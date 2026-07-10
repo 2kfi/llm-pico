@@ -1,0 +1,141 @@
+
+litellm_settings:
+  drop_params: true
+  modify_params: true
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  cooldown_time: 45
+  allowed_fails: 1
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 3
+    recovery_timeout: 30
+
+general_settings:
+  master_key: "sk-pico-master-CHANGE-ME"
+  db_path: "llm-pico.db"
+
+model_list:
+  - model_name: gpt-5.4-mini
+    litellm_params:
+      model: openai/gpt-5.4-mini
+      api_key: "sk-..."
+    images: false
+
+  - model_name: gemma-4-31b-it
+    litellm_params:
+      model: gemini/gemma-4-31b-it
+      api_key: "..."
+    rpm: 15
+    rpd: 1500
+    images: false
+
+  - model_name: gemma-4-26b-a4b-it
+    litellm_params:
+      model: gemini/gemma-4-26b-a4b-it
+      api_key: "..."
+    rpm: 15
+    rpd: 1500
+    images: false
+
+  - model_name: gemini-3-flash-preview
+    litellm_params:
+      model: gemini/gemini-3-flash-preview
+      api_key: "..."
+    rpm: 5
+    rpd: 20
+    tpm: 250000
+    images: false
+
+  - model_name: gemini-embedding-2
+    litellm_params:
+      model: gemini/gemini-embedding-2
+      api_key: "..."
+    rpm: 100
+    rpd: 1000
+    tpm: 30000
+    images: false
+    embeddings: true
+
+  - model_name: gemini-embedding-001
+    litellm_params:
+      model: gemini/gemini-embedding-2
+      api_key: "..."
+    rpm: 100
+    rpd: 1000
+    tpm: 30000
+    images: false
+    embeddings: true
+
+  - model_name: gemini-3.1-flash-lite
+    litellm_params:
+      model: gemini/gemini-3.1-flash-lite
+      api_key: "..."
+    rpm: 15
+    rpd: 500
+    tpm: 250000
+    images: false
+
+  - model_name: groq-openai-gpt-oss-120b
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: "gsk_..."
+      api_base: "https://api.groq.com/openai/v1"
+    rpd: 1000
+    rpm: 30
+    tpm: 8000
+    tpd: 8000
+    images: false
+
+  - model_name: zai-glm4-flash
+    litellm_params:
+      model: zai/glm-4-flash
+      api_key: "..."
+      api_base: "https://open.bigmodel.cn/api/paas/v4"
+    images: false
+
+  - model_name: cf-zai-org-glm-5.2
+    litellm_params:
+      model: cloudflare/@cf/zai-org/glm-5.2
+      api_key: "..."
+      api_base: "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
+    images: false
+
+  - model_name: cf-moonshotai-kimi-k2.7-code
+    litellm_params:
+      model: cloudflare/@cf/moonshotai/kimi-k2.7-code
+      api_key: "..."
+      api_base: "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
+    images: false
+
+  - model_name: cf-openai-gpt-oss-120b
+    litellm_params:
+      model: cloudflare/@cf/openai/gpt-oss-120b
+      api_key: "..."
+      api_base: "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
+    images: false
+
+  - model_name: poolside-laguna-m.1-OPENROUTER
+    litellm_params:
+      model: openrouter/poolside/laguna-m.1:free
+      api_key: "sk-or-..."
+      api_base: "https://openrouter.ai/api/v1"
+    rpd: 30
+    images: false
+
+  - model_name: nvidia-nemotron-3-ultra-550b-a55b-OPENROUTER
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      api_key: "sk-or-..."
+      api_base: "https://openrouter.ai/api/v1"
+    rpd: 50
+    images: false
+
+  - model_name: nvidia-llama-large
+    litellm_params:
+      model: nvidia_nim/meta/llama3-70b-instruct
+      api_key: "nvapi-..."
+      api_base: "https://integrate.api.nvidia.com/v1"
+    images: false

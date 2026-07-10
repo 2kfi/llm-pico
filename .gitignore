@@ -1,0 +1,21 @@
+*.pyc
+__pycache__/
+.venv/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.DS_Store
+.env
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.whl
+
+# Secrets — keep only config.example.yaml in git
+config.yaml
+users.yaml
+config.yml
