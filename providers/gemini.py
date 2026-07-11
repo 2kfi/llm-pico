@@ -92,7 +92,7 @@ class GeminiAdapter(BaseAdapter):
         for i, cand in enumerate(candidates):
             content = cand.get("content", {})
             parts = content.get("parts", [])
-            text = "".join(p.get("text", "") for p in parts)
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
             choices.append({
                 "index": i,
                 "message": {
@@ -230,7 +230,7 @@ class GeminiAdapter(BaseAdapter):
             candidates = data.get("candidates", [])
             for cand in candidates:
                 parts = cand.get("content", {}).get("parts", [])
-                text = "".join(p.get("text", "") for p in parts)
+                text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                 finish = _map_gemini_finish(cand.get("finishReason", ""))
 
                 sse_data = {

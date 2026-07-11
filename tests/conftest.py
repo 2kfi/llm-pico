@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.config import Config, GeneralSettings, LitellmParams, ModelEntry, RouterSettings
+from core.config import Config, GeneralSettings, ModelParams, ModelEntry, RouterSettings
 
 
 @pytest.fixture
@@ -23,7 +23,7 @@ def single_model_config(config):
     config.model_list = [
         ModelEntry(
             model_name="test-model",
-            litellm_params=LitellmParams(
+            model_params=ModelParams(
                 model="openai/gpt-4",
                 api_key="sk-test-key-1",
                 api_base="https://api.openai.com/v1",
@@ -38,7 +38,7 @@ def multi_key_config(config):
     config.model_list = [
         ModelEntry(
             model_name="test-model",
-            litellm_params=LitellmParams(
+            model_params=ModelParams(
                 model="openai/gpt-4",
                 api_key="sk-test-key-1",
                 api_base="https://api.openai.com/v1",
@@ -46,7 +46,7 @@ def multi_key_config(config):
         ),
         ModelEntry(
             model_name="test-model",
-            litellm_params=LitellmParams(
+            model_params=ModelParams(
                 model="openai/gpt-4",
                 api_key="sk-test-key-2",
                 api_base="https://api.openai.com/v1",
@@ -61,7 +61,7 @@ def dual_group_config(config):
     config.model_list = [
         ModelEntry(
             model_name="test-model",
-            litellm_params=LitellmParams(
+            model_params=ModelParams(
                 model="openai/gpt-4",
                 api_key="sk-oa-key",
                 api_base="https://api.openai.com/v1",
@@ -69,7 +69,7 @@ def dual_group_config(config):
         ),
         ModelEntry(
             model_name="test-model",
-            litellm_params=LitellmParams(
+            model_params=ModelParams(
                 model="groq/llama3",
                 api_key="gsk-gr-key",
                 api_base="https://api.groq.com/openai/v1",

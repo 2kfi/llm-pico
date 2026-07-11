@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 import httpx
 
@@ -33,7 +34,18 @@ class OpenAIAdapter(BaseAdapter):
         if "max_tokens" in body and "max_completion_tokens" not in body:
             body["max_completion_tokens"] = body.pop("max_tokens")
         url = f"{self._base_url()}/chat/completions"
-        return await self.client.post(url, content=json.dumps(body), headers=self._headers())
+        response = await self.client.post(url, content=json.dumps(body), headers=self._headers())
+
+        if response.status_code == 200:
+            resp_body = json.loads(response.content)
+            if "choices" in resp_body:
+                for choice in resp_body["choices"]:
+                    msg = choice.get("message", {})
+                    if "content" in msg and msg["content"]:
+                        msg["content"] = re.sub(r"<think>.*?</think>", "", msg["content"], flags=re.DOTALL).strip()
+            response._content = json.dumps(resp_body).encode()
+
+        return response
 
     async def proxy_completions(self, body_bytes: bytes) -> httpx.Response:
         url = f"{self._base_url()}/completions"

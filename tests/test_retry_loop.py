@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from starlette.responses import StreamingResponse
 
 from core.router import Router, CircuitBreaker, KeyState, ProviderGroup
-from core.config import Config, GeneralSettings, LitellmParams, ModelEntry, RouterSettings
+from core.config import Config, GeneralSettings, ModelParams, ModelEntry, RouterSettings
 
 
 class MockAdapter:
@@ -64,7 +64,7 @@ async def test_retry_on_5xx():
     )
     entry = ModelEntry(
         model_name="test-model",
-        litellm_params=LitellmParams(model="openai/gpt-4", api_key="sk-key-1"),
+        model_params=ModelParams(model="openai/gpt-4", api_key="sk-key-1"),
     )
 
     router = MockRouter([(group, key1, entry), (group, key2, entry)])
@@ -123,7 +123,7 @@ async def test_retry_exhausted_raises_last_error():
     )
     entry = ModelEntry(
         model_name="test-model",
-        litellm_params=LitellmParams(model="openai/gpt-4", api_key="sk-key-1"),
+        model_params=ModelParams(model="openai/gpt-4", api_key="sk-key-1"),
     )
 
     router = MockRouter([(group, key1, entry) for _ in range(5)])
@@ -179,7 +179,7 @@ async def test_non_retryable_errors_propagate_immediately():
     )
     entry = ModelEntry(
         model_name="test-model",
-        litellm_params=LitellmParams(model="openai/gpt-4", api_key="sk-key-1"),
+        model_params=ModelParams(model="openai/gpt-4", api_key="sk-key-1"),
     )
 
     router = MockRouter([(group, key1, entry) for _ in range(5)])
@@ -234,12 +234,12 @@ async def test_failover_model_called_when_retries_exhausted():
     )
     entry = ModelEntry(
         model_name="test-model",
-        litellm_params=LitellmParams(model="openai/gpt-4", api_key="sk-key-1"),
+        model_params=ModelParams(model="openai/gpt-4", api_key="sk-key-1"),
         failover_model="fallback-model",
     )
     fallback_entry = ModelEntry(
         model_name="fallback-model",
-        litellm_params=LitellmParams(model="openai/gpt-3.5", api_key="sk-key-1"),
+        model_params=ModelParams(model="openai/gpt-3.5", api_key="sk-key-1"),
     )
     fallback_group = ProviderGroup(
         provider_slug="openai",
@@ -302,12 +302,12 @@ async def test_failover_does_not_chain():
     )
     entry = ModelEntry(
         model_name="test-model",
-        litellm_params=LitellmParams(model="openai/gpt-4", api_key="sk-key-1"),
+        model_params=ModelParams(model="openai/gpt-4", api_key="sk-key-1"),
         failover_model="fallback-model",
     )
     fallback_entry = ModelEntry(
         model_name="fallback-model",
-        litellm_params=LitellmParams(model="openai/gpt-3.5", api_key="sk-key-1"),
+        model_params=ModelParams(model="openai/gpt-3.5", api_key="sk-key-1"),
         failover_model="deep-fallback",  # this should NOT be triggered
     )
 

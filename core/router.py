@@ -71,21 +71,21 @@ class Router:
             model_name = entry.model_name
             self._model_entries[model_name] = entry
 
-            provider_slug = self._extract_provider(entry.litellm_params.model)
+            provider_slug = self._extract_provider(entry.model_params.model)
             if model_name not in self._model_map:
                 self._model_map[model_name] = []
 
             groups = self._model_map[model_name]
             matching_group = None
             for g in groups:
-                if g.provider_slug == provider_slug and g.api_base == entry.litellm_params.api_base:
+                if g.provider_slug == provider_slug and g.api_base == entry.model_params.api_base:
                     matching_group = g
                     break
 
             if matching_group is None:
                 matching_group = ProviderGroup(
                     provider_slug=provider_slug,
-                    api_base=entry.litellm_params.api_base,
+                    api_base=entry.model_params.api_base,
                     circuit_breaker=CircuitBreaker(
                         failure_threshold=self._settings.circuit_breaker.failure_threshold,
                         recovery_timeout=self._settings.circuit_breaker.recovery_timeout,
@@ -93,7 +93,7 @@ class Router:
                 )
                 groups.append(matching_group)
 
-            matching_group.keys.append(KeyState(api_key=entry.litellm_params.api_key or ""))
+            matching_group.keys.append(KeyState(api_key=entry.model_params.api_key or ""))
 
         _log.info("router indexed %d model names", len(self._model_map))
 

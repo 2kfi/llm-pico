@@ -129,6 +129,8 @@ class AnthropicAdapter(BaseAdapter):
             req["top_p"] = body["top_p"]
         if body.get("stop"):
             req["stop_sequences"] = body["stop"] if isinstance(body["stop"], list) else [body["stop"]]
+        if body.get("stream"):
+            req["stream"] = True
         return req
 
     def peek_request(self, body: bytes) -> tuple[str, bool, int]:
@@ -141,9 +143,23 @@ class AnthropicAdapter(BaseAdapter):
         body = json.loads(body_bytes)
         anthropic_req = self._build_anthropic_request(body, model_string)
         url = f"{self._base_url()}/messages"
-        response = await self.client.post(url, content=json.dumps(anthropic_req), headers=self._headers())
+        is_stream = body.get("stream", False)
+
+        if is_stream:
+            response = await self.client.send(
+                self.client.build_request("POST", url, content=json.dumps(anthropic_req), headers=self._headers()),
+                stream=True,
+            )
+        else:
+            response = await self.client.post(url, content=json.dumps(anthropic_req), headers=self._headers())
 
         if response.status_code != 200:
+            if not is_stream:
+                return response
+            await response.aread()
+            return response
+
+        if is_stream:
             return response
 
         data = response.json()

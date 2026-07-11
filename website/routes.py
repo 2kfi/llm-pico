@@ -13,7 +13,10 @@ async def dashboard():
 
 @router.get("/dashboard/{path:path}")
 async def dashboard_static(path: str):
-    file = STATIC_DIR / path
-    if file.is_file():
-        return FileResponse(file)
+    full_path = (STATIC_DIR / path).resolve()
+    if not str(full_path).startswith(str(STATIC_DIR.resolve())):
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("Not found", status_code=404)
+    if full_path.is_file():
+        return FileResponse(full_path)
     return FileResponse(STATIC_DIR / "index.html")

@@ -62,10 +62,7 @@ class RateLimiter:
             )
             row = await cursor.fetchone()
             count = row["count"] if row else 0
-        entry: _InMemCounter = {"window_start": ws, "count": count, "dirty": False}
-        mk = self._mem_key(key_hash, model_name, level, window_type)
-        self._mem[mk] = entry
-        return entry
+        return {"window_start": ws, "count": count, "dirty": False}
 
     async def check_and_reserve(
         self,
@@ -87,10 +84,14 @@ class RateLimiter:
             level = limits.get("_level", "user")
             ws = self._window_start(window_type, now)
             async with self._shard_lock(key_hash, model_name):
-                entry = self._mem.get(self._mem_key(key_hash, model_name, level, window_type))
+                mk = self._mem_key(key_hash, model_name, level, window_type)
+                entry = self._mem.get(mk)
                 if entry is None or entry["window_start"] != ws:
-                    entry = {"window_start": ws, "count": 0, "dirty": False}
-                    self._mem[self._mem_key(key_hash, model_name, level, window_type)] = entry
+                    if entry is None and window_type in ("rpd", "tpd", "asd"):
+                        entry = await self._load_from_db(key_hash, model_name, level, window_type)
+                    else:
+                        entry = {"window_start": ws, "count": 0, "dirty": False}
+                    self._mem[mk] = entry
 
                 check_count = entry["count"] + reserve_amount
                 if check_count > limit:
@@ -177,11 +178,28 @@ class RateLimiter:
                 entry["dirty"] = False
             await db.commit()
 
+    async def _purge_stale_entries(self) -> None:
+        now = time.time()
+        stale_keys = []
+        for mk, entry in self._mem.items():
+            _, _, _, window_type = mk
+            current_ws = self._window_start(window_type, now)
+            if entry["window_start"] != current_ws:
+                stale_keys.append(mk)
+        for mk in stale_keys:
+            if mk in self._dirty:
+                continue
+            del self._mem[mk]
+
     async def _flush_loop(self) -> None:
+        flush_count = 0
         while self._running:
             await asyncio.sleep(self._flush_interval)
             try:
                 await self._flush_dirty()
+                flush_count += 1
+                if flush_count % 10 == 0:
+                    await self._purge_stale_entries()
             except Exception:
                 _log.exception("flush error")
 

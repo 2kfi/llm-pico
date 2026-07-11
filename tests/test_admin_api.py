@@ -9,7 +9,7 @@ import pytest
 import pytest_asyncio
 
 from api.server import create_app
-from core.config import Config, GeneralSettings, LitellmParams, ModelEntry, RouterSettings
+from core.config import Config, GeneralSettings, ModelParams, ModelEntry, RouterSettings
 from core.db import close_db, init_db, get_db
 
 MASTER_KEY = "sk-pico-master-test"
@@ -27,7 +27,7 @@ async def app(tmp_path):
         model_list=[
             ModelEntry(
                 model_name="test-model",
-                litellm_params=LitellmParams(
+                model_params=ModelParams(
                     model="openai/gpt-4",
                     api_key="sk-test-key-1",
                     api_base="https://api.openai.com/v1",

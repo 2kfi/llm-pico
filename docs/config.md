@@ -87,12 +87,12 @@ general_settings:
 
 model_list:
   - model_name: "gpt-5.4-mini"
-    litellm_params:
+    model_params:
       model: "openai/gpt-5.4-mini"
       api_key: "${OPENAI_API_KEY}"
 
   - model_name: "gemini-flash"
-    litellm_params:
+    model_params:
       model: "gemini/gemini-3-flash-preview"
       api_key: "${GEMINI_API_KEY:-}"
 ```
@@ -173,7 +173,7 @@ Each entry in `model_list` defines a model the proxy can serve. At least one ent
 ```yaml
 model_list:
   - model_name: "gpt-5.4-mini"
-    litellm_params:
+    model_params:
       model: "openai/gpt-5.4-mini"
       api_key: "${OPENAI_API_KEY}"
       api_base: null
@@ -198,9 +198,9 @@ model_list:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `model_name` | string | **required** | User-facing model name. This is what clients send in `model:`. |
-| `litellm_params.model` | string | **required** | Upstream model string with provider prefix (see [Provider Prefixes](#9-provider-prefixes)). |
-| `litellm_params.api_key` | string \| null | `null` | Provider API key. Use `${ENV_VAR}`. |
-| `litellm_params.api_base` | string \| null | `null` | Custom base URL. Required for some providers (OpenRouter, NVIDIA NIM, Cloudflare). |
+| `model_params.model` | string | **required** | Upstream model string with provider prefix (see [Provider Prefixes](#9-provider-prefixes)). |
+| `model_params.api_key` | string \| null | `null` | Provider API key. Use `${ENV_VAR}`. |
+| `model_params.api_base` | string \| null | `null` | Custom base URL. Required for some providers (OpenRouter, NVIDIA NIM, Cloudflare). |
 | `rpm` | int \| null | `null` | Requests per minute limit for this model. `null` = unlimited. |
 | `rpd` | int \| null | `null` | Requests per day limit. |
 | `tpm` | int \| null | `null` | Tokens per minute limit. |
@@ -228,21 +228,21 @@ Multiple `model_list` entries with the **same `model_name`** but **different `ap
 model_list:
   # Key 1
   - model_name: "gpt-5.4-mini"
-    litellm_params:
+    model_params:
       model: "openai/gpt-5.4-mini"
       api_key: "${OPENAI_KEY_1}"
     rpm: 500
 
   # Key 2 — same model_name, different key
   - model_name: "gpt-5.4-mini"
-    litellm_params:
+    model_params:
       model: "openai/gpt-5.4-mini"
       api_key: "${OPENAI_KEY_2}"
     rpm: 500
 
   # Key 3 — different provider, same user-facing name
   - model_name: "gpt-5.4-mini"
-    litellm_params:
+    model_params:
       model: "openrouter/openai/gpt-5.4-mini"
       api_key: "${OPENROUTER_KEY}"
       api_base: "https://openrouter.ai/api/v1"
@@ -257,7 +257,7 @@ Clients see a single `gpt-5.4-mini` model. The proxy round-robins across the thr
 
 ## 9. Provider Prefixes
 
-The `litellm_params.model` field uses a provider prefix to route to the correct upstream API. The prefix determines which adapter handles the request.
+The `model_params.model` field uses a provider prefix to route to the correct upstream API. The prefix determines which adapter handles the request.
 
 | Prefix | Provider | Example | `api_base` needed? |
 |--------|----------|---------|-------------------|
@@ -396,13 +396,13 @@ The `failover_model` field specifies a backup model when all retries for the pri
 ```yaml
 model_list:
   - model_name: "gpt-5.4-mini"
-    litellm_params:
+    model_params:
       model: "openai/gpt-5.4-mini"
       api_key: "${OPENAI_API_KEY}"
     failover_model: "gemma-4-31b-it"   # ← fallback
 
   - model_name: "gemma-4-31b-it"
-    litellm_params:
+    model_params:
       model: "gemini/gemma-4-31b-it"
       api_key: "${GEMINI_API_KEY}"
 ```
@@ -426,7 +426,7 @@ When `can_cache: true` is set on a model entry, non-streaming responses are cach
 ```yaml
 model_list:
   - model_name: "gpt-5.4-mini"
-    litellm_params:
+    model_params:
       model: "openai/gpt-5.4-mini"
       api_key: "${OPENAI_API_KEY}"
     can_cache: true
@@ -457,9 +457,9 @@ model_list:
 
 ```yaml
 # ──────────────────────────────────────────────
-# litellm_settings — passed through to litellm
+# model_settings — passed through to litellm
 # ──────────────────────────────────────────────
-litellm_settings:
+model_settings:
   drop_params: true       # drop unsupported params instead of erroring
   modify_params: true     # auto-adapt params for provider compatibility
 
@@ -492,7 +492,7 @@ model_list:
 
   # ── OpenAI ──────────────────────────────────
   - model_name: gpt-5.4-mini
-    litellm_params:
+    model_params:
       model: openai/gpt-5.4-mini
       api_key: "${OPENAI_API_KEY}"
     images: false
@@ -503,7 +503,7 @@ model_list:
 
   # ── Google Gemini ───────────────────────────
   - model_name: gemma-4-31b-it
-    litellm_params:
+    model_params:
       model: gemini/gemma-4-31b-it
       api_key: "${GEMINI_API_KEY}"
     rpm: 15
@@ -511,7 +511,7 @@ model_list:
     images: false
 
   - model_name: gemini-3-flash-preview
-    litellm_params:
+    model_params:
       model: gemini/gemini-3-flash-preview
       api_key: "${GEMINI_API_KEY}"
     rpm: 5
@@ -521,7 +521,7 @@ model_list:
 
   # ── Gemini Embeddings ───────────────────────
   - model_name: gemini-embedding-2
-    litellm_params:
+    model_params:
       model: gemini/gemini-embedding-2
       api_key: "${GEMINI_API_KEY}"
     rpm: 100
@@ -532,7 +532,7 @@ model_list:
 
   # ── Groq (STT) ─────────────────────────────
   - model_name: groq-whisper-large-v3-stt
-    litellm_params:
+    model_params:
       model: groq/whisper-large-v3
       api_key: "${GROQ_API_KEY}"
       api_base: "https://api.groq.com/openai/v1"
@@ -544,7 +544,7 @@ model_list:
 
   # ── Groq (TTS) ─────────────────────────────
   - model_name: groq-orpheus-english-tts
-    litellm_params:
+    model_params:
       model: groq/canopylabs/orpheus-v1-english
       api_key: "${GROQ_API_KEY}"
       api_base: "https://api.groq.com/openai/v1"
@@ -556,14 +556,14 @@ model_list:
 
   # ── OpenRouter (with key pooling) ───────────
   - model_name: nvidia-nemotron-ultra
-    litellm_params:
+    model_params:
       model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       api_key: "${OPENROUTER_KEY_1}"
       api_base: "https://openrouter.ai/api/v1"
     rpd: 50
 
   - model_name: nvidia-nemotron-ultra       # same name → pooled
-    litellm_params:
+    model_params:
       model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       api_key: "${OPENROUTER_KEY_2}"
       api_base: "https://openrouter.ai/api/v1"
@@ -571,21 +571,21 @@ model_list:
 
   # ── NVIDIA NIM ─────────────────────────────
   - model_name: nvidia-deepseek-v4-pro
-    litellm_params:
+    model_params:
       model: nvidia_nim/deepseek-ai/deepseek-v4-pro
       api_key: "${NVIDIA_API_KEY}"
       api_base: "https://integrate.api.nvidia.com/v1"
 
   # ── Cloudflare Workers AI ──────────────────
   - model_name: cf-glm-5.2
-    litellm_params:
+    model_params:
       model: cloudflare/@cf/zai-org/glm-5.2
       api_key: "${CF_API_TOKEN}"
       api_base: "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
 
   # ── Zhipu AI ───────────────────────────────
   - model_name: zai-glm-4.5-flash
-    litellm_params:
+    model_params:
       model: zai/glm-4.5-flash
       api_key: "${ZAI_API_KEY}"
       api_base: "https://open.bigmodel.cn/api/paas/v4"

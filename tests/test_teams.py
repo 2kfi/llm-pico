@@ -6,7 +6,7 @@ import time
 import pytest
 
 from core.auth import verify_api_key
-from core.config import Config, GeneralSettings, ModelEntry, LitellmParams, RouterSettings
+from core.config import Config, GeneralSettings, ModelEntry, ModelParams, RouterSettings
 import pytest_asyncio
 
 from core.db import close_db, init_db, get_db

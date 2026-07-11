@@ -134,7 +134,7 @@ async function doLogin() {
   MASTER_KEY = document.getElementById('master-key-input').value.trim();
   if (!MASTER_KEY) return;
   try {
-    await api('/health');
+    await api('/admin/keys');
     localStorage.setItem('pico_master_key', MASTER_KEY);
     showApp();
   } catch {
@@ -194,10 +194,10 @@ function fmt$(n) { return '$' + (n || 0).toFixed(4); }
 async function loadDashboard() {
   const el = document.getElementById('page-dashboard');
   el.innerHTML = '<div class="page-header"><h2>Dashboard</h2><button onclick="loadDashboard()">Refresh</button></div><div class="grid grid-4" id="dash-stats"></div><div class="card" style="margin-top:16px" id="dash-health">Checking health...</div>';
-  const [health, keys, teams] = await Promise.all([api('/health').catch(() => null), api('/admin/keys').catch(() => []), api('/admin/teams').catch(() => [])]);
+  const [health, keysData, teamsData] = await Promise.all([api('/health').catch(() => null), api('/admin/keys').catch(() => ({keys: []})), api('/admin/teams').catch(() => ({teams: []}))]);
   const usage = await api('/admin/usage').catch(() => ({}));
-  const keysArr = Array.isArray(keys) ? keys : [];
-  const teamsArr = Array.isArray(teams) ? teams : [];
+  const keysArr = (keysData && keysData.keys) || [];
+  const teamsArr = (teamsData && teamsData.teams) || [];
   document.getElementById('dash-stats').innerHTML = `
     <div class="card stat-card"><div class="val">${keysArr.length}</div><div class="lbl">API Keys</div></div>
     <div class="card stat-card"><div class="val">${teamsArr.length}</div><div class="lbl">Teams</div></div>
@@ -212,7 +212,8 @@ async function loadDashboard() {
 async function loadKeys() {
   const el = document.getElementById('page-keys');
   el.innerHTML = '<div class="page-header"><h2>API Keys</h2><button class="primary" onclick="showCreateKey()">+ Create Key</button></div><div class="card"><table><thead><tr><th>Prefix</th><th>Label</th><th>Active</th><th>User</th><th>Created</th><th></th></tr></thead><tbody id="keys-tbody"><tr><td colspan="6" style="color:var(--muted)">Loading...</td></tr></tbody></table></div>';
-  const keys = await api('/admin/keys').catch(() => []);
+  const data = await api('/admin/keys').catch(() => ({keys: []}));
+  const keys = data.keys || [];
   const arr = Array.isArray(keys) ? keys : [];
   document.getElementById('keys-tbody').innerHTML = arr.length === 0 ? '<tr><td colspan="6" style="color:var(--muted)">No keys found</td></tr>'
     : arr.map(k => `<tr>
@@ -255,7 +256,8 @@ async function revokeKey(prefix) {
 async function loadTeams() {
   const el = document.getElementById('page-teams');
   el.innerHTML = '<div class="page-header"><h2>Teams & Users</h2><button class="primary" onclick="showCreateTeam()">+ Create Team</button></div><div id="teams-list" class="grid grid-2"></div>';
-  const teams = await api('/admin/teams').catch(() => []);
+  const data = await api('/admin/teams').catch(() => ({teams: []}));
+  const teams = data.teams || [];
   const arr = Array.isArray(teams) ? teams : [];
   document.getElementById('teams-list').innerHTML = arr.length === 0 ? '<div class="card" style="color:var(--muted)">No teams yet</div>'
     : arr.map(t => `<div class="card" id="team-${t.id}">

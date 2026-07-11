@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 
 from providers import get_adapter
-from providers.base import close_all_clients
+from providers.base import BaseAdapter, close_all_clients
 from providers.openai import OpenAIAdapter
 from api.admin import router as admin_router
 from core.auth import (
@@ -304,7 +304,7 @@ async def _proxy_request(
                     model_limits=model_limits,
                 )
 
-            adapter_model = model_entry.litellm_params.model
+            adapter_model = model_entry.model_params.model
             # Strip provider prefix (e.g. "openai/gpt-4" → "gpt-4")
             model_for_api = adapter_model.split("/", 1)[1] if "/" in adapter_model else adapter_model
             rewritten_body = _rewrite_model_field(body_bytes, model_for_api)
@@ -426,20 +426,43 @@ async def _handle_streaming(
 
     actual_tokens = 0
 
-    async def generate():
-        nonlocal actual_tokens
-        async for chunk in upstream.aiter_bytes():
-            if b"usage" in chunk:
-                try:
-                    text = chunk.decode("utf-8", errors="replace")
-                    for line in text.split("\n"):
-                        if line.startswith("data: ") and "[DONE]" not in line:
-                            data = json.loads(line[6:])
-                            if "usage" in data:
-                                actual_tokens = data["usage"].get("total_tokens", 0)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
-            yield chunk
+    has_custom_stream = type(adapter).proxy_stream is not BaseAdapter.proxy_stream
+
+    if has_custom_stream:
+        stream_chunks, stream_usage = await adapter.proxy_stream(upstream)
+
+        async def generate():
+            nonlocal actual_tokens
+            for chunk in stream_chunks:
+                if b"usage" in chunk:
+                    try:
+                        text = chunk.decode("utf-8", errors="replace")
+                        for line in text.split("\n"):
+                            if line.startswith("data: ") and "[DONE]" not in line:
+                                data = json.loads(line[6:])
+                                if "usage" in data:
+                                    actual_tokens = data["usage"].get("total_tokens", 0)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+                yield chunk
+
+        if stream_usage:
+            actual_tokens = stream_usage.get("total_tokens", 0)
+    else:
+        async def generate():
+            nonlocal actual_tokens
+            async for chunk in upstream.aiter_bytes():
+                if b"usage" in chunk:
+                    try:
+                        text = chunk.decode("utf-8", errors="replace")
+                        for line in text.split("\n"):
+                            if line.startswith("data: ") and "[DONE]" not in line:
+                                data = json.loads(line[6:])
+                                if "usage" in data:
+                                    actual_tokens = data["usage"].get("total_tokens", 0)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+                yield chunk
 
     response = StreamingResponse(generate(), media_type="text/event-stream")
     response.headers["X-Request-Id"] = request_id
@@ -448,60 +471,63 @@ async def _handle_streaming(
             response.headers[k] = v
 
     async def _log_and_reconcile():
-        nonlocal actual_tokens
-        while True:
-            try:
-                await asyncio.sleep(0.1)
-                if actual_tokens > 0 or response.headers.get("x-llm-pico-done"):
+        try:
+            nonlocal actual_tokens
+            while True:
+                try:
+                    await asyncio.sleep(0.1)
+                    if actual_tokens > 0 or response.headers.get("x-llm-pico-done"):
+                        break
+                except (asyncio.CancelledError, GeneratorExit):
                     break
-            except (asyncio.CancelledError, GeneratorExit):
-                break
 
-        latency = int((time.monotonic() - t0) * 1000)
+            latency = int((time.monotonic() - t0) * 1000)
 
-        if actual_tokens == 0:
-            actual_tokens = reservation
+            if actual_tokens == 0:
+                actual_tokens = reservation
 
-        pt = 0
-        ct = 0
-        cost = compute_cost(pt, ct, cost_in, cost_out)
-        if cost is None and actual_tokens:
-            cost = compute_cost(actual_tokens, 0, cost_in, cost_out)
+            pt = 0
+            ct = 0
+            cost = compute_cost(pt, ct, cost_in, cost_out)
+            if cost is None and actual_tokens:
+                cost = compute_cost(actual_tokens, 0, cost_in, cost_out)
 
-        await log_usage(
-            key_hash=user_key["key_hash"] if user_key else master_key,
-            key_prefix=user_key["key_prefix"] if user_key else "master",
-            model_name=model_name,
-            provider=provider_slug,
-            prompt_tokens=pt,
-            completion_tokens=ct,
-            total_tokens=actual_tokens,
-            latency_ms=latency,
-            status_code=200,
-            cost_usd=cost,
-        )
-
-        emit({
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
-            "key_prefix": user_key["key_prefix"] if user_key else "master",
-            "model": model_name,
-            "provider": provider_slug,
-            "prompt_tokens": pt,
-            "completion_tokens": ct,
-            "total_tokens": actual_tokens,
-            "latency_ms": latency,
-            "status": 200,
-            "cost_usd": cost,
-        })
-
-        if user_key:
-            await limiter.reconcile(
-                key_hash=user_key["key_hash"],
+            await log_usage(
+                key_hash=user_key["key_hash"] if user_key else master_key,
+                key_prefix=user_key["key_prefix"] if user_key else "master",
                 model_name=model_name,
-                limits=limits,
-                actual_tokens=actual_tokens,
-                reserved_tokens=reservation,
+                provider=provider_slug,
+                prompt_tokens=pt,
+                completion_tokens=ct,
+                total_tokens=actual_tokens,
+                latency_ms=latency,
+                status_code=200,
+                cost_usd=cost,
             )
+
+            emit({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                "key_prefix": user_key["key_prefix"] if user_key else "master",
+                "model": model_name,
+                "provider": provider_slug,
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": actual_tokens,
+                "latency_ms": latency,
+                "status": 200,
+                "cost_usd": cost,
+            })
+
+            if user_key:
+                await limiter.reconcile(
+                    key_hash=user_key["key_hash"],
+                    model_name=model_name,
+                    limits=limits,
+                    actual_tokens=actual_tokens,
+                    reserved_tokens=reservation,
+                )
+        except Exception:
+            _log.exception("background logging/reconciliation failed")
 
     _log.debug("streaming request %s: model=%s provider=%s", request_id, model_name, provider_slug)
     asyncio.create_task(_log_and_reconcile())
@@ -697,7 +723,7 @@ async def _health_check() -> Response:
     )
 
 
-async def _route_completions(request: Request) -> Response:
+async def _route_completions(request: Request, user_key: dict = Depends(require_api_key)) -> Response:
     return await _route_chat_completions(request)
 
 
@@ -799,7 +825,7 @@ async def _proxy_audio_request(
                     model_limits=model_limits,
                 )
 
-            adapter_model = model_entry.litellm_params.model
+            adapter_model = model_entry.model_params.model
             t0 = time.monotonic()
 
             try:
@@ -1002,7 +1028,7 @@ async def _proxy_audio_speech(
                     })
 
             adapter = adapter_cls(provider_slug=slug, api_key=key_state.api_key, api_base=result[0].api_base)
-            adapter_model = model_entry.litellm_params.model
+            adapter_model = model_entry.model_params.model
             model_for_api = adapter_model.split("/", 1)[1] if "/" in adapter_model else adapter_model
             rewritten_body = _rewrite_model_field(body_bytes, model_for_api)
             t0 = time.monotonic()
@@ -1191,7 +1217,6 @@ def create_app(app_state: dict[str, Any]) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )

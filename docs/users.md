@@ -594,7 +594,7 @@ Use the `model_name` from your config.yaml. For example:
 ```yaml
 model_list:
   - model_name: gpt-5.4-mini          # use this name in allowlists
-    litellm_params:
+    model_params:
       model: openai/gpt-5.4-mini      # this is the upstream provider path
 ```
 
@@ -666,14 +666,14 @@ In `config.yaml`, create multiple `model_list` entries with the same `model_name
 ```yaml
 model_list:
   - model_name: gpt-5.4-mini
-    litellm_params:
+    model_params:
       model: openai/gpt-5.4-mini
       api_key: "sk-openai-key-1"
     rpm: 50
     rpd: 5000
 
   - model_name: gpt-5.4-mini
-    litellm_params:
+    model_params:
       model: openai/gpt-5.4-mini
       api_key: "sk-openai-key-2"
     rpm: 50

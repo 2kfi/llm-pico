@@ -143,14 +143,14 @@ Loads YAML into dataclasses:
 Config
 ├── general_settings: GeneralSettings  (master_key, db_path, retention settings)
 ├── router_settings: RouterSettings    (routing_strategy, num_retries, cooldown_time, circuit_breaker)
-└── model_list: list[ModelEntry]       (model_name, litellm_params, rpm/rpd/tpm/tpd, capabilities)
+└── model_list: list[ModelEntry]       (model_name, model_params, rpm/rpd/tpm/tpd, capabilities)
 ```
 
 `ModelEntry` fields:
 - `model_name` — the name clients use (e.g. `gpt-5.4-mini`)
-- `litellm_params.model` — the upstream model string with provider prefix (e.g. `openai/gpt-5.4-mini`)
-- `litellm_params.api_key` — the upstream API key
-- `litellm_params.api_base` — optional custom base URL
+- `model_params.model` — the upstream model string with provider prefix (e.g. `openai/gpt-5.4-mini`)
+- `model_params.api_key` — the upstream API key
+- `model_params.api_base` — optional custom base URL
 - `rpm`, `rpd`, `tpm`, `tpd` — model-level rate limits
 - `ash`, `asd` — audio seconds per hour/day (for STT/TTS models)
 - `images`, `embeddings`, `stt`, `tts` — capability flags
@@ -383,7 +383,7 @@ general_settings:
 
 model_list:
   - model_name: gpt-5.4-mini
-    litellm_params:
+    model_params:
       model: openai/gpt-5.4-mini    # "provider/model-name"
       api_key: "${OPENAI_API_KEY}"  # env var interpolation
       api_base: null                 # optional override

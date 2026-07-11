@@ -96,7 +96,7 @@ router_settings:
 
 model_list:
   - model_name: gpt-5.4-mini             # the name clients use
-    litellm_params:
+    model_params:
       model: openai/gpt-5.4-mini         # provider/model-name
       api_key: "sk-..."
       api_base: null                     # optional override
@@ -114,7 +114,7 @@ Any value in the config can use `${VAR_NAME}` or `${VAR_NAME:-default}` syntax t
 
 ### Model naming format
 
-The `model` field in `litellm_params` uses the format `<provider>/<upstream-model-name>`.
+The `model` field in `model_params` uses the format `<provider>/<upstream-model-name>`.
 
 | Provider | Slug | Example |
 |----------|------|---------|

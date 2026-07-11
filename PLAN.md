@@ -158,7 +158,7 @@ Unregistered slugs fall through to `OpenAIAdapter` via `get_adapter(slug) or Ope
 ├── docs/
 │   └── understand.md           # Full codebase walkthrough
 │
-├── config-litellm.yml          # UNTRACKED — active config with real API keys (secrets!)
+├── config-litellm.yml          # UNTRACKED — active config (real API keys — do NOT commit)
 ```
 
 ---
@@ -431,7 +431,7 @@ router_settings:
 
 model_list:
   - model_name: gpt-5.4-mini
-    litellm_params:
+    model_params:
       model: openai/gpt-5.4-mini
       api_key: "${OPENAI_API_KEY}"
       api_base: "https://..."
@@ -451,14 +451,14 @@ model_list:
 
   # Blended rate fallback (set only one, or neither):
   - model_name: gemini-3-flash-preview
-    litellm_params:
+    model_params:
       model: gemini/gemini-3-flash-preview
       api_key: "${GEMINI_API_KEY}"
     cost_per_1m_output: 0.15          # $0.15 per 1M total tokens (blended)
 
   # Key pooling: same model_name + different api_key = load-balanced
   - model_name: nvidia-nemotron-...
-    litellm_params:
+    model_params:
       model: openrouter/nvidia/...
       api_key: "${OPENROUTER_API_KEY}"
       api_base: "https://openrouter.ai/api/v1"

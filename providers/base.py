@@ -10,20 +10,6 @@ import httpx
 _log = logging.getLogger("llm-pico.providers.base")
 
 _shared_clients: dict[str, httpx.AsyncClient] = {}
-_shared_clients_lock: Any = None
-
-
-def _get_lock():
-    global _shared_clients_lock
-    if _shared_clients_lock is None:
-        import asyncio
-        try:
-            _shared_clients_lock = asyncio.Lock()
-        except RuntimeError:
-            _shared_clients_lock = None
-    return _shared_clients_lock
-
-
 def _get_client(provider_slug: str) -> httpx.AsyncClient:
     if provider_slug in _shared_clients:
         return _shared_clients[provider_slug]
@@ -138,4 +124,5 @@ class BaseAdapter(ABC):
         return chunks, usage
 
     async def close(self) -> None:
-        pass
+        if getattr(self, '_owns_client', False) and hasattr(self, 'client'):
+            await self.client.aclose()

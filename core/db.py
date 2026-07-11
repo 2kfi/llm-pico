@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 import aiosqlite
 
 _db_pool: asyncio.Queue[aiosqlite.Connection] | None = None
+_db_path: str | None = None
 _POOL_SIZE = 2
 _log = logging.getLogger("llm-pico.db")
 
@@ -122,9 +123,10 @@ async def _configure_conn(conn: aiosqlite.Connection) -> None:
 
 
 async def init_db(db_path: str) -> None:
-    global _db_pool
+    global _db_pool, _db_path
     if _db_pool is not None:
         return
+    _db_path = db_path
     pool: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue(maxsize=_POOL_SIZE)
     for _ in range(_POOL_SIZE):
         conn = await aiosqlite.connect(db_path)
@@ -141,7 +143,17 @@ async def get_db() -> AsyncIterator[aiosqlite.Connection]:
     conn = await _db_pool.get()
     try:
         yield conn
-    finally:
+    except (Exception, asyncio.CancelledError):
+        try:
+            await conn.close()
+        except Exception:
+            pass
+        if _db_path:
+            new_conn = await aiosqlite.connect(_db_path)
+            await _configure_conn(new_conn)
+            await _db_pool.put(new_conn)
+        raise
+    else:
         await _db_pool.put(conn)
 
 
@@ -166,12 +178,12 @@ async def prune_logs(usage_days: int = 30, admin_days: int = 90) -> tuple[int, i
     admin_cutoff = time.time() - admin_days * 86400
     async with get_db() as conn:
         cursor = await conn.execute(
-            "DELETE FROM usage_log WHERE created_at < datetime(?, 'unixepoch')",
+            "DELETE FROM usage_log WHERE REPLACE(created_at, 'T', ' ') < datetime(?, 'unixepoch')",
             (usage_cutoff,),
         )
         usage_deleted = cursor.rowcount
         cursor = await conn.execute(
-            "DELETE FROM admin_log WHERE created_at < datetime(?, 'unixepoch')",
+            "DELETE FROM admin_log WHERE REPLACE(created_at, 'T', ' ') < datetime(?, 'unixepoch')",
             (admin_cutoff,),
         )
         admin_deleted = cursor.rowcount

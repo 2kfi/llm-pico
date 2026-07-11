@@ -74,10 +74,15 @@ const es=new EventSource('/admin/logs/stream');
 es.onmessage=e=>{
   const d=JSON.parse(e.data);
   if(d.type==='keepalive') return;
-  const ts=d.ts||'';
   const line=document.createElement('div');
-  const statusClass=d.status===200?'log-status-ok':'log-status-err';
-  line.innerHTML=`<span class="log-ts">${ts}</span> <span class="log-model">${d.model||'?'}</span> <span class="log-status ${statusClass}">[${d.status}]</span> tokens:<span class="log-tokens">${d.total_tokens||0}</span> cost:<span class="log-cost">$${(d.cost_usd||0).toFixed(6)}</span> ${d.key_prefix||''}`;
+  const ts=document.createElement('span'); ts.className='log-ts'; ts.textContent=d.ts||'';
+  const model=document.createElement('span'); model.className='log-model'; model.textContent=d.model||'?';
+  const status=document.createElement('span');
+  status.className=d.status===200?'log-status-ok':'log-status-err';
+  status.textContent=`[${d.status}]`;
+  const tokens=document.createElement('span'); tokens.className='log-tokens'; tokens.textContent=`tokens:${d.total_tokens||0}`;
+  const cost=document.createElement('span'); cost.className='log-cost'; cost.textContent=` cost:$${(d.cost_usd||0).toFixed(6)}`;
+  line.append(ts,' ',model,' ',status,' ',tokens,' ',cost,' ',d.key_prefix||'');
   el.appendChild(line);
   el.scrollTop=el.scrollHeight;
   if(el.children.length>1000) el.removeChild(el.children[0]);

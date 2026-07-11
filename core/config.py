@@ -69,7 +69,7 @@ class GeneralSettings:
 
 
 @dataclass
-class LitellmParams:
+class ModelParams:
     model: str = ""
     api_key: str | None = None
     api_base: str | None = None
@@ -78,7 +78,7 @@ class LitellmParams:
 @dataclass
 class ModelEntry:
     model_name: str
-    litellm_params: LitellmParams
+    model_params: ModelParams
     rpm: int | None = None
     rpd: int | None = None
     tpm: int | None = None
@@ -154,10 +154,10 @@ def load_config(path: str) -> Config:
 
     # model_list
     for entry in raw.get("model_list") or []:
-        lp = entry.get("litellm_params") or {}
+        lp = entry.get("model_params") or {}
         model_entry = ModelEntry(
             model_name=entry["model_name"],
-            litellm_params=LitellmParams(
+            model_params=ModelParams(
                 model=lp.get("model", ""),
                 api_key=lp.get("api_key"),
                 api_base=lp.get("api_base"),
