@@ -44,10 +44,16 @@ class ModelEntry:
     rpd: int | None = None
     tpm: int | None = None
     tpd: int | None = None
+    ash: int | None = None
+    asd: int | None = None
     images: bool = False
     embeddings: bool = False
     stt: bool = False
     tts: bool = False
+    failover_model: str | None = None
+    can_cache: bool = False
+    cost_per_1m_input: float | None = None
+    cost_per_1m_output: float | None = None
 
 
 @dataclass
@@ -117,10 +123,16 @@ def load_config(path: str) -> Config:
             rpd=entry.get("rpd"),
             tpm=entry.get("tpm"),
             tpd=entry.get("tpd"),
+            ash=entry.get("ash"),
+            asd=entry.get("asd"),
             images=entry.get("images", False),
             embeddings=entry.get("embeddings", False),
             stt=entry.get("stt", False),
             tts=entry.get("tts", False),
+            failover_model=entry.get("failover-model"),
+            can_cache=entry.get("can_cache", False),
+            cost_per_1m_input=entry.get("cost_per_1m_input"),
+            cost_per_1m_output=entry.get("cost_per_1m_output"),
         )
         cfg.model_list.append(model_entry)
 

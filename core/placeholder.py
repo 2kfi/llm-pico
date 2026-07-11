@@ -10,9 +10,7 @@ NOT_IMPLEMENTED = {
         "variations": "Image variations are not yet supported",
     },
     "audio": {
-        "transcriptions": "Audio transcription is not yet supported",
         "translations": "Audio translation is not yet supported",
-        "speech": "Text-to-speech is not yet supported",
     },
     "moderations": {"moderations": "Moderation is not yet supported"},
 }

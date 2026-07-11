@@ -5,8 +5,8 @@ from pathlib import Path
 import click
 import uvicorn
 
-from .config import load_config, load_users
-from .server import create_app
+from core.config import load_config, load_users
+from api.server import create_app
 
 
 @click.command()

@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from .config import Config, ModelEntry, RouterSettings
+from core.config import Config, ModelEntry, RouterSettings
 
 _log = logging.getLogger("llm-pico.router")
 

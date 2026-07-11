@@ -6,10 +6,10 @@ from typing import Any
 
 import httpx
 
-from .base import BaseAdapter
-from . import register
+from providers.base import BaseAdapter
+from providers import register
 
-_log = logging.getLogger("llm-pico.adapter.cloudflare")
+_log = logging.getLogger("llm-pico.providers.cloudflare")
 
 
 @register("cloudflare")

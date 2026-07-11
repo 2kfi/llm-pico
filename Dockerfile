@@ -1,7 +1,10 @@
 FROM python:3.12-slim AS builder
 WORKDIR /app
 COPY pyproject.toml .
-COPY llm_pico/ ./llm_pico/
+COPY core/ ./core/
+COPY providers/ ./providers/
+COPY api/ ./api/
+COPY website/ ./website/
 RUN pip install --no-cache-dir build && python -m build --wheel
 
 FROM python:3.12-slim

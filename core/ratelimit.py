@@ -6,11 +6,11 @@ import time
 from collections import defaultdict
 from typing import Any, Literal
 
-from . import db as db_module
+from core import db as db_module
 
 _log = logging.getLogger("llm-pico.ratelimit")
 
-_WINDOW_TYPES = ("rpm", "rpd", "tpm", "tpd")
+_WINDOW_TYPES = ("rpm", "rpd", "tpm", "tpd", "ash", "asd")
 
 _InMemCounter = dict[str, Any]
 
@@ -29,7 +29,7 @@ class RateLimiter:
 
     def _window_start(self, window_type: str) -> str:
         now = time.time()
-        if window_type in ("rpm", "tpm"):
+        if window_type in ("rpm", "tpm", "ash"):
             return time.strftime("%Y-%m-%dT%H:%M:00", time.gmtime(now))
         return time.strftime("%Y-%m-%d", time.gmtime(now))
 
@@ -57,25 +57,27 @@ class RateLimiter:
         limits: dict[str, int | None],
         reservation: int = 0,
     ) -> dict[str, Any] | None:
-        for window_type in ("rpm", "tpm", "rpd", "tpd"):
+        for window_type in ("rpm", "tpm", "ash", "rpd", "tpd", "asd"):
             limit = limits.get(window_type)
             if limit is None:
                 continue
 
             level = limits.get("_level", "user")
             async with self._shard_lock(key_hash, model_name):
-                if window_type in ("rpm", "tpm"):
+                if window_type in ("rpm", "tpm", "ash"):
                     entry = self._mem.get(self._mem_key(key_hash, model_name, level, window_type))
                     if entry is None or entry["window_start"] != self._window_start(window_type):
-                        entry = await self._load_from_db(key_hash, model_name, level, window_type)
+                        entry = {"window_start": self._window_start(window_type), "count": 0, "dirty": False}
+                        self._mem[self._mem_key(key_hash, model_name, level, window_type)] = entry
 
                     check_count = entry["count"] + reservation
                     if check_count > limit:
+                        retry = 60 if window_type == "rpm" else 3600 if window_type == "ash" else 60
                         return {
                             "exceeded": window_type,
                             "limit": limit,
                             "count": entry["count"],
-                            "retry_after": 60 if window_type in ("rpm", "tpm") else 86400,
+                            "retry_after": retry,
                         }
                     entry["count"] += reservation
                     entry["dirty"] = True
@@ -157,8 +159,8 @@ class RateLimiter:
                 if entry is None or not entry["dirty"]:
                     continue
                 key_hash, model_name, level, window_type = mk
-                # Only persist RPD/TPD to SQLite; RPM/TPM are in-memory only
-                if window_type not in ("rpd", "tpd"):
+                # Only persist RPD/TPD/ASD to SQLite; RPM/TPM/ASH are in-memory only
+                if window_type not in ("rpd", "tpd", "asd"):
                     entry["dirty"] = False
                     continue
                 await db.execute(

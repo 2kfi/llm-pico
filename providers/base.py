@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-_log = logging.getLogger("llm-pico.adapter")
+_log = logging.getLogger("llm-pico.providers.base")
 
 
 class BaseAdapter(ABC):
@@ -64,6 +64,9 @@ class BaseAdapter(ABC):
     @abstractmethod
     async def proxy_request(self, body_bytes: bytes, model_string: str) -> httpx.Response:
         ...
+
+    async def proxy_tts(self, body_bytes: bytes, model_string: str) -> httpx.Response:
+        raise NotImplementedError("TTS not supported by this adapter")
 
     async def proxy_stream(
         self, response: httpx.Response

@@ -14,11 +14,11 @@ dependencies = [
 ]
 
 [project.scripts]
-llm-pico = "llm_pico.cli:main"
+llm-pico = "api.cli:main"
 
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["llm_pico*"]
+include = ["core*", "providers*", "api*", "website*"]

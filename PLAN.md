@@ -1,28 +1,68 @@
 # llm-pico — Full Implementation Plan
 
+> **Note**: This is a **living document** reflecting the *actual* current state of the codebase, not an aspirational design doc. It is updated as the project evolves.
+
+## Codebase Restructure (Current)
+
+The codebase has been restructured into a clean layered architecture with three main packages:
+
+- **`api/`** — All HTTP/FastAPI concerns (routes, middleware, CLI entry point)
+- **`core/`** — Pure business logic (no HTTP imports, just functions that take params and return values)
+- **`providers/`** — Provider adapters, lazily loaded on demand via `importlib`
+- **`website/`** — Web dashboard SPA served at `/admin/dashboard`
+- **`temp/tests/`** — All 45 tests, mirroring the `core/` and `api/` structure
+
+Key principle: `core/` never imports FastAPI. `api/` imports from `core/` and `providers/`. Provider adapters are loaded only when first needed, keeping startup fast.
+
+---
+
 ## 1. Overview
 
-**llm-pico** is a lightweight (<200MB RAM) LLM proxy that presents a single OpenAI-compatible endpoint and routes requests to 11 different LLM providers. It handles authentication, rate limiting, usage tracking, and provider switching behind the scenes.
+**llm-pico** is a hyper-lightweight (<200MB RAM) LLM proxy that presents a single OpenAI-compatible endpoint and routes to 15+ models across 7 providers. It handles authentication, capability gating, per-user + per-model rate limiting (hybrid in-memory/SQLite), usage tracking, circuit breaker retry, failover, and admin API behind the scenes.
 
 ### Core Design Decisions
 
 | Decision | Choice | Rationale |
-|---|---|---|---|
-| Language | Python | LiteLLM compat, rich ecosystem |
+|---|---|---|
+| Language | Python 3.11+ | LiteLLM compat, rich ecosystem |
 | HTTP framework | FastAPI | Async, OpenAI-compat docs, Pydantic validation built-in |
-| HTTP client | httpx | Async, per-provider connection pools |
+| HTTP client | httpx | Async, per-provider connection pools, pool_timeout fix (`pool=` kwarg) |
 | Database | SQLite + aiosqlite | Zero-dependency persistence, survives restarts |
-| Rate limiting (RPM/TPM) | In-memory sharded counters (dict + asyncio.Lock) | ~200ns per check, zero DB write contention on hot path |
-| Rate limiting (RPD/TPD) | SQLite rate_counters, flush every 10s if changed | Day-level windows tolerate latency; SQLite for durability |
-| Provider adapters | Custom (no SDKs) | Tiny dependency footprint, full control over format translation |
+| Rate limiting (RPM/TPM/ASH) | In-memory sharded counters (dict + asyncio.Lock) | ~200ns per check, zero DB write contention on hot path |
+| Rate limiting (RPD/TPD/ASD) | SQLite rate_counters, flush every 10s if changed | Day-level windows tolerate latency; SQLite for durability |
+| Provider adapters | Custom (no SDKs), lazy-loaded | Tiny dependency footprint, full control over format translation, imports only when needed |
 | Passthrough parsing | Raw bytes for OpenAI-compat providers | Parse only model/stream/max_tokens (3 fields), forward raw JSON. No Pydantic overhead on hot path. |
 | Token burst protection | Anticipatory reservation | Reserve `prompt+max_tokens` upfront per stream. Release unused post-stream. Prevents concurrent burst overshoot. |
-| Provider outage handling | Error-class-aware retry + circuit breaker | 5xx → fail fast, no retry. 429 → swap key. Circuit breaker: 3 consecutive 5xx = open 30s. |
+| Provider outage handling | Error-class-aware retry + circuit breaker + failover | 429 → cool down key. 400/401/403/404/501 → propagate immediately. 5xx → circuit breaker (3 consecutive = open 30s). All retries exhausted → try failover-model (1 level, no chaining). |
+| Capability gating | Explicit YAML flags only (images, embeddings, stt, tts) | Both model-level flag + adapter-level class var; no auto-detection |
+| Audio (STT/TTS) | Full route handlers with retry loop | multipart form for STT, JSON for TTS; ash/asd rate limits |
+| Teams & Users | Hierarchy: Team → User → API Key | Each level has own rate limits; per-user monthly budget only (no team-level budget) |
+| Cost tracking | per-model `cost_per_1m_input` + `cost_per_1m_output` (USD) | Computed at request time, logged to `usage_log.cost_usd`; blended fallback |
+| Live log stream | Internal asyncio.Queue pub/sub + SSE endpoint | Zero external deps; per-subscriber backpressure (maxsize 256, drop oldest) |
+| Exact-match caching | SQLite request_cache table, SHA-256 body key | Per-model opt-in (`can_cache: true`), TTL 1h, skips upstream on hit |
 | TLS | Reverse proxy only (nginx/caddy) | Keep the proxy simple |
-| Deployment | pip package + Docker image | Both options |
+| Deployment | pip package + Docker | Both options |
 | Port | 4000 | Default listen port |
-| Key format | `sk-pico-<random>` | Distinct from raw OpenAI keys |
-| Config reload | Graceful drain + restart | Track active streams, drain with timeout, then restart |
+| Key format | `sk-pico-<64-hex>` | Distinct from raw provider keys |
+| Config reload | Graceful drain + `os.execve()` restart | Track active streams via request registry, drain with 120s timeout, then exec |
+| Architecture | Layered (`api/` + `core/` + `providers/`) | Clear separation of HTTP layer from business logic; easy to test core in isolation |
+
+### Provider Matrix
+
+All providers are **lazy-loaded** via `providers/__init__.py`. Calling `get_adapter("anthropic")` triggers `importlib.import_module()` only on first use. OpenAI adapter is always importable as fallback.
+
+| Provider Slug | Adapter | Images | Embeddings | STT | TTS | Adapts From/To |
+|---|---|---|---|---|---|---|
+| `openai` | OpenAIAdapter | ✅ | ✅ | ✅ | ✅ | Passthrough |
+| `anthropic` | AnthropicAdapter | ✅ | ❌ | ❌ | ❌ | Anthropic ↔ OpenAI |
+| `gemini` | GeminiAdapter | ✅ | ✅ | ❌ | ❌ | Gemini ↔ OpenAI |
+| `cloudflare` | CloudflareAdapter | ❌ | ✅ | ❌ | ❌ | Passthrough (prefix-stripping) |
+| `groq` | OpenAIAdapter (fallback) | ❌ | ❌ | ✅ | ✅ | Passthrough (needs api_base) |
+| `zhipu` | OpenAIAdapter (fallback) | ❌ | ❌ | ❌ | ❌ | Passthrough |
+| `openrouter` | OpenAIAdapter (fallback) | ❌ | ❌ | ❌ | ❌ | Passthrough |
+| `nvidia_nim` | OpenAIAdapter (fallback) | ❌ | ❌ | ❌ | ❌ | Passthrough |
+
+Unregistered slugs fall through to `OpenAIAdapter` via `get_adapter(slug) or OpenAIAdapter` in `api/server.py`.
 
 ---
 
@@ -31,42 +71,64 @@
 ```
 /home/2kfi/.llm-pico/
 ├── pyproject.toml              # PEP 621 project metadata + deps
-├── README.md                   # Usage guide (Phase 3)
-├── Dockerfile                  # Multi-stage Docker build (Phase 3)
-├── docker-compose.yml          # Quick-start compose (Phase 3)
-├── config.example.yaml         # Reference config with all providers
+├── README.md                   # Quick start, config reference, admin API docs
+├── PLAN.md                     # This file — living implementation plan
+├── Dockerfile                  # Multi-stage Docker build (python:3.12-slim, 168MB)
+├── .dockerignore
+├── .gitignore
+├── config.example.yaml         # Reference config with all 7 providers (placeholder keys)
 ├── users.example.yaml          # Reference user keys file
 │
-└── llm_pico/
-    ├── __init__.py             # Package metadata
-    ├── __main__.py             # python -m llm_pico entry
-    ├── cli.py                  # Click CLI: llm-pico [options]
-    ├── config.py               # Load + validate config.yaml + users.yaml
-    ├── server.py               # FastAPI app factory
-    ├── auth.py                 # API key lookup + model allowlist check
-    ├── router.py               # Model→provider resolution + key pooling
-    ├── ratelimit.py            # Fixed-window counters (user + model level)
-    ├── db.py                   # SQLite schema init + connection management
-    ├── models.py               # Pydantic request/response schemas
-    ├── admin.py                # Admin API router (/admin/*)
-    ├── usage.py                # Usage logging to SQLite
-    │
-    ├── adapters/
-    │   ├── __init__.py         # Adapter registry
-    │   ├── base.py             # Abstract base adapter
-    │   ├── openai.py           # OpenAI (passthrough)
-    │   ├── anthropic.py        # Anthropic (translate)
-    │   ├── gemini.py           # Google Gemini (translate)
-    │   ├── groq.py             # Groq (OpenAI-compat passthrough)
-    │   ├── openrouter.py       # OpenRouter (OpenAI-compat passthrough)
-    │   ├── cloudflare.py       # Cloudflare Workers AI (translate)
-    │   ├── nvidia.py           # NVIDIA NIM (OpenAI-compat passthrough)
-    │   ├── zhipu.py            # Zhipu AI (translate)
-    │   ├── ollama.py           # Ollama (OpenAI-compat, api_base)
-    │   ├── llamacpp.py         # llama.cpp (OpenAI-compat, api_base)
-    │   └── vllm.py             # vLLM (OpenAI-compat, api_base)
-    │
-    └── placeholder.py          # 501 stubs for image/audio/moderation
+├── api/                        # FastAPI routes, HTTP layer
+│   ├── __init__.py
+│   ├── __main__.py             # python -m entry
+│   ├── cli.py                  # Click CLI + uvicorn launcher
+│   ├── server.py               # FastAPI app, lifespan, all proxy route handlers
+│   └── admin.py                # Admin REST API (keys, teams, users, stats, logs, config reload)
+│
+├── core/                       # Business logic (no HTTP)
+│   ├── __init__.py             # version string
+│   ├── config.py               # YAML -> dataclasses
+│   ├── db.py                   # SQLite schema + connection
+│   ├── auth.py                 # API key verification + user/team hierarchy
+│   ├── router.py               # Model resolution + circuit breaker
+│   ├── ratelimit.py            # Hybrid rate limiter (in-memory + SQLite)
+│   ├── usage.py                # Usage logging + cost + stats
+│   ├── teams.py                # Team/User CRUD + budget + limit merging
+│   ├── events.py               # SSE pub/sub (asyncio.Queue)
+│   ├── cache.py                # Exact-match request cache
+│   ├── models.py               # Pydantic schemas
+│   └── placeholder.py          # 501 stubs for unsupported endpoints
+│
+├── providers/                  # Provider adapters (lazy-loaded on demand)
+│   ├── __init__.py             # Lazy registry (load adapter only when needed)
+│   ├── base.py                 # BaseAdapter ABC
+│   ├── openai.py               # OpenAI passthrough (fallback for unknown slugs)
+│   ├── anthropic.py            # Anthropic ↔ OpenAI translation
+│   ├── gemini.py               # Gemini ↔ OpenAI translation
+│   └── cloudflare.py           # Cloudflare passthrough (prefix-stripping)
+│
+├── website/                    # Web dashboard SPA
+│   ├── __init__.py
+│   ├── routes.py               # FastAPI router for static files
+│   └── static/
+│       └── index.html          # Self-contained SPA (keys, teams, users, budgets, logs)
+│
+├── temp/
+│   └── tests/                  # All 45 tests (mirrors core/ structure)
+│       ├── conftest.py         # 4 fixtures: config, single_model, multi_key, dual_group
+│       ├── test_router.py      # 7 tests: resolve, cooldown, circuit breaker FSM
+│       ├── test_ratelimit.py   # 10 tests: RPM, reservations, reconcile, user+model levels, ASH/ASD
+│       ├── test_retry_loop.py  # 5 tests: 5xx retry, exhaustion, non-retryable, failover, no-chain
+│       ├── test_cost.py        # 5 tests: both rates, blended, null, zero
+│       ├── test_events.py      # 3 tests: emit, multiple subs, backpressure
+│       ├── test_teams.py       # 11 tests: CRUD, limits, budget, cascade, hierarchy
+│       └── test_cache.py       # 4 tests: set/get, key uniqueness, expiry, clear
+│
+├── docs/
+│   └── understand.md           # Full codebase walkthrough
+│
+├── config-litellm.yml          # UNTRACKED — active config with real API keys (secrets!)
 ```
 
 ---
@@ -81,32 +143,28 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
-    "httpx>=0.28.0",
+    "httpx>=0.28.0",      # pool_timeout kwarg renamed to pool= in >=0.28
     "aiosqlite>=0.20.0",
     "click>=8.1.0",
     "pyyaml>=6.0",
     "pydantic>=2.0",
-    "pydantic-settings>=2.0",
 ]
 ```
 
-No provider SDKs. All upstream communication via `httpx`.
+No provider SDKs. All upstream communication via `httpx.AsyncClient`.
 
-Each provider adapter gets its own `httpx.AsyncClient` with bounded connection limits:
+### httpx Pool Configuration
+
 ```python
 limits=httpx.Limits(
-    max_connections=5,           # 5 concurrent outbound connections per provider
-    max_keepalive_connections=3, # 3 kept alive between requests
-    keepalive_expiry=30.0,       # seconds before closing idle keepalive
+    max_connections=5,
+    max_keepalive_connections=3,
+    keepalive_expiry=30.0,
 )
-timeout=httpx.Timeout(
-    connect=10.0,                # 10s TCP connect timeout
-    read=300.0,                  # 5min read timeout (for long streaming)
-    pool_timeout=10.0,           # 10s wait for a pool slot
-)
+timeout=httpx.Timeout(300.0, connect=10.0, pool=10.0)
 ```
 
-11 providers × 5 connections = 55 outbound sockets max at any time. Well within the default 1024 FD soft limit.
+**CRITICAL:** `httpx >= 0.28` renamed `pool_timeout=` → `pool=`. The old keyword raises `TypeError`.
 
 ---
 
@@ -114,343 +172,270 @@ timeout=httpx.Timeout(
 
 File: auto-created at `{db_dir}/llm-pico.db` (default: next to config, overridable with `--db`).
 
+### Current Tables
+
 ```sql
 CREATE TABLE IF NOT EXISTS user_keys (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    key_hash        TEXT    NOT NULL UNIQUE,  -- SHA-256 of the raw key
-    key_prefix      TEXT    NOT NULL,          -- First 12 chars for display (sk-pico-a1b2c3...)
-    label           TEXT,                      -- Human-friendly name
+    key_hash        TEXT    NOT NULL UNIQUE,     -- SHA-256 of raw key
+    key_prefix      TEXT    NOT NULL,             -- First 12 chars for display
+    label           TEXT,
     is_active       INTEGER NOT NULL DEFAULT 1,
-    created_at      TEXT    NOT NULL,          -- ISO-8601
-    expires_at      TEXT,                     -- ISO-8601 or NULL
-    model_allowlist TEXT,                     -- JSON array ["gpt-4",...] or NULL (all)
-    rpm_limit       INTEGER,                  -- Per-user request limit per minute
-    rpd_limit       INTEGER,                  -- Per-user request limit per day
-    tpm_limit       INTEGER,                  -- Per-user token limit per minute
-    tpd_limit       INTEGER                   -- Per-user token limit per day
+    created_at      TEXT    NOT NULL,             -- ISO-8601
+    expires_at      TEXT,
+    model_allowlist TEXT,                         -- JSON array or NULL (all)
+    rpm_limit       INTEGER,
+    rpd_limit       INTEGER,
+    tpm_limit       INTEGER,
+    tpd_limit       INTEGER,
+    user_id         INTEGER,                     -- FK to users(id) — NULL for legacy keys
+    FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
 CREATE TABLE IF NOT EXISTS usage_log (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     key_hash          TEXT    NOT NULL,
     key_prefix        TEXT    NOT NULL,
-    model_name        TEXT    NOT NULL,        -- The user-facing model_name
-    provider          TEXT    NOT NULL,        -- The provider slug (openai, anthropic...)
-    request_id        TEXT    NOT NULL,        -- UUID generated by proxy
+    model_name        TEXT    NOT NULL,
+    provider          TEXT    NOT NULL,
+    request_id        TEXT    NOT NULL,             -- UUID generated by proxy
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens      INTEGER NOT NULL DEFAULT 0,
     latency_ms        INTEGER NOT NULL DEFAULT 0,
     status_code       INTEGER NOT NULL,
-    error             TEXT,                    -- Error message if any, NULL on success
-    created_at        TEXT    NOT NULL         -- ISO-8601
+    error             TEXT,
+    cost_usd          REAL,                        -- Computed at request time, NULL if model has no pricing
+    created_at        TEXT    NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_usage_key   ON usage_log(key_hash);
+CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_log(model_name);
+CREATE INDEX IF NOT EXISTS idx_usage_time  ON usage_log(created_at);
 
-CREATE INDEX IF NOT EXISTS idx_usage_key    ON usage_log(key_hash);
-CREATE INDEX IF NOT EXISTS idx_usage_model  ON usage_log(model_name);
-CREATE INDEX IF NOT EXISTS idx_usage_time   ON usage_log(created_at);
-
--- Rate limit counters (fixed-window)
 CREATE TABLE IF NOT EXISTS rate_counters (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     key_hash      TEXT    NOT NULL,
     model_name    TEXT    NOT NULL,
     level         TEXT    NOT NULL CHECK(level IN ('user', 'model')),
-    window_type   TEXT    NOT NULL CHECK(window_type IN ('rpm', 'rpd', 'tpm', 'tpd')),
-    window_start  TEXT    NOT NULL,            -- ISO-8601 truncated to minute or day
+    window_type   TEXT    NOT NULL CHECK(window_type IN ('rpd', 'tpd', 'asd')),
+    window_start  TEXT    NOT NULL,                  -- ISO-8601 truncated to minute or day
     count         INTEGER NOT NULL DEFAULT 0,
     UNIQUE(key_hash, model_name, level, window_type, window_start)
 );
 
--- Admin audit log (who did what, when)
 CREATE TABLE IF NOT EXISTS admin_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    action      TEXT    NOT NULL,              -- create_key, revoke_key, set_limits, etc.
-    actor_hash  TEXT    NOT NULL,              -- master key hash
-    details     TEXT,                          -- JSON payload with action details
+    action      TEXT    NOT NULL,
+    actor_hash  TEXT    NOT NULL,
+    details     TEXT,
     created_at  TEXT    NOT NULL
+);
+```
+
+### New Tables: Teams & Users
+
+```sql
+CREATE TABLE IF NOT EXISTS teams (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL UNIQUE,
+    description     TEXT,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT    NOT NULL,
+    model_allowlist TEXT,                       -- JSON array or NULL
+    rpm_limit       INTEGER,                     -- Team-level limit override
+    rpd_limit       INTEGER,
+    tpm_limit       INTEGER,
+    tpd_limit       INTEGER
+    -- NOTE: No monthly_budget_usd — per-user budget only
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id           INTEGER NOT NULL REFERENCES teams(id),
+    email             TEXT    NOT NULL UNIQUE,
+    name              TEXT    NOT NULL,
+    is_active         INTEGER NOT NULL DEFAULT 1,
+    created_at        TEXT    NOT NULL,
+    model_allowlist   TEXT,                      -- JSON array or NULL
+    rpm_limit         INTEGER,                    -- User-level limit override
+    rpd_limit         INTEGER,
+    tpm_limit         INTEGER,
+    tpd_limit         INTEGER,
+    monthly_budget_usd REAL                      -- Per-user monthly cap (USD); NULL = no cap
 );
 ```
 
 ---
 
-## 5. Rate Limiting — Two Layers × Two Storage Tiers
+## 5. Rate Limiting — Three Layers × Six Window Types
 
-### Layer 1: Model-Level Limits (aggregate across all users)
-Configured on each model entry in `config.yaml`:
-```yaml
-- model_name: gpt-5.4-mini
-  litellm_params:
-    model: openai/gpt-5.4-mini
-    api_key: "..."
-  rpm: 50       # Aggregate request limit per minute
-  rpd: 5000     # Aggregate request limit per day
-  tpm: 100000   # Aggregate token limit per minute
-  tpd: 1000000  # Aggregate token limit per day
-```
+### Three Layers (with Teams)
 
-### Layer 2: User-Level Limits (per API key)
-Configured per user key in `users.yaml`:
-```yaml
-- key: "sk-pico-dev-..."
-  label: "dev-bot"
-  models: [gpt-5.4-mini, gemma-4-31b-it]
-  rpm: 100
-  rpd: 10000
-```
+1. **Model-Level Limits** — Configured per `model_list` entry in config YAML:
+   ```yaml
+   - model_name: gpt-5.4-mini
+     rpm: 50
+     rpd: 5000
+   ```
 
-### Storage Strategy: Hybrid In-Memory + SQLite
+2. **User-Level Limits** — Resolved from hierarchy (most restrictive wins):
+   ```
+   effective_limit = min(
+       key.row.rpm_limit,        # from user_keys
+       user.row.rpm_limit,       # from users table (NULL = inherit)
+       team.row.rpm_limit        # from teams table (NULL = unlimited)
+   )
+   ```
 
-Not all windows are equal. Per-minute windows (RPM/TPM) are on the hot path — checked on every request and reset every 60s. Per-day windows (RPD/TPD) reset every 24h and tolerate slightly stale reads.
+3. **Per-User Monthly Budget** — Checked on every request (individual cap only, no team-level budget):
+   ```
+   user_spend = SELECT SUM(cost_usd) FROM usage_log
+                WHERE key_hash IN (SELECT key_hash FROM user_keys WHERE user_id = ?)
+                AND created_at >= start_of_month()
+   if user_spend + this_request_cost > user.monthly_budget_usd → 429
+   ```
 
-| Window Types | Storage | Why |
-|---|---|---|
-| **RPM, TPM** | In-memory Python `dict` with `asyncio.Lock` per shard | ~200ns atomic increments. No SQLite write contention. |
-| **RPD, TPD** | SQLite `rate_counters` table | Durable. Flushed from memory every 10s only if value changed. |
+### Six Window Types × Two Storage Tiers
 
-**Key insight:** SQLite writes serialize globally. By keeping RPM/TPM in memory, we eliminate the hottest SQLite contention entirely. RPD/TPD writes are infrequent enough (a few thousand per day per key-model) that SQLite handles them trivially.
-
-### In-Memory Counter Architecture
-
-```
-rate_cache: dict[
-    (key_hash, model_name, level, 'rpm' | 'tpm'),  # key
-    {
-        "window_start": "2026-07-10T14:35:00",
-        "count": 42,
-        "dirty": True,            # needs SQLite flush
-    }
-]
-```
-
-- Each unique key gets its own `asyncio.Lock` (sharded by hash of the key)
-- Increment: acquire lock, check window, increment
-- Background task every 10s: iterate dirty entries, UPSERT into SQLite, clear dirty flag
-- On startup: load RPD/TPD counters from SQLite (RPM/TPM start at 0 since old windows are already expired)
-
-### Pre-Request Check Flow
-
-```
-1. Parse request → extract key_hash, model_name
-2. Look up user key's limits, model's limits
-3. Check RPM/TPM (in-memory, fast path):
-   a. Compute minute window_start
-   b. Look up or create in-memory counter
-   c. Acquire shard lock → if count >= limit → 429
-   d. Atomic increment → release lock
-4. Check RPD/TPD (SQLite, slower path):
-   a. Compute day window_start
-   b. SELECT count FROM rate_counters (read from SQLite directly for RPD/TPD)
-   c. If count >= limit → 429
-   d. Increment in-memory, mark dirty (flushed to SQLite every 10s)
-```
-
-### Streaming Token Tracking: Estimate + Reconcile
-
-TPM and TPD limits require knowing token counts *before* allowing a request. But for streaming completions, total tokens are only known after the final SSE chunk.
-
-**Pre-stream estimation:**
-```
-prompt_tokens = count with tiktoken (or fallback: len(text) // 4)
-estimated_output = request.max_tokens  # from the request body
-  OR configurable default (4096)        # if max_tokens not set
-estimated_total = prompt_tokens + estimated_output
-
-check: current_count + estimated_total < limit
-```
-
-**Post-stream reconciliation:**
-After the final SSE `data: [DONE]` chunk (or after the response is fully buffered):
-```
-actual_tokens = response.usage.total_tokens  # from provider's final chunk
-delta = actual_tokens - estimated_total
-
-# Adjust counters:
-#   If we over-estimated (delta < 0): decrement TPM/TPD counter
-#   If we under-estimated (delta > 0): increment TPM/TPD counter
-#   This keeps counters accurate even after a long stream
-```
-
-**Why this works:**
-- Estimation prevents gross overshoot (a 100k-token stream needs `max_tokens` set high enough)
-- Reconciliation corrects the counter so the *next* request has an accurate view
-- The edge case (under-estimate followed by another request before reconcile) is bounded by the estimate cap
-
-### What Gets Logged vs. What Gets Counted
-
-| Data | Logged to `usage_log` (immutable) | Counted in `rate_counters` (reconciled) |
-|---|---|---|
-| Prompt tokens | Yes, actual from response | Yes, adjusted post-stream |
-| Completion tokens | Yes, actual from response | Yes, adjusted post-stream |
-| Total tokens | Yes, actual from response | Yes, adjusted post-stream |
-| Latency | Yes, from wall clock | No |
-| Model name | Yes | Implicit via counter key |
-| Provider | Yes | No |
-| Status code | Yes | No |
+| Window | Meaning | Resolution | Storage | retry_after |
+|---|---|---|---|---|
+| **RPM** | Requests per minute | per-minute window | In-memory dict | 60s |
+| **TPM** | Tokens per minute | per-minute window | In-memory dict | 60s |
+| **RPD** | Requests per day | daily window | SQLite (flush every 10s if dirty) | 86400s |
+| **TPD** | Tokens per day | daily window | SQLite (flush every 10s if dirty) | 86400s |
+| **ASH** | Audio seconds per hour | per-hour window | In-memory dict | 3600s |
+| **ASD** | Audio seconds per day | daily window | SQLite (flush every 10s if dirty) | 86400s |
 
 ---
 
 ## 6. API Surface
 
-### Public Endpoints (User API Key)
+### Public Endpoints (User or Master API Key)
 
-| Method | Path | Body | Response | Streaming |
-|---|---|---|---|---|
-| `POST` | `/v1/chat/completions` | ChatCompletionRequest | ChatCompletionResponse | SSE (stream=True) |
-| `POST` | `/v1/completions` | CompletionRequest | CompletionResponse | SSE |
-| `POST` | `/v1/embeddings` | EmbeddingRequest | EmbeddingResponse | No |
-| `GET` | `/v1/models` | — | ModelList (filtered by key) | No |
-| `GET` | `/v1/models/{model}` | — | ModelObject | No |
-| `POST` | `/v1/images/generations` | — | 501 placeholder | No |
-| `POST` | `/v1/audio/transcriptions` | — | 501 placeholder | No |
-| `POST` | `/v1/audio/speech` | — | 501 placeholder | No |
-| `POST` | `/v1/moderations` | — | 501 placeholder | No |
-| `GET` | `/health` | — | `{"status": "ok"}` | No |
+| Method | Path | Handler | Notes |
+|---|---|---|---|
+| `POST` | `/v1/chat/completions` | `_route_chat_completions` | Streaming (SSE) or buffered |
+| `POST` | `/v1/completions` | `_route_completions` | Alias to chat |
+| `POST` | `/v1/embeddings` | `_route_embeddings` | Passthrough |
+| `POST` | `/v1/audio/transcriptions` | `_route_audio_transcriptions` | Multipart form STT |
+| `POST` | `/v1/audio/speech` | `_route_audio_speech` | JSON body TTS |
+| `GET` | `/v1/models` | `_route_models` | Filtered by user allowlist |
+| `GET` | `/v1/models/{model_id}` | `_route_single_model` | Single model lookup |
+| `GET` | `/health` | `_health_check` | `{"status": "ok"}` |
+| `POST` | `/v1/images/generations` | placeholder | 501 |
+| `POST` | `/v1/images/edits` | placeholder | 501 |
+| `POST` | `/v1/images/variations` | placeholder | 501 |
+| `POST` | `/v1/audio/translations` | placeholder | 501 |
+| `POST` | `/v1/moderations` | placeholder | 501 |
 
 ### Admin Endpoints (Master API Key)
 
-| Method | Path | Description | Body/Params |
+| Method | Path | Phase | Description |
 |---|---|---|---|
-| `GET` | `/admin/keys` | List all user keys (no hash exposure) | — |
-| `POST` | `/admin/keys` | Create a new user key | `{"label": "...", "models": [...], "rpm": ...}` |
-| `DELETE` | `/admin/keys/{prefix}` | Revoke a key by prefix | — |
-| `PUT` | `/admin/keys/{prefix}/models` | Set model allowlist | `{"models": ["gpt-4", ...]}` (null = all) |
-| `PUT` | `/admin/keys/{prefix}/limits` | Set rate limits | `{"rpm": ..., "rpd": ..., "tpm": ..., "tpd": ...}` |
-| `GET` | `/admin/usage` | Aggregate usage (all keys + per key) | `?from=&to=&limit=` |
-| `GET` | `/admin/usage/top-models` | Top models by token count | `?from=&to=&limit=` |
-| `POST` | `/admin/config/reload` | Reload config from disk | — |
-| `GET` | `/admin/log` | Admin action audit log | `?limit=` |
+| `GET` | `/admin/keys` | Existing | List all user keys |
+| `POST` | `/admin/keys` | Existing | Create a new user key (returns raw key once) |
+| `DELETE` | `/admin/keys/{prefix}` | Existing | Revoke a key (soft-delete) |
+| `PUT` | `/admin/keys/{prefix}/models` | Existing | Set model allowlist |
+| `PUT` | `/admin/keys/{prefix}/limits` | Existing | Set rate limits |
+| `PUT` | `/admin/keys/{prefix}/user` | Teams | Assign key to a user |
+| `GET` | `/admin/usage` | Existing | Aggregate usage stats (now includes `total_cost_usd`) |
+| `GET` | `/admin/usage/top-models` | Existing | Top models by token count |
+| `GET` | `/admin/log` | Existing | Admin action audit log |
+| `POST` | `/admin/config/reload` | Existing | Graceful drain + restart |
+| `GET` | `/admin/stats/costs` | Cost | Cost breakdown by user/model/date range |
+| `POST` | `/admin/teams` | Teams | Create a team |
+| `GET` | `/admin/teams` | Teams | List all teams |
+| `GET` | `/admin/teams/{id}` | Teams | Team details + month-to-date spend |
+| `PUT` | `/admin/teams/{id}/limits` | Teams | Set team-level rate limits |
+| `PUT` | `/admin/teams/{id}/budget` | Teams | Set team monthly budget cap |
+| `POST` | `/admin/teams/{id}/users` | Teams | Create user under team |
+| `GET` | `/admin/teams/{id}/users` | Teams | List users in team |
+| `GET` | `/admin/teams/{id}/usage` | Teams | Team usage + cost breakdown |
+| `PUT` | `/admin/users/{id}/limits` | Teams | Set user-level rate limits |
+| `PUT` | `/admin/users/{id}/budget` | Teams | Set user monthly budget cap |
+| `GET` | `/admin/users/{id}/usage` | Teams | Per-user usage + cost |
+| `GET` | `/admin/logs/stream` | SSE | Live SSE event stream of completed requests |
+| `GET` | `/admin/logs` | SSE | Minimal HTML dashboard (embedded) |
 
 ---
 
 ## 7. Config File Format
 
-### config.yaml (extended from your LiteLLM template)
+### Config YAML (`config.yaml` / `config.yml`)
+
+Both `.yaml` and `.yml` extensions work. Auto-detected next to config file.
 
 ```yaml
-# ==========================================
-# GLOBAL SETTINGS
-# ==========================================
-
 general_settings:
-  master_key: "sk-pico-master-..."     # Admin API key
-  db_path: "/data/llm-pico.db"         # Optional, default: next to config
+  master_key: "sk-pico-master-..."     # Required — admin API key
 
 router_settings:
-  routing_strategy: simple-shuffle     # How to pick between multiple keys for same model
-  num_retries: 2                       # Retries on 429/401/timeout (not 5xx)
-  cooldown_time: 45                    # Seconds to cool down a rate-limited key
-  allowed_fails: 1                     # Consecutive 429 fails before cooldown
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  cooldown_time: 45
+  allowed_fails: 1
   circuit_breaker:
     enabled: true
-    failure_threshold: 3               # Consecutive 5xx before opening circuit
-    recovery_timeout: 30               # Seconds in OPEN state before trying again
-
-# ==========================================
-# PROVIDER / MODEL DEFINITIONS
-# ==========================================
+    failure_threshold: 3
+    recovery_timeout: 30
 
 model_list:
-  # --- OpenAI ---
-  - model_name: gpt-4-turbo
+  - model_name: gpt-5.4-mini
     litellm_params:
-      model: openai/gpt-4-turbo
+      model: openai/gpt-5.4-mini
       api_key: "sk-..."
+      api_base: "https://..."
     rpm: 50
     rpd: 5000
+    tpm: 100000
+    tpd: 1000000
+    ash: 7200
+    asd: 2880
+    images: false
+    embeddings: true
+    stt: true
+    tts: true
+    failover-model: "gemma-4-31b-it"
+    cost_per_1m_input: 15.00          # $15 per 1M prompt tokens (USD)
+    cost_per_1m_output: 60.00         # $60 per 1M completion tokens (USD)
 
-  # Multiple keys load-balanced for the same model_name:
-  - model_name: gpt-4-turbo
+  # Blended rate fallback (set only one, or neither):
+  - model_name: gemini-3-flash-preview
     litellm_params:
-      model: openai/gpt-4-turbo
-      api_key: "sk-...-key2"
-    rpm: 50
+      model: gemini/gemini-3-flash-preview
+      api_key: "..."
+    cost_per_1m_output: 0.15          # $0.15 per 1M total tokens (blended)
 
-  # --- Anthropic ---
-  - model_name: claude-3-opus
+  # Key pooling: same model_name + different api_key = load-balanced
+  - model_name: nvidia-nemotron-...
     litellm_params:
-      model: anthropic/claude-3-opus-20240229
-      api_key: "sk-ant-..."
-
-  # --- Google Gemini ---
-  - model_name: gemini-2-flash
-    litellm_params:
-      model: gemini/gemini-2.0-flash
-      api_key: "AIza..."
-
-  # --- Groq (OpenAI-compat) ---
-  - model_name: groq-llama-3
-    litellm_params:
-      model: groq/llama3-70b-8192
-      api_key: "gsk_..."
-
-  # --- OpenRouter ---
-  - model_name: orion-deepseek
-    litellm_params:
-      model: openrouter/deepseek/deepseek-r1
+      model: openrouter/nvidia/...
       api_key: "sk-or-..."
-
-  # --- Cloudflare Workers AI ---
-  - model_name: cf-llama
-    litellm_params:
-      model: cloudflare/@cf/meta/llama-3.1-8b-instruct
-      api_key: "cfut_..."
-      api_base: "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/"
-
-  # --- NVIDIA NIM ---
-  - model_name: nvidia-llama
-    litellm_params:
-      model: nvidia_nim/meta/llama3-70b-instruct
-      api_key: "nvapi-..."
-
-  # --- Zhipu AI ---
-  - model_name: glm-4-flash
-    litellm_params:
-      model: zhipu/glm-4-flash
-      api_key: "7cbb..."
-
-  # --- Ollama (local) ---
-  - model_name: ollama-llama3
-    litellm_params:
-      model: ollama/llama3
-      api_base: "http://localhost:11434/v1"
-      # No api_key needed for local
-
-  # --- llama.cpp (local) ---
-  - model_name: local-llama
-    litellm_params:
-      model: llamacpp/llama-3-8b
-      api_base: "http://localhost:8080/v1"
-
-  # --- vLLM (local) ---
-  - model_name: vllm-mistral
-    litellm_params:
-      model: vllm/mistral-7b
-      api_base: "http://localhost:8000/v1"
-      api_key: "internal-key"   # Optional
+      api_base: "https://openrouter.ai/api/v1"
+    rpd: 50
 ```
 
-### users.yaml
+### Cost Pricing Rules
+
+- `cost_per_1m_input` and `cost_per_1m_output` are both optional floats (USD)
+- If both set: `cost = (prompt/1M * input) + (completion/1M * output)`
+- If only `cost_per_1m_output` set: used as blended rate on `total_tokens`
+- If only `cost_per_1m_input` set: used as blended rate on `total_tokens`
+- If neither set: `cost_usd` logs as `NULL`
+
+### Users YAML (`users.yaml` / `users.yml`)
 
 ```yaml
-users:
-  - key: "sk-pico-dev-abc123def456"
-    label: "development-bot"
-    models: null                  # null = access to ALL configured models
-    rpm: 100
-    rpd: 10000
+- key: "sk-pico-dev-abc123def456"
+  label: "development-bot"
+  models: null                 # null = all models
+  rpm: 100
+  rpd: 10000
 
-  - key: "sk-pico-ci-789ghi"
-    label: "ci-pipeline"
-    models:
-      - gpt-4-turbo
-      - gemini-2-flash
-    tpd: 500000                   # token limit per day
-
-  - key: "sk-pico-test-xyz"
-    label: "test-user"
-    # No limits = unlimited (within model-level limits)
-    # No model list = all models
+- key: "sk-pico-ci-789ghi"
+  label: "ci-pipeline"
+  models: [gpt-5.4-mini, gemini-2-flash]
+  tpd: 500000
 ```
 
 ---
@@ -458,430 +443,225 @@ users:
 ## 8. Request Flow (Detailed)
 
 ```
-┌─────────┐     ┌───────────────────────────────────────────────────────────────┐
-│ Client  │────▶│  llm-pico                                                      │
-│ (curl/  │     │                                                               │
-│  SDK)   │     │  1. Auth: Extract Bearer token, hash it,                      │
-│         │     │     look up in SQLite. Fail if not found / inactive           │
-│         │     │                                                               │
-│         │     │  2. Allowlist: If key has model_allowlist,                    │
-│         │     │     check model_name is in it. Fail if not.                   │
-│         │     │                                                               │
-│         │     │  3. Rate Limit — RPM/TPM: in-memory dict (fast path).         │
-│         │     │     If streaming: estimate_total = prompt + max_tokens.       │
-│         │     │     If any limit exceeded → 429.                              │
-│         │     │                                                               │
-│         │     │  4. Rate Limit — RPD/TPD: SQLite counters.                    │
-│         │     │     If any limit exceeded → 429.                              │
-│         │     │                                                               │
-│         │     │  5. Router: Find all entries in model_list matching            │
-│         │     │     model_name. Pick one via simple-shuffle.                  │
-│         │     │     Resolve provider slug + model string.                     │
-│         │     │                                                               │
-│         │     │  6. Adapter: Translate OpenAI request → provider              │
-│         │     │     format. For OpenAI-compat providers,                      │
-│         │     │     this is nearly a passthrough.                             │
-│         │     │                                                               │
-│         │     │  7. Proxy: Send via per-provider httpx pool (max 5 conns).    │
-│         │     │     Handle streaming or buffered response.                    │
-│         │     │                                                               │
-│         │     │  8. Adapter: Translate provider response → OpenAI             │
-│         │     │     format. Extract actual token counts from final chunk.     │
-│         │     │                                                               │
-│         │     │  9. Logging: Insert usage_log row with actual tokens,         │
-│         │     │     latency, status.                                          │
-│         │     │                                                               │
-│         │     │  10. Reconcile: Adjust TPM/TPD counters with delta between    │
-│         │     │      estimated and actual tokens. Mark dirty for SQLite flush.│
-│         │     │                                                               │
-│         │     │  11. Response: Return OpenAI-format response to               │
-│         │     │      client (stream SSE or single JSON).                      │
-│         │     │                                                               │
-└─────────┘     └───────────────────────────────────────────────────────────────┘
+Client → llm-pico:
+
+1. Auth
+   - Extract "Bearer <key>" from Authorization header
+   - Master key check first (string equality)
+   - SHA-256 hash user key, look up in SQLite user_keys
+   - Reject if not found, inactive, or expired
+   - If user_key.user_id is set: resolve user + team hierarchy
+
+2. Model Access
+   - Resolve effective model_allowlist: min(key, user, team)
+   - Verify model_name is in effective allowlist
+   - Returns 403 if not allowed
+
+3. Body Peek (for non-audio routes)
+   - Parse JSON → extract model, stream, max_tokens
+
+4. Cache Check (non-streaming, can_cache=true models only)
+   - SHA-256 hash of raw body → lookup SQLite request_cache table
+   - If hit and not expired → return cached response body immediately
+
+5. Budget Check (per-user only, no team budget)
+   - If user has monthly_budget_usd:
+     SELECT SUM(cost_usd) FROM usage_log WHERE key_hash IN (user's keys) ...
+     If (spend + estimated_cost) > budget → 429
+   - Estimated cost = compute_cost(prompt, max_tokens, cost_in, cost_out)
+
+6. Rate Limit — RPM/TPM/ASH (in-memory, fast path)
+   - Resolve effective limits: min(key, user, team)
+   - Acquire shard lock, check count + reservation ≤ limit
+   - If exceeded → 429 with retry_after
+
+6. Rate Limit — RPD/TPD/ASD (SQLite)
+   - Same limit resolution
+   - SELECT current count, check, UPSERT increment
+
+7. Router Resolution
+   - resolve(model_name): pick healthy key/group via simple-shuffle
+
+8. Capability Gating + Adapter Selection
+   - get_adapter(slug) lazy-loads provider module on first use
+
+9. Upstream Request + Error Handling + Failover
+   (identical to current flow)
+
+10. Response Handling
+    - Streaming: StreamingResponse with SSE, background reconcile task
+    - Buffered: Read full body
+
+11. Cost Computation
+    - Look up model_entry pricing (cost_per_1m_input, cost_per_1m_output)
+    - compute_cost(prompt_tokens, completion_tokens, ...) → cost_usd
+
+12. Usage Logging
+    - INSERT INTO usage_log with cost_usd
+
+13. SSE Event Emission
+    - emit({key_prefix, model, prompt_tokens, completion_tokens,
+            latency_ms, status, cost_usd})
+    - Fans out to all subscribed asyncio.Queue subscribers
+
+14. Rate Limit Reconciliation (streaming only)
+    - Adjust TPM/TPD counters with delta
 ```
 
 ---
 
 ## 9. Adapter Design
 
-### Base Adapter Interface
+### Adapter Catalog
 
-```python
-class BaseAdapter(ABC):
-    provider: str  # e.g., "openai", "anthropic"
+| Adapter | Location | Lines | Type | Special |
+|---|---|---|---|---|
+| `OpenAIAdapter` | `providers/openai.py` | 56 | Passthrough (raw bytes) | Supports chat, completions, embeddings, audio STT, audio TTS |
+| `AnthropicAdapter` | `providers/anthropic.py` | 198 | Full translate | Images via base64, 1:2 SSE event mapping |
+| `GeminiAdapter` | `providers/gemini.py` | 199 | Full translate | `generateContent` API, `?key=` auth, embeddings |
+| `CloudflareAdapter` | `providers/cloudflare.py` | 43 | Passthrough | Strips `cloudflare/` prefix, `/ai/v1` base path |
 
-    @abstractmethod
-    async def translate_request(self, body: dict, model_string: str) -> tuple[dict, dict]:
-        """
-        Translate OpenAI-format request dict to provider-native format.
-        Returns (headers, provider_body).
-        """
-        ...
-
-    @abstractmethod
-    async def translate_response(self, response: httpx.Response) -> dict:
-        """
-        Translate provider-native response to OpenAI-format response dict.
-        """
-        ...
-
-    async def handle_stream_chunk(self, chunk: bytes) -> bytes:
-        """
-        Optional: translate individual SSE chunks for streaming responses.
-        Default: pass through unchanged.
-        """
-        return chunk
-```
-
-### Adapter Categories
-
-| Category | Providers | Translation Complexity |
-|---|---|---|
-| **Passthrough** | OpenAI, Groq, OpenRouter | Zero translation. Body goes as-is. |
-| **OpenAI-compat + base URL** | Ollama, llama.cpp, vLLM, NVIDIA | Zero translation. Base URL configurable. |
-| **Header transform** | Anthropic | Change `model` prefix, map `messages` format, map `max_tokens`, handle `stop_sequences`. Response maps back. |
-| **Full transform** | Gemini, Cloudflare, Zhipu | Significant body restructuring. |
-
-### Stream Handling
-
-For streaming, the adapter's `handle_stream_chunk` processes each SSE `data:` line:
-- **Passthrough**: Forward `data: {"choices":[...delta...]}` as-is
-- **Anthropic**: Translates Anthropic SSE format → OpenAI SSE format
-- **Gemini**: Translates Gemini server-sent events → OpenAI format
+All adapters are lazy-loaded via `providers/__init__.py` using `importlib.import_module()`. The `@register` decorator caches the class after first import.
 
 ---
 
-## 10. Passthrough Architecture (Raw Bytes)
-
-For the 7 OpenAI-compatible providers (OpenAI, Groq, OpenRouter, Ollama, llama.cpp, vLLM, NVIDIA), the request body is forwarded as raw bytes without Pydantic parsing.
-
-### Inbound (client → proxy → provider)
+## 10. Circuit Breaker Design
 
 ```
-POST /v1/chat/completions
-Body: raw JSON bytes ──→ read_peek: parse only 3 fields from JSON
-  ├── model       → for routing + provider selection
-  ├── stream      → for response mode (SSE vs buffered)
-  └── max_tokens  → for rate limit reservation
-
-Remaining bytes → stored as raw `body_bytes` → forwarded verbatim to upstream
+CLOSED → (3 consecutive 5xx) → OPEN → (30s timeout) → HALF_OPEN
+                                                          |
+                                                    success → CLOSED
+                                                      5xx → OPEN
 ```
 
-Implementation:
+---
+
+## 11. Error Handling
+
+| Scenario | HTTP Status | Retry? |
+|---|---|---|
+| Missing/wrong API key | 401 | No |
+| Key expired / user inactive / team inactive | 403 | No |
+| Model not in allowlist (key/user/team) | 403 | No |
+| Monthly budget exceeded (user or team) | 429 | No (immediate 429) |
+| Model not in config | 404 | No |
+| Model lacks capability | 400 | No |
+| Rate limit exceeded | 429 | Yes — cool down key, try next |
+| Upstream 5xx | 502 | Yes — circuit breaker, try next key |
+| Upstream timeout | 504 | Yes — try next key |
+| Connection error | 502 | Yes — try next key |
+| All retries exhausted | 502 | Try failover-model (1 level) |
+| Placeholder endpoint | 501 | No |
+
+---
+
+## 12. Live SSE Log Stream (`core/events.py`)
+
+### Design
+
+A lightweight pub/sub bus using `asyncio.Queue`. No external dependencies.
+
 ```python
+# core/events.py
+
+import asyncio
 import json
+from typing import Any
 
-def peek_request(body: bytes) -> tuple[str, bool, int]:
-    """Parse only the 3 fields needed. Returns (model, stream, max_tokens)."""
-    obj = json.loads(body)
-    return (
-        obj.get("model", ""),
-        obj.get("stream", False),
-        obj.get("max_tokens", 4096),
-    )
-```
+_subs: set[asyncio.Queue] = set()
 
-### Outbound (provider → proxy → client)
-
-For buffered responses: forward raw response body as-is (no Pydantic parse).
-For streaming responses: forward SSE `data:` lines as raw bytes. Intercept only the final `data: [DONE]` and any chunk containing `"usage"` for token reconciliation.
-
-```python
-async def proxy_stream(response: httpx.Response, writer: asyncio.StreamWriter):
-    """Forward SSE chunks as raw bytes. Extract usage from final chunk."""
-    usage = None
-    async for chunk in response.aiter_bytes():
-        if b'"usage"' in chunk and b'[DONE]' not in chunk:
-            # Extract token counts from the final usage chunk
+def emit(event: dict[str, Any]) -> None:
+    """Fan out to all subscribers. Drop oldest entry on slow consumers."""
+    payload = json.dumps(event)
+    for q in list(_subs):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
             try:
-                data = json.loads(chunk.removeprefix(b"data: "))
-                usage = data.get("usage")
-            except (json.JSONDecodeError, IndexError):
+                q.get_nowait()
+                q.put_nowait(payload)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
-        writer.write(chunk)  # Forward raw bytes
-    return usage
+
+def subscribe() -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue(maxsize=256)
+    _subs.add(q)
+    return q
+
+def unsubscribe(q: asyncio.Queue) -> None:
+    _subs.discard(q)
 ```
 
-## 11. Anticipatory Reservation (TPM/TPD Burst Protection)
+### Integration Points
 
-Extended from the rate limiter flow in §5:
+One line inserted after every successful `log_usage()` call (8 call sites across `api/server.py`):
 
-```
-On request start (under shard lock):
-  reservation = prompt_tokens + max(request.max_tokens, 4096)
-  available = limit - current_count
-  if reservation > available → 429 (not enough budget for worst case)
-  counter += reservation   ← reserved atomically
-
-On stream complete (after usage extracted from final chunk):
-  actual = response.usage.total_tokens
-  unused = reservation - actual
-  counter -= unused        ← release what we didn't consume
-  # If actual > reservation (max_tokens undersized):
-  #   counter += (actual - reservation)  # should be rare
-```
-
-**Why this prevents bursts:** Each request locks its worst-case allocation upfront. 10 concurrent requests each reserving 16k tokens need 160k available in the limit. The shard lock serializes the check+reserve atomically — no two requests can both see "enough room" and overshoot.
-
-## 12. Circuit Breaker Design
-
-Per-provider state machine:
-
-```
-               ┌────────────────────────────┐
-               │           CLOSED            │
-               │  (normal operation)         │
-               │  error_count = 0            │
-               └─────────┬──────────────────┘
-                         │ 5xx response
-                         │ error_count++
-                         │ if error_count >= threshold (3)
-                         v
-               ┌────────────────────────────┐
-               │           OPEN              │
-               │  (fail fast)                │
-               │  All requests → 502         │
-               │  Wait recovery_timeout (30s)│
-               └─────────┬──────────────────┘
-                         │ timeout expires
-                         v
-               ┌────────────────────────────┐
-               │         HALF_OPEN           │
-               │  (test the waters)          │
-               │  Try next request upstream  │
-               └─────────┬──────────────────┘
-                    ┌────┴────┐
-                    │         │
-                  success    5xx
-                    │         │
-                    v         v
-               CLOSED       OPEN
-          (error_count=0)  (reset timer)
-```
-
-Implementation in `router.py`:
 ```python
-@dataclass
-class CircuitBreakerState:
-    provider: str
-    state: Literal["CLOSED", "OPEN", "HALF_OPEN"] = "CLOSED"
-    error_count: int = 0
-    opened_at: float | None = None
-
-    def record_failure(self) -> None:
-        self.error_count += 1
-        if self.error_count >= 3:
-            self.state = "OPEN"
-            self.opened_at = time.monotonic()
-
-    def record_success(self) -> None:
-        self.state = "CLOSED"
-        self.error_count = 0
-        self.opened_at = None
-
-    def is_request_allowed(self) -> bool:
-        if self.state == "CLOSED":
-            return True
-        if self.state == "OPEN":
-            if time.monotonic() - self.opened_at >= 30:
-                self.state = "HALF_OPEN"
-                return True
-            return False
-        # HALF_OPEN: allow exactly one request
-        return True
+from core.events import emit
+emit({
+    "ts": created_at,
+    "key_prefix": key_prefix,
+    "model": model_name,
+    "provider": slug,
+    "prompt_tokens": prompt_tokens,
+    "completion_tokens": completion_tokens,
+    "total_tokens": total_tokens,
+    "latency_ms": latency,
+    "status": status_code,
+    "cost_usd": cost_usd,
+})
 ```
 
----
+### SSE Endpoint
 
-## 13. Implementation Phases
-
-### Phase 1 — Core Skeleton (this session)
-
-Files to create:
-1. `pyproject.toml` — Project config + dependencies
-2. `llm_pico/__init__.py` — `__version__ = "0.1.0"`
-3. `llm_pico/__main__.py` — `from .cli import main; main()`
-4. `llm_pico/cli.py` — Click CLI with options:
-   - `--host` (default: `0.0.0.0`)
-   - `--port` (default: `4000`)
-   - `--config` (default: `./config.yaml`)
-   - `--users` (default: `./users.yaml`)
-   - `--db` (default: `./llm-pico.db`)
-   - `--verbose` / `-v` (flag)
-5. `llm_pico/config.py` — Loads YAML, validates structure:
-   - `load_config(path)` → `Config` dataclass
-   - `load_users(path)` → `list[UserKey]`
-   - Validates required fields, model_name uniqueness
-   - Auto-detects users.yaml next to config.yaml
-6. `llm_pico/db.py` — SQLite init:
-   - `get_db()` — async context manager for connection
-   - `init_db()` — create tables + indexes
-   - WAL mode for performance
-7. `llm_pico/models.py` — Pydantic schemas:
-   - `ChatCompletionRequest`, `ChatCompletionResponse`
-   - `CompletionRequest`, `CompletionResponse`
-   - `EmbeddingRequest`, `EmbeddingResponse`
-   - `ModelList`, `ModelObject`
-   - `ErrorResponse` (for 4xx/5xx)
-   - `UserKeyCreate`, `UserKeyResponse`, `KeyList`
-   - `UsageStats`, `UsageSummary`
-8. `llm_pico/auth.py` — Auth middleware:
-   - `verify_api_key(auth_header)` → `UserKey` or raise `401`
-   - `check_model_access(user_key, model_name)` → bool or raise `403`
-   - Admin key check: `verify_master_key(auth_header, master_key)`
-9. `llm_pico/router.py` — Request routing:
-   - `resolve_model(model_name)` → `list[ModelEntry]`
-   - `pick_entry(entries, strategy="simple-shuffle")` → `ModelEntry`
-   - Builds in-memory index from config on startup
-   - Key cooldown tracking for 429 handling
-10. `llm_pico/ratelimit.py` — Hybrid rate limiter:
-    - In-memory cache for RPM/TPM: dict with `asyncio.Lock` per shard, ~200ns increments
-    - SQLite `rate_counters` for RPD/TPD: durable, flushed from memory every 10s
-    - `check_rate_limit(key_hash, model_name, limits, is_streaming, prompt_tokens)` → pass/429
-      - RPM/TPM checked via in-memory cache (fast path)
-      - RPD/TPD checked via SQLite (slower path, day-level windows)
-      - Streaming: estimate output tokens from `max_tokens` (default 4096)
-    - `reconcile_tokens(key_hash, model_name, estimated_total, actual_total)` → adjust counters post-stream
-    - Background task: `_flush_dirty_counters()` every 10s
-    - Returns rate limit headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
-11. `llm_pico/usage.py` — Usage logger:
-    - `log_usage(key_hash, key_prefix, model_name, provider, tokens, latency, status, error)`
-    - `get_usage_stats(...)` — aggregate queries for admin API
-12. `llm_pico/server.py` — FastAPI app factory:
-    - `create_app(config, users)` → `FastAPI`
-    - Adds middleware: auth, rate limit, CORS
-    - Mounts public routes and admin router
-    - In-flight request registry: `set[request_id]` with asyncio events per stream
-    - `startup` event: init DB, load config, build router index, start background tasks (rate counter flush, stale counter cleanup)
-    - `shutdown` event: close DB, cancel background tasks
-13. `llm_pico/admin.py` — Admin API router:
-    - All admin endpoints with master key auth
-    - Key CRUD: create (returns full key once), list (no hash), revoke, update limits/models
-    - Usage queries: aggregate, per-key, top-models
-    - Config reload endpoint (graceful drain + restart):
-      ```
-      POST /admin/config/reload:
-        1. Set server state to "draining" (503 to new requests with Retry-After)
-        2. Signal active streaming connections to finish naturally
-        3. Wait up to N seconds (configurable, default 120) for drain
-        4. After timeout: log warning for remaining streams, force-close
-        5. exec() the current process (re-reads config on restart)
-      ```
-    - Audit logging
-14. `llm_pico/adapters/__init__.py` — Adapter registry:
-    - `get_adapter(provider)` → `BaseAdapter`
-    - Maps provider slugs to adapter classes
-15. `llm_pico/adapters/base.py` — Abstract base:
-    - `BaseAdapter` with interface methods
-    - Default `handle_stream_chunk` (passthrough)
-16. `llm_pico/adapters/openai.py` — OpenAI adapter:
-    - Passthrough — returns body unchanged
-    - Handles streaming SSE by forwarding raw lines
-17. `llm_pico/placeholder.py` — Placeholder endpoints:
-    - Returns `{"error": "Not implemented", "message": "Image generation is not supported yet"}`
-    - HTTP 501 status code
-
-### Phase 2 — All Provider Adapters
-
-Create adapter files:
-1. `adapters/anthropic.py` — Full translate:
-   - Request: map `messages` format (system → `system`, user/assistant messages), map `max_tokens`, `stop`, `temperature`, `top_p`
-   - Response: map `content[].text` → `choices[].delta.content`, handle streaming SSE events
-   - Handle Anthropic's `content_block_start`, `content_block_delta`, `message_delta` events → OpenAI delta format
-2. `adapters/gemini.py` — Full translate:
-   - Request: map `messages` → `contents` array (user: `role: user`, assistant: `role: model`), system → `system_instruction`, map generation config
-   - Response: extract `candidates[0].content.parts[0].text` → OpenAI format
-   - Stream: translate Gemini's server-sent events
-3. `adapters/groq.py` — Passthrough (already OpenAI-compat)
-4. `adapters/openrouter.py` — Passthrough
-5. `adapters/cloudflare.py` — Translate:
-   - Request: CF Workers AI uses `{"messages": [...]}` format already close to OpenAI
-   - Need to handle model name mapping and account_id in base URL
-6. `adapters/nvidia.py` — Passthrough (OpenAI-compat)
-7. `adapters/zhipu.py` — Translate to Zhipu format
-8. `adapters/ollama.py` — Passthrough (OpenAI-compat API)
-9. `adapters/llamacpp.py` — Passthrough (OpenAI-compat API)
-10. `adapters/vllm.py` — Passthrough (OpenAI-compat API)
-
-### Phase 3 — Polish
-
-1. Rate limit response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `Retry-After`
-2. Config validation with rich error messages (which field, what's wrong)
-3. Dockerfile + docker-compose.yml
-4. README.md with:
-   - Quick start
-   - Configuration reference
-   - Provider-specific notes
-   - Admin API reference
-   - Production deployment guide
-6. `config.example.yaml` — Full reference with all providers, comments
-7. `users.example.yaml` — Reference user file
-8. Test suite:
-   - `tests/test_auth.py`
-   - `tests/test_ratelimit.py`
-   - `tests/test_config.py`
-   - `tests/test_router.py`
-   - `tests/test_adapters.py` (unit tests with mocked httpx)
-   - `tests/test_admin.py`
-   - `tests/test_integration.py` (end-to-end with local providers)
-
----
-
-## 11. CLI Usage
-
-```bash
-# Start the proxy
-llm-pico
-
-# With options
-llm-pico --port 8080 --host 127.0.0.1 --config /etc/llm-pico/config.yaml
-
-# With verbose logging
-llm-pico -v
-
-# With custom db path
-llm-pico --db /data/llm-pico.db
-
-# Version
-llm-pico --version
-
-# Help
-llm-pico --help
+```python
+@router.get("/logs/stream")
+async def log_stream(request: Request) -> StreamingResponse:
+    await _require_master(request)
+    q = subscribe()
+    async def generate():
+        try:
+            while True:
+                payload = await asyncio.wait_for(q.get(), timeout=30)
+                yield f"data: {payload}\n\n"
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
+        finally:
+            unsubscribe(q)
+    return StreamingResponse(generate(), media_type="text/event-stream")
 ```
 
+### Embedded HTML Dashboard
+
+```python
+@router.get("/logs", include_in_schema=False)
+async def log_dashboard(request: Request) -> Response:
+    await _require_master(request)
+    return Response(content=HTML_PAGE, media_type="text/html")
+```
+
+A single self-contained HTML page with `EventSource("/admin/logs/stream")`, a `<pre>` log display with auto-scroll, and styling for a terminal-like dashboard.
+
 ---
 
-## 12. Key Format & Security
+## 13. Graceful Draining
 
-- **Master key**: `sk-pico-master-<64-char-hex>` — defined in config.yaml
-- **User keys**: `sk-pico-<64-char-hex>` — generated by admin API, stored in users.yaml or DB
+(Identical to current state.)
+
+---
+
+## 14. Key Format & Security
+
+- **Master key**: `sk-pico-master-<64-char-hex>` — defined in `general_settings.master_key`
+- **User keys**: `sk-pico-<64-char-hex>` — generated by admin API, stored in SQLite
+- **User key → User mapping**: `user_keys.user_id` FK to `users.id` (nullable for legacy keys)
 - **Storage**: SHA-256 hashed in SQLite. Raw key shown only once on creation.
-- **Transport**: Always over HTTPS (terminated by reverse proxy, not the proxy itself)
-- **Rate limit key prefix disclosure**: Admin API returns only `key_prefix` (e.g., `sk-pico-a1b2c3`), never the full key
-- **Logging**: Full request/response bodies never logged (only tokens, model, latency)
+- **Transport**: Always over HTTPS (terminated by reverse proxy)
+- **Audit**: All admin actions logged to `admin_log` table
 
 ---
 
-## 13. Error Handling
-
-| Scenario | HTTP Status | Response Body |
-|---|---|---|
-| Missing/wrong API key | 401 | `{"error": "unauthorized", "message": "Invalid API key"}` |
-| Key expired | 403 | `{"error": "forbidden", "message": "API key expired"}` |
-| Model not in allowlist | 403 | `{"error": "forbidden", "message": "Model not allowed for this key"}` |
-| Rate limit exceeded (user) | 429 | `{"error": "rate_limit_exceeded", "message": "User rate limit exceeded", "retry_after": 30}` |
-| Rate limit exceeded (model) | 429 | `{"error": "rate_limit_exceeded", "message": "Model rate limit exceeded", "retry_after": 30}` |
-| Model not found in config | 404 | `{"error": "model_not_found", "message": "Model 'xyz' not configured"}` |
-| Upstream provider error | 502 | `{"error": "upstream_error", "message": "Provider returned 500"}` |
-| Upstream timeout | 504 | `{"error": "upstream_timeout", "message": "Provider timed out"}` |
-| Unknown provider | 500 | `{"error": "internal_error", "message": "No adapter for provider 'xyz'"}` |
-| Placeholder endpoint | 501 | `{"error": "not_implemented", "message": "Not implemented: audio transcription"}` |
-
----
-
-## 14. Resource Budget (RAM)
-
-Per-provider httpx pools capped at 5 connections each × 11 providers = 55 outbound sockets max. Here are the estimates at different concurrency levels:
+## 15. Resource Budget (RAM)
 
 | Component | Idle | 10 concurrent | 50 concurrent |
 |---|---|---|---|
@@ -893,63 +673,91 @@ Per-provider httpx pools capped at 5 connections each × 11 providers = 55 outbo
 | Request buffers | 0 | ~20MB | ~60MB |
 | Response streaming buffers (4KB each) | 0 | ~5MB | ~15MB |
 | In-memory rate cache | ~1MB | ~1MB | ~2MB |
+| SSE event queues (256 × N subscribers) | 0 | ~1MB | ~2MB |
 | Provider adapter cache | ~2MB | ~2MB | ~2MB |
 | Router index | ~1MB | ~1MB | ~1MB |
-| **Total** | **~30MB** | **~78MB** | **~142MB** |
-
-Well under 200MB at all concurrency levels through 50 concurrent requests.
-
-**FD budget:** 11 providers × up to 5 connections = 55 sockets + 1 SQLite DB FD + 1 config FD + misc = ~60 FDs. Default `ulimit -n` is 1024. Headroom for spikes (provider retries creating temp sockets).
+| **Total** | **~30MB** | **~79MB** | **~144MB** |
 
 ---
 
-## 15. Open Questions (Answered)
+## 16. Test Suite
 
-| Question | Answer |
-|---|---|
-| Language? | Python (LiteLLM compat) |
-| Deployment? | pip package + Docker |
-| Database? | SQLite (no external deps) |
-| Rate limit scope? | User × Model × Provider |
-| Rate limit storage? | RPM/TPM in-memory (dict+Lock), RPD/TPD in SQLite flush every 10s |
-| Streaming token tracking? | Estimate + reconcile (pre-check with max_tokens, correct post-stream) |
-| httpx connection strategy? | Per-provider pools, max 5 connections each, 55 total |
-| Streaming? | Yes, full SSE |
-| Admin features? | Keys CRUD, usage stats, config reload (graceful drain) |
-| Model access? | Per-user allowlists, default: all |
-| Config reload? | Graceful drain + restart (drain active streams with timeout, then restart) |
-| Usage tracking? | Everything (tokens, latency, model, provider) |
-| Logging? | Quiet default, `--verbose` for debug |
-| Anthropic approach? | Accept OpenAI format, translate via adapter |
-| Fallback? | Error-class-aware: 429→swap key, 5xx→fail fast. Per-provider circuit breaker (3 fails, 30s recovery) |
-| /v1/models? | Yes, with per-user filtering |
-| Endpoints? | Full OpenAI surface (placeholders for image/audio) |
-| Port? | 4000 |
-| Key bootstrap? | users.yaml file |
-| TLS? | Reverse proxy only |
-| CLI name? | `llm-pico` |
-| Key prefix? | `sk-pico-...` |
-| Extra providers? | Ollama, llama.cpp, vLLM added |
+45 tests currently pass. All tests live in `temp/tests/` and import from `core.*` and `api.*` packages.
+
+### Current Tests
+
+**`temp/tests/test_router.py`** — 7 tests
+- Resolve returns correct group/key/entry
+- Returns None for unknown model
+- `get_model_names()` returns configured models
+- Picks next key on cooldown (429)
+- Returns None when all keys cooled
+- Picks other group when circuit is OPEN
+- Circuit breaker recovers after timeout
+
+**`temp/tests/test_ratelimit.py`** — 10 tests
+- RPM allows/rejects/separate keys/reservation
+- TPM reconcile
+- User + model levels separate
+- ASH allows/rejects
+- ASD allows/rejects
+
+**`temp/tests/test_retry_loop.py`** — 5 tests
+- 5xx retry, exhaustion, non-retryable, failover, no-chain
+
+**`temp/tests/test_cost.py`** — 5 tests
+- Cost computation with both input/output rates
+- Blended rate fallback (only output set, only input set)
+- No cost when neither rate is set
+- Zero-token edge case
+
+**`temp/tests/test_events.py`** — 3 tests
+- Emit + subscribe receives event
+- Multiple subscribers each receive events
+- Slow consumer drops oldest (backpressure)
+
+**`temp/tests/test_teams.py`** — 11 tests
+- Create team, create user under team
+- Update team limits, update user limits/budget
+- User budget exceeded → 429
+- User budget not set → no error
+- Merge limits (most restrictive wins)
+- Merge allowlist (intersection)
+- Cascade: deactivate team → all users + keys blocked
+- Team/user month spend aggregation
+- Auth resolves user/team hierarchy
+
+**`temp/tests/test_cache.py`** — 4 tests
+- Cache set and get
+- Cache key uniqueness (different bodies → different keys)
+- Cache expiry (negative TTL → no hit)
+- Clear all cache entries
 
 ---
 
-## 16. File Creation Order (Build Sequence)
+## 17. Implementation Status
 
-1. `pyproject.toml` + `llm_pico/__init__.py`
-2. `llm_pico/__main__.py` + `llm_pico/cli.py`
-3. `llm_pico/models.py` (Pydantic schemas)
-4. `llm_pico/db.py` (SQLite init)
-5. `llm_pico/config.py` (YAML load + validate)
-6. `llm_pico/auth.py` (key lookup + allowlist)
-7. `llm_pico/ratelimit.py` (fixed-window counters)
-8. `llm_pico/usage.py` (usage logging + stats queries)
-9. `llm_pico/router.py` (model resolution + key selection)
-10. `llm_pico/adapters/base.py` + `adapters/__init__.py`
-11. `llm_pico/adapters/openai.py` (passthrough)
-12. `llm_pico/server.py` (FastAPI app, route mounting)
-13. `llm_pico/admin.py` (admin endpoints)
-14. `llm_pico/placeholder.py` (501 stubs)
-15. `config.example.yaml` + `users.example.yaml`
-16. `tests/` directory with test files
-17. `Dockerfile` + `docker-compose.yml`
-18. `README.md`
+All three phases **complete** plus caching layer. 45 tests, all passing.
+
+### Built So Far
+
+| Feature | Files | Tests |
+|---|---|---|
+| Teams/Users hierarchy + per-user budget | `core/teams.py`, `core/auth.py`, `api/admin.py`, `core/db.py` | 11 |
+| Cost tracking (compute_cost, cost_usd) | `core/usage.py`, `core/config.py`, `core/db.py` | 5 |
+| SSE log stream (pub/sub, endpoint, dashboard) | `core/events.py`, `api/admin.py` | 3 |
+| Exact-match request cache (SQLite, TTL) | `core/cache.py`, `core/db.py`, `api/server.py`, `core/config.py` | 4 |
+| Rate limiting (6 windows, 3 layers) | `core/ratelimit.py` | 10 |
+| Router + circuit breaker | `core/router.py` | 7 |
+| Retry + failover | `api/server.py` | 5 |
+
+### Remaining Polish
+
+1. **STT/TTS capability flags** — `stt: true` / `tts: true` on Whisper/TTS entries in `config.example.yaml`
+2. **Placeholder `/v1/audio/translations`** — 501 stub; could proxy to OpenAI-compat
+3. **Token-based audio rate limiting** — `ash`/`asd` count requests; could estimate from audio duration
+4. **Rate limit response headers** — `X-RateLimit-*` not yet sent
+5. **End-to-end integration tests** — No live-provider tests
+6. **Docker compose** — `docker-compose.yml` not yet created
+7. **CLI polish** — `--version` doesn't work
+8. **Config validation** — Better error messages on invalid YAML

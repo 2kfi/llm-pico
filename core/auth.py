@@ -6,7 +6,8 @@ import logging
 import time
 from typing import Any, TYPE_CHECKING
 
-from .db import get_db
+from core.db import get_db
+from core.teams import merge_allowlist, merge_limits, resolve_user_limits
 
 _log = logging.getLogger("llm-pico.auth")
 
@@ -57,16 +58,44 @@ async def verify_api_key(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    return {
+    key_limits = {
+        "rpm": row["rpm_limit"],
+        "rpd": row["rpd_limit"],
+        "tpm": row["tpm_limit"],
+        "tpd": row["tpd_limit"],
+    }
+
+    user_id = row["user_id"]
+    user_row = None
+    team_row = None
+
+    if user_id is not None:
+        user_row, team_row = await resolve_user_limits(user_id)
+        if user_row and not user_row.get("is_active"):
+            return None
+        if team_row and not team_row.get("is_active"):
+            return None
+
+    merged_limits = merge_limits(key_limits, user_row, team_row) if user_id else key_limits
+    merged_allowlist = merge_allowlist(allowlist, user_row, team_row) if user_id else allowlist
+
+    result: dict[str, Any] = {
         "role": "user",
         "key_hash": row["key_hash"],
         "key_prefix": row["key_prefix"],
-        "model_allowlist": allowlist,
-        "rpm_limit": row["rpm_limit"],
-        "rpd_limit": row["rpd_limit"],
-        "tpm_limit": row["tpm_limit"],
-        "tpd_limit": row["tpd_limit"],
+        "model_allowlist": merged_allowlist,
+        "rpm_limit": merged_limits.get("rpm"),
+        "rpd_limit": merged_limits.get("rpd"),
+        "tpm_limit": merged_limits.get("tpm"),
+        "tpd_limit": merged_limits.get("tpd"),
+        "user_id": user_id,
     }
+
+    if user_id:
+        result["user_row"] = user_row
+        result["team_row"] = team_row
+
+    return result
 
 
 def check_model_access(user: dict[str, Any], model_name: str) -> bool:
