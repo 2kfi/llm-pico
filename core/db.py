@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 import aiosqlite
 
-_db_connection: aiosqlite.Connection | None = None
+_db_pool: asyncio.Queue[aiosqlite.Connection] | None = None
+_POOL_SIZE = 2
 _log = logging.getLogger("llm-pico.db")
 
 SCHEMA_SQL = """
@@ -105,28 +108,72 @@ CREATE TABLE IF NOT EXISTS admin_log (
 """
 
 
+async def _configure_conn(conn: aiosqlite.Connection) -> None:
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA busy_timeout=2000")
+    await conn.execute("PRAGMA synchronous=NORMAL")
+    await conn.execute("PRAGMA mmap_size=67108864")
+    await conn.execute("PRAGMA cache_size=-8000")
+    await conn.execute("PRAGMA temp_store=MEMORY")
+    await conn.execute("PRAGMA foreign_keys=ON")
+    await conn.executescript(SCHEMA_SQL)
+    await conn.commit()
+
+
 async def init_db(db_path: str) -> None:
-    global _db_connection
-    _db_connection = await aiosqlite.connect(db_path)
-    _db_connection.row_factory = aiosqlite.Row
-    await _db_connection.execute("PRAGMA journal_mode=WAL")
-    await _db_connection.execute("PRAGMA busy_timeout=5000")
-    await _db_connection.execute("PRAGMA synchronous=NORMAL")
-    await _db_connection.executescript(SCHEMA_SQL)
-    await _db_connection.commit()
-    _log.info("database initialized at %s", db_path)
-
-
-async def close_db() -> None:
-    global _db_connection
-    if _db_connection:
-        await _db_connection.close()
-        _db_connection = None
-        _log.info("database closed")
+    global _db_pool
+    if _db_pool is not None:
+        return
+    pool: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue(maxsize=_POOL_SIZE)
+    for _ in range(_POOL_SIZE):
+        conn = await aiosqlite.connect(db_path)
+        await _configure_conn(conn)
+        await pool.put(conn)
+    _db_pool = pool
+    _log.info("database pool initialized at %s (%d connections)", db_path, _POOL_SIZE)
 
 
 @asynccontextmanager
 async def get_db() -> AsyncIterator[aiosqlite.Connection]:
-    if _db_connection is None:
+    if _db_pool is None:
         raise RuntimeError("database not initialized")
-    yield _db_connection
+    conn = await _db_pool.get()
+    try:
+        yield conn
+    finally:
+        await _db_pool.put(conn)
+
+
+async def close_db() -> None:
+    global _db_pool
+    if _db_pool is None:
+        return
+    pool = _db_pool
+    _db_pool = None
+    while not pool.empty():
+        conn = await pool.get()
+        await conn.close()
+    _log.info("database pool closed")
+
+
+async def prune_logs(usage_days: int = 30, admin_days: int = 90) -> tuple[int, int]:
+    """Delete usage_log and admin_log entries older than the specified days.
+
+    Returns a tuple of (usage_deleted, admin_deleted).
+    """
+    usage_cutoff = time.time() - usage_days * 86400
+    admin_cutoff = time.time() - admin_days * 86400
+    async with get_db() as conn:
+        cursor = await conn.execute(
+            "DELETE FROM usage_log WHERE created_at < datetime(?, 'unixepoch')",
+            (usage_cutoff,),
+        )
+        usage_deleted = cursor.rowcount
+        cursor = await conn.execute(
+            "DELETE FROM admin_log WHERE created_at < datetime(?, 'unixepoch')",
+            (admin_cutoff,),
+        )
+        admin_deleted = cursor.rowcount
+        await conn.commit()
+    return usage_deleted, admin_deleted

@@ -10,24 +10,24 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Form, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 
 from providers import get_adapter
+from providers.base import close_all_clients
 from providers.openai import OpenAIAdapter
 from api.admin import router as admin_router
 from core.auth import (
     check_model_access,
-    extract_bearer,
     hash_key,
     prefix_from_key,
+    require_api_key,
     seed_users,
-    verify_api_key,
 )
-from core.cache import get_cached, make_cache_key, set_cached
+from core.cache import get_cached, set_cached
 from core.config import Config
-from core.db import close_db, init_db
+from core.db import close_db, init_db, prune_logs
 from core.events import emit
 from core.placeholder import router as placeholder_router
 from core.ratelimit import get_limiter
@@ -37,6 +37,34 @@ from core.usage import compute_cost, log_usage
 from website.routes import router as website_router
 
 _log = logging.getLogger("llm-pico.server")
+
+_ALL_WINDOWS = ("rpm", "rpd", "tpm", "tpd", "ash", "asd")
+
+
+async def _build_rate_limit_headers(
+    limiter,
+    key_hash: str,
+    model_name: str,
+    user_limits: dict[str, int | None],
+    model_limits: dict[str, int | None],
+) -> dict[str, str]:
+    """Build X-RateLimit-* headers from current limiter usage."""
+    headers: dict[str, str] = {}
+    now = time.time()
+    for level, limits in [("user", user_limits), ("model", model_limits)]:
+        for window in _ALL_WINDOWS:
+            limit = limits.get(window)
+            if limit is None:
+                continue
+            count = await limiter.get_usage(key_hash, model_name, level, window) or 0
+            remaining = max(0, limit - count)
+            reset_ts = limiter._window_end(window, now)
+            prefix = f"X-RateLimit-{window.upper()}"
+            headers[f"{prefix}-Limit"] = str(limit)
+            headers[f"{prefix}-Remaining"] = str(remaining)
+            headers[f"{prefix}-Reset"] = str(reset_ts)
+    return headers
+
 
 _in_flight: set[str] = set()
 _in_flight_lock = asyncio.Lock()
@@ -87,9 +115,30 @@ async def lifespan(app: FastAPI):
 
     _log.info("llm-pico ready: %d models, %d adapters", len(config.model_list), len(router.get_model_names()))
 
+    async def _log_pruner(cfg: Config):
+        while True:
+            try:
+                usg, adm = await prune_logs(
+                    cfg.general_settings.usage_log_retention_days,
+                    cfg.general_settings.admin_log_retention_days,
+                )
+                if usg > 0 or adm > 0:
+                    _log.info("Pruned %d usage rows and %d admin rows", usg, adm)
+            except Exception:
+                _log.exception("Log pruning failed")
+            await asyncio.sleep(3600)
+
+    pruner_task = asyncio.create_task(_log_pruner(config))
+
     yield
 
+    pruner_task.cancel()
+    try:
+        await pruner_task
+    except asyncio.CancelledError:
+        pass
     await limiter.stop()
+    await close_all_clients()
     await close_db()
 
     _log.info("shutdown complete")
@@ -179,7 +228,7 @@ async def _proxy_request(
                     "error": {"message": f"Adapter '{slug}' does not support embeddings yet", "type": "not_implemented", "code": 501}
                 })
 
-            adapter = adapter_cls(api_key=key_state.api_key, api_base=provider_group.api_base)
+            adapter = adapter_cls(provider_slug=slug, api_key=key_state.api_key, api_base=provider_group.api_base)
 
             # Image check
             if route_type == "chat" and adapter.has_image_input(body_bytes):
@@ -196,11 +245,10 @@ async def _proxy_request(
 
             # ---- Cache check (only on first attempt, non-streaming) ----
             if attempt == 0 and model_entry.can_cache and not stream:
-                ck = make_cache_key(body_bytes)
-                cached = await get_cached(ck)
+                cached = await get_cached(body_bytes)
                 if cached:
                     resp_body, content_type = cached
-                    _log.debug("cache hit for %s (%s)", model_name, ck[:12])
+                    _log.debug("cache hit for %s", model_name)
                     return Response(content=resp_body, media_type=content_type)
 
             # ---- Budget check (user-level, only on first attempt) ----
@@ -220,6 +268,7 @@ async def _proxy_request(
                     })
 
             # ---- Rate limit reservation (only on first attempt) ----
+            rl_headers: dict[str, str] = {}
             if attempt == 0:
                 model_limits = {
                     "_level": "model",
@@ -247,9 +296,18 @@ async def _proxy_request(
                                     "retry_after": rejected["retry_after"],
                                 }
                             })
+                rl_headers = await _build_rate_limit_headers(
+                    limiter,
+                    key_hash=user_key["key_hash"] if user_key else master_key or "admin",
+                    model_name=model_name,
+                    user_limits=limits,
+                    model_limits=model_limits,
+                )
 
             adapter_model = model_entry.litellm_params.model
-            rewritten_body = _rewrite_model_field(body_bytes, adapter_model)
+            # Strip provider prefix (e.g. "openai/gpt-4" → "gpt-4")
+            model_for_api = adapter_model.split("/", 1)[1] if "/" in adapter_model else adapter_model
+            rewritten_body = _rewrite_model_field(body_bytes, model_for_api)
 
             try:
                 cin = model_entry.cost_per_1m_input
@@ -258,7 +316,7 @@ async def _proxy_request(
                     response = await _handle_streaming(
                         adapter=adapter,
                         body_bytes=rewritten_body,
-                        model_string=adapter_model,
+                        model_string=model_for_api,
                         user_key=user_key,
                         master_key=master_key or "",
                         model_name=model_name,
@@ -268,12 +326,13 @@ async def _proxy_request(
                         limits=limits,
                         request_id=request_id,
                         cost_in=cin, cost_out=cout,
+                        rate_limit_headers=rl_headers,
                     )
                 else:
                     response = await _handle_buffered(
                         adapter=adapter,
                         body_bytes=rewritten_body,
-                        model_string=adapter_model,
+                        model_string=model_for_api,
                         user_key=user_key,
                         master_key=master_key or "",
                         model_name=model_name,
@@ -283,15 +342,16 @@ async def _proxy_request(
                         limits=limits,
                         request_id=request_id,
                         cost_in=cin, cost_out=cout,
+                        rate_limit_headers=rl_headers,
+                        route_type=route_type,
                     )
 
                 router.record_success(provider_group)
 
                 if model_entry.can_cache and not stream:
-                    ck = make_cache_key(body_bytes)
                     resp_body = response.body if hasattr(response, 'body') else None
                     if resp_body:
-                        asyncio.create_task(set_cached(ck, resp_body))
+                        await set_cached(body_bytes, resp_body)
 
                 return response
 
@@ -345,6 +405,7 @@ async def _handle_streaming(
     request_id: str,
     cost_in: float | None = None,
     cost_out: float | None = None,
+    rate_limit_headers: dict[str, str] | None = None,
 ) -> StreamingResponse:
     t0 = time.monotonic()
 
@@ -381,6 +442,10 @@ async def _handle_streaming(
             yield chunk
 
     response = StreamingResponse(generate(), media_type="text/event-stream")
+    response.headers["X-Request-Id"] = request_id
+    if rate_limit_headers:
+        for k, v in rate_limit_headers.items():
+            response.headers[k] = v
 
     async def _log_and_reconcile():
         nonlocal actual_tokens
@@ -457,11 +522,16 @@ async def _handle_buffered(
     request_id: str,
     cost_in: float | None = None,
     cost_out: float | None = None,
+    rate_limit_headers: dict[str, str] | None = None,
+    route_type: str = "chat",
 ) -> Response:
     t0 = time.monotonic()
 
     try:
-        upstream = await adapter.proxy_request(body_bytes, model_string)
+        if route_type == "embeddings":
+            upstream = await adapter.proxy_embeddings(body_bytes)
+        else:
+            upstream = await adapter.proxy_request(body_bytes, model_string)
     except httpx.ConnectError as e:
         raise HTTPException(status_code=502, detail={
             "error": {"message": f"Upstream connection failed: {e}", "type": "upstream_error", "code": 502}
@@ -526,10 +596,15 @@ async def _handle_buffered(
     _log.debug("buffered request %s: model=%s provider=%s tokens=%d latency=%dms",
                request_id, model_name, provider_slug, actual_tokens, latency)
 
-    return Response(content=body, media_type="application/json", status_code=upstream.status_code)
+    resp = Response(content=body, media_type="application/json", status_code=upstream.status_code)
+    resp.headers["X-Request-Id"] = request_id
+    if rate_limit_headers:
+        for k, v in rate_limit_headers.items():
+            resp.headers[k] = v
+    return resp
 
 
-async def _route_chat_completions(request: Request) -> Response:
+async def _route_chat_completions(request: Request, user_key: dict = Depends(require_api_key)) -> Response:
     if _is_draining:
         return Response(
             content=json.dumps({"error": {"message": "Server is shutting down", "type": "draining", "code": 503}}),
@@ -540,20 +615,7 @@ async def _route_chat_completions(request: Request) -> Response:
 
     app_state = request.app.state
     config: Config = getattr(app_state, "config")
-
-    auth_header = request.headers.get("Authorization")
-    raw_key = extract_bearer(auth_header)
-    if not raw_key:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Missing or invalid Authorization header", "type": "unauthorized", "code": 401}
-        })
-
     master_key = config.general_settings.master_key
-    user_key = await verify_api_key(raw_key, master_key)
-    if user_key is None:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Invalid API key", "type": "unauthorized", "code": 401}
-        })
 
     body_bytes = await request.body()
     try:
@@ -589,24 +651,9 @@ async def _route_chat_completions(request: Request) -> Response:
     )
 
 
-async def _route_models(request: Request) -> Response:
+async def _route_models(request: Request, user_key: dict = Depends(require_api_key)) -> Response:
     app_state = request.app.state
     router: Router = getattr(app_state, "router")
-    config: Config = getattr(app_state, "config")
-
-    auth_header = request.headers.get("Authorization")
-    raw_key = extract_bearer(auth_header)
-    if not raw_key:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Missing or invalid Authorization header", "type": "unauthorized", "code": 401}
-        })
-
-    master_key = config.general_settings.master_key
-    user_key = await verify_api_key(raw_key, master_key)
-    if user_key is None:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Invalid API key", "type": "unauthorized", "code": 401}
-        })
 
     all_models = router.get_model_names()
 
@@ -621,24 +668,9 @@ async def _route_models(request: Request) -> Response:
     )
 
 
-async def _route_single_model(request: Request, model_id: str) -> Response:
+async def _route_single_model(request: Request, model_id: str, user_key: dict = Depends(require_api_key)) -> Response:
     app_state = request.app.state
     router: Router = getattr(app_state, "router")
-    config: Config = getattr(app_state, "config")
-
-    auth_header = request.headers.get("Authorization")
-    raw_key = extract_bearer(auth_header)
-    if not raw_key:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Missing or invalid Authorization header", "type": "unauthorized", "code": 401}
-        })
-
-    master_key = config.general_settings.master_key
-    user_key = await verify_api_key(raw_key, master_key)
-    if user_key is None:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Invalid API key", "type": "unauthorized", "code": 401}
-        })
 
     if model_id not in router.get_model_names():
         raise HTTPException(status_code=404, detail={
@@ -719,7 +751,7 @@ async def _proxy_audio_request(
                     "error": {"message": f"Model '{model_name}' does not support speech-to-text", "type": "bad_request", "code": 400}
                 })
 
-            adapter = adapter_cls(api_key=key_state.api_key, api_base=provider_group.api_base)
+            adapter = adapter_cls(provider_slug=slug, api_key=key_state.api_key, api_base=provider_group.api_base)
 
             if attempt == 0 and user_key and user_key.get("user_id"):
                 est_cost = compute_cost(0, 0, model_entry.cost_per_1m_input, model_entry.cost_per_1m_output)
@@ -739,6 +771,7 @@ async def _proxy_audio_request(
                     "ash": model_entry.ash,
                     "asd": model_entry.asd,
                 }
+                rl_headers: dict[str, str] = {}
                 for l in (limits, model_limits):
                     has_any = any(v is not None for k, v in l.items() if k != "_level")
                     if has_any:
@@ -758,6 +791,13 @@ async def _proxy_audio_request(
                                     "retry_after": rejected["retry_after"],
                                 }
                             })
+                rl_headers = await _build_rate_limit_headers(
+                    limiter,
+                    key_hash=user_key["key_hash"] if user_key else master_key or "admin",
+                    model_name=model_name,
+                    user_limits=limits,
+                    model_limits=model_limits,
+                )
 
             adapter_model = model_entry.litellm_params.model
             t0 = time.monotonic()
@@ -839,7 +879,11 @@ async def _proxy_audio_request(
                 "cost_usd": cost,
             })
 
-            return Response(content=body, media_type="application/json")
+            resp = Response(content=body, media_type="application/json")
+            resp.headers["X-Request-Id"] = request_id
+            for k, v in rl_headers.items():
+                resp.headers[k] = v
+            return resp
 
         # All retries exhausted — try failover model (one level, no chain)
         if not _is_failover and model_entry and model_entry.failover_model:
@@ -862,7 +906,7 @@ async def _proxy_audio_request(
         await _untrack_request(request_id)
 
 
-async def _route_audio_transcriptions(request: Request) -> Response:
+async def _route_audio_transcriptions(request: Request, user_key: dict = Depends(require_api_key)) -> Response:
     if _is_draining:
         return Response(
             content=json.dumps({"error": {"message": "Server is shutting down", "type": "draining", "code": 503}}),
@@ -871,20 +915,7 @@ async def _route_audio_transcriptions(request: Request) -> Response:
 
     app_state = request.app.state
     config: Config = getattr(app_state, "config")
-
-    auth_header = request.headers.get("Authorization")
-    raw_key = extract_bearer(auth_header)
-    if not raw_key:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Missing or invalid Authorization header", "type": "unauthorized", "code": 401}
-        })
-
     master_key = config.general_settings.master_key
-    user_key = await verify_api_key(raw_key, master_key)
-    if user_key is None:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Invalid API key", "type": "unauthorized", "code": 401}
-        })
 
     form = await request.form()
     audio_file: UploadFile | None = form.get("file")
@@ -970,14 +1001,16 @@ async def _proxy_audio_speech(
                         "error": {"message": budget_err, "type": "budget_exceeded", "code": 429}
                     })
 
-            adapter = adapter_cls(api_key=key_state.api_key, api_base=result[0].api_base)
+            adapter = adapter_cls(provider_slug=slug, api_key=key_state.api_key, api_base=result[0].api_base)
             adapter_model = model_entry.litellm_params.model
+            model_for_api = adapter_model.split("/", 1)[1] if "/" in adapter_model else adapter_model
+            rewritten_body = _rewrite_model_field(body_bytes, model_for_api)
             t0 = time.monotonic()
 
             try:
                 upstream = await adapter.proxy_tts(
-                    body_bytes=body_bytes,
-                    model_string=adapter_model,
+                    body_bytes=rewritten_body,
+                    model_string=model_for_api,
                 )
             except httpx.ConnectError as e:
                 router.record_failure(result[0], key_state, 502)
@@ -1067,7 +1100,7 @@ async def _proxy_audio_speech(
         await _untrack_request(request_id)
 
 
-async def _route_audio_speech(request: Request) -> Response:
+async def _route_audio_speech(request: Request, user_key: dict = Depends(require_api_key)) -> Response:
     if _is_draining:
         return Response(
             content=json.dumps({"error": {"message": "Server is shutting down", "type": "draining", "code": 503}}),
@@ -1076,20 +1109,7 @@ async def _route_audio_speech(request: Request) -> Response:
 
     app_state = request.app.state
     config: Config = getattr(app_state, "config")
-
-    auth_header = request.headers.get("Authorization")
-    raw_key = extract_bearer(auth_header)
-    if not raw_key:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Missing or invalid Authorization header", "type": "unauthorized", "code": 401}
-        })
-
     master_key = config.general_settings.master_key
-    user_key = await verify_api_key(raw_key, master_key)
-    if user_key is None:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Invalid API key", "type": "unauthorized", "code": 401}
-        })
 
     body_bytes = await request.body()
     try:
@@ -1120,22 +1140,10 @@ async def _route_audio_speech(request: Request) -> Response:
     )
 
 
-async def _route_embeddings(request: Request) -> Response:
-    auth_header = request.headers.get("Authorization")
-    raw_key = extract_bearer(auth_header)
-    if not raw_key:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Missing or invalid Authorization header", "type": "unauthorized", "code": 401}
-        })
-
+async def _route_embeddings(request: Request, user_key: dict = Depends(require_api_key)) -> Response:
     app_state = request.app.state
     config: Config = getattr(app_state, "config")
     master_key = config.general_settings.master_key
-    user_key = await verify_api_key(raw_key, master_key)
-    if user_key is None:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Invalid API key", "type": "unauthorized", "code": 401}
-        })
 
     body_bytes = await request.body()
     try:

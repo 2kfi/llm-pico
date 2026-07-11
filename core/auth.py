@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import time
@@ -8,6 +9,8 @@ from typing import Any, TYPE_CHECKING
 
 from core.db import get_db
 from core.teams import merge_allowlist, merge_limits, resolve_user_limits
+
+from fastapi import Request
 
 _log = logging.getLogger("llm-pico.auth")
 
@@ -34,7 +37,7 @@ async def verify_api_key(
     raw_key: str,
     master_key: str | None = None,
 ) -> dict[str, Any] | None:
-    if master_key and raw_key == master_key:
+    if master_key and hmac.compare_digest(raw_key, master_key):
         return {"role": "admin", "key_prefix": "master"}
 
     key_hash = hash_key(raw_key)
@@ -103,6 +106,48 @@ def check_model_access(user: dict[str, Any], model_name: str) -> bool:
     if allowlist is None:
         return True
     return model_name in allowlist
+
+
+async def require_api_key(request: Request) -> dict:
+    """FastAPI dependency: verify a valid Bearer API key (user or master).
+
+    Returns the user_key dict. Raises 401 on failure.
+    """
+    from fastapi import HTTPException
+    auth_header = request.headers.get("Authorization")
+    raw_key = extract_bearer(auth_header)
+    if not raw_key:
+        raise HTTPException(status_code=401, detail={
+            "error": {"message": "Missing or invalid Authorization header",
+                       "type": "unauthorized", "code": 401}
+        })
+    config = request.app.state.config
+    master_key = config.general_settings.master_key
+    user_key = await verify_api_key(raw_key, master_key)
+    if user_key is None:
+        raise HTTPException(status_code=401, detail={
+            "error": {"message": "Invalid API key",
+                       "type": "unauthorized", "code": 401}
+        })
+    return user_key
+
+
+async def require_master_key(request: Request) -> str:
+    """FastAPI dependency: require the master API key (admin only).
+
+    Returns the raw key string for audit logging. Raises 401 on failure.
+    """
+    from fastapi import HTTPException
+    config = request.app.state.config
+    master_key = config.general_settings.master_key
+    auth_header = request.headers.get("Authorization")
+    raw_key = extract_bearer(auth_header)
+    if not raw_key or not hmac.compare_digest(raw_key, master_key):
+        raise HTTPException(status_code=401, detail={
+            "error": {"message": "Invalid or missing master API key",
+                       "type": "unauthorized", "code": 401}
+        })
+    return raw_key
 
 
 async def seed_users(users: list[Any]) -> None:

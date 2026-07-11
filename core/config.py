@@ -1,10 +1,47 @@
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+
+_ENV_VAR_RE = re.compile(r"\$\{([^}:]+)(?::(-?[^}]*))?\}")
+
+
+def _resolve_env_vars(raw: dict) -> dict:
+    """Walk a parsed-YAML dict and resolve ${VAR_NAME} or ${VAR_NAME:-default} strings.
+
+    Recursively traverses nested dicts and lists. Any string value matching
+    the ${VAR} or ${VAR:-default} pattern is replaced with the environment
+    variable value. Raises ValueError if a variable is not set and has no default.
+    """
+
+    def _walk(value):
+        if isinstance(value, str):
+            match = _ENV_VAR_RE.fullmatch(value)
+            if not match:
+                return value
+            var_name = match.group(1)
+            default = match.group(2)
+            env_val = os.environ.get(var_name)
+            if env_val is not None:
+                return env_val
+            if default is not None:
+                return default
+            raise ValueError(
+                f"Environment variable ${var_name} is not set "
+                f"and no default value was provided"
+            )
+        elif isinstance(value, dict):
+            return {k: _walk(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [_walk(item) for item in value]
+        return value
+
+    return _walk(raw)
 
 
 @dataclass
@@ -27,6 +64,8 @@ class RouterSettings:
 class GeneralSettings:
     master_key: str = ""
     db_path: str | None = None
+    usage_log_retention_days: int = 30
+    admin_log_retention_days: int = 90
 
 
 @dataclass
@@ -82,6 +121,8 @@ def load_config(path: str) -> Config:
     with open(path_obj) as f:
         raw = yaml.safe_load(f)
 
+    raw = _resolve_env_vars(raw)
+
     if not isinstance(raw, dict):
         raise ValueError("config must be a YAML dictionary")
 
@@ -92,6 +133,8 @@ def load_config(path: str) -> Config:
     cfg.general_settings = GeneralSettings(
         master_key=gs.get("master_key", ""),
         db_path=gs.get("db_path"),
+        usage_log_retention_days=gs.get("usage_log_retention_days", 30),
+        admin_log_retention_days=gs.get("admin_log_retention_days", 90),
     )
 
     # router_settings
@@ -129,7 +172,7 @@ def load_config(path: str) -> Config:
             embeddings=entry.get("embeddings", False),
             stt=entry.get("stt", False),
             tts=entry.get("tts", False),
-            failover_model=entry.get("failover-model"),
+            failover_model=entry.get("failover_model"),
             can_cache=entry.get("can_cache", False),
             cost_per_1m_input=entry.get("cost_per_1m_input"),
             cost_per_1m_output=entry.get("cost_per_1m_output"),
@@ -152,6 +195,8 @@ def load_users(path: str) -> list[UserKey]:
 
     with open(path_obj) as f:
         raw = yaml.safe_load(f)
+
+    raw = _resolve_env_vars(raw)
 
     if not isinstance(raw, dict):
         return []

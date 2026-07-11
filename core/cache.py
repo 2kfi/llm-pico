@@ -1,57 +1,64 @@
 from __future__ import annotations
 
-import hashlib
-import logging
 import time
-
-from core.db import get_db
-
-_log = logging.getLogger("llm-pico.cache")
-
-CACHE_TTL = 3600
+from collections import OrderedDict
+from hashlib import sha256
 
 
-def make_cache_key(body_bytes: bytes) -> str:
-    return hashlib.sha256(body_bytes).hexdigest()
+class MemoryCache:
+    def __init__(self, max_size: int = 256, default_ttl: int = 3600):
+        self._max_size = max_size
+        self._default_ttl = default_ttl
+        self._store: OrderedDict[str, tuple[float, bytes, str]] = OrderedDict()
+
+    def _make_key(self, body: bytes) -> str:
+        return sha256(body).hexdigest()
+
+    async def get(self, body: bytes) -> tuple[bytes, str] | None:
+        key = self._make_key(body)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        expires_at, data, content_type = entry
+        if time.time() > expires_at:
+            del self._store[key]
+            return None
+        self._store.move_to_end(key)
+        return data, content_type
+
+    async def set(self, body: bytes, response: bytes, content_type: str = "application/json", ttl: int | None = None) -> None:
+        key = self._make_key(body)
+        expires_at = time.time() + (ttl if ttl is not None else self._default_ttl)
+        self._store[key] = (expires_at, response, content_type)
+        self._store.move_to_end(key)
+        if len(self._store) > self._max_size:
+            self._store.popitem(last=False)
+
+    async def clear(self) -> None:
+        self._store.clear()
+
+    async def clear_expired(self) -> int:
+        now = time.time()
+        expired = [k for k, (exp, _, _) in self._store.items() if now > exp]
+        for k in expired:
+            del self._store[k]
+        return len(expired)
 
 
-async def get_cached(cache_key: str) -> tuple[bytes, str] | None:
-    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-    async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT response_body, content_type FROM request_cache WHERE cache_key = ? AND expires_at > ?",
-            (cache_key, now),
-        )
-        row = await cursor.fetchone()
-    if row is None:
-        return None
-    return row["response_body"], row["content_type"]
+_cache = MemoryCache()
 
 
-async def set_cached(cache_key: str, response_body: bytes, content_type: str = "application/json", ttl: int = CACHE_TTL) -> None:
-    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-    expires_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + ttl))
-    async with get_db() as db:
-        await db.execute(
-            """INSERT OR REPLACE INTO request_cache
-               (cache_key, response_body, content_type, created_at, expires_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (cache_key, response_body, content_type, now, expires_at),
-        )
-        await db.commit()
-    _log.debug("cached response %s (ttl=%ds)", cache_key[:12], ttl)
+async def get_cached(body: bytes) -> tuple[bytes, str] | None:
+    return await _cache.get(body)
+
+
+async def set_cached(body: bytes, response: bytes, content_type: str = "application/json", ttl: int | None = None) -> None:
+    await _cache.set(body, response, content_type, ttl)
+
+
+async def clear_cache() -> None:
+    await _cache.clear()
 
 
 async def clear_expired() -> int:
-    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-    async with get_db() as db:
-        cursor = await db.execute("DELETE FROM request_cache WHERE expires_at <= ?", (now,))
-        await db.commit()
-        return cursor.rowcount
-
-
-async def clear_cache() -> int:
-    async with get_db() as db:
-        cursor = await db.execute("DELETE FROM request_cache")
-        await db.commit()
-        return cursor.rowcount
+    return await _cache.clear_expired()

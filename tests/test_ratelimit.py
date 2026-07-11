@@ -59,14 +59,14 @@ async def test_rpm_separate_keys():
 @pytest.mark.asyncio
 async def test_reservation_consumes_multiple():
     limiter = RateLimiter()
-    limits = {"_level": "user", "rpm": 10}
+    limits = {"_level": "user", "tpm": 100}
 
-    rejected = await limiter.check_and_reserve("hash-c", "model-x", limits, reservation=7)
+    rejected = await limiter.check_and_reserve("hash-c", "model-x", limits, reservation=70)
     assert rejected is None
 
-    rejected = await limiter.check_and_reserve("hash-c", "model-x", limits, reservation=7)
+    rejected = await limiter.check_and_reserve("hash-c", "model-x", limits, reservation=70)
     assert rejected is not None
-    assert rejected["exceeded"] == "rpm"
+    assert rejected["exceeded"] == "tpm"
 
 
 @pytest.mark.asyncio

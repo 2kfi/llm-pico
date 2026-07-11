@@ -11,6 +11,8 @@ router_settings:
 
 general_settings:
   master_key: "sk-pico-master-CHANGE-ME"
+  usage_log_retention_days: 30
+  admin_log_retention_days: 90
 
 model_list:
   # ==========================================
@@ -24,7 +26,7 @@ model_list:
     can_cache: true
     cost_per_1m_input: 15.00
     cost_per_1m_output: 60.00
-    failover-model: "gemma-4-31b-it"
+    failover_model: "gemma-4-31b-it"
 
   # ==========================================
   # 2. GEMINI

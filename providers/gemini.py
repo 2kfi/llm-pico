@@ -12,12 +12,25 @@ from providers import register
 
 _log = logging.getLogger("llm-pico.providers.gemini")
 
+_AUDIO_MIME = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "opus": "audio/opus",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
+    "ogg": "audio/ogg",
+    "pcm": "audio/L16",
+}
+
 
 @register("gemini")
 class GeminiAdapter(BaseAdapter):
     provider = "gemini"
     supports_images = True
     supports_embeddings = True
+
+    def __init__(self, provider_slug: str = "gemini", api_key: str | None = None, api_base: str | None = None) -> None:
+        super().__init__(provider_slug=provider_slug, api_key=api_key, api_base=api_base)
 
     def _set_auth_headers(self, headers: dict[str, str]) -> None:
         headers["Content-Type"] = "application/json"
@@ -64,6 +77,11 @@ class GeminiAdapter(BaseAdapter):
                             parts.append({"inline_data": {"mime_type": mime_type, "data": b64}})
                         else:
                             parts.append({"text": url})
+                    elif p.get("type") == "input_audio":
+                        audio = p["input_audio"]
+                        fmt = audio.get("format", "mp3")
+                        mime_type = _AUDIO_MIME.get(fmt, f"audio/{fmt}")
+                        parts.append({"inline_data": {"mime_type": mime_type, "data": audio["data"]}})
                 contents.append({"role": gemini_role, "parts": parts})
 
         return contents, system_instruction
@@ -130,14 +148,60 @@ class GeminiAdapter(BaseAdapter):
         body = json.loads(body_bytes)
         stream = body.get("stream", False)
         gemini_req = self._build_gemini_request(body, model_string)
-        url = self._build_url(model_string, stream=False)
+        url = self._build_url(model_string, stream=stream)
         response = await self.client.post(url, content=json.dumps(gemini_req))
 
         if response.status_code != 200:
             return response
 
+        if stream:
+            return response
+
         data = response.json()
         openai_resp = self._gemini_to_openai_response(data, model_string)
+        response._content = json.dumps(openai_resp).encode()
+        return response
+
+    async def proxy_embeddings(self, body_bytes: bytes) -> httpx.Response:
+        body = json.loads(body_bytes)
+        inp = body.get("input", "")
+        inputs = inp if isinstance(inp, list) else [inp]
+
+        model = body.get("model", "")
+        gemini_model = f"models/{model}"
+        requests_list = []
+        for text in inputs:
+            requests_list.append({
+                "model": gemini_model,
+                "content": {"parts": [{"text": text}]},
+            })
+        url = f"{self._base_url()}/models/{model}:batchEmbedContents?key={self.api_key}"
+        response = await self.client.post(url, content=json.dumps({"requests": requests_list}))
+
+        if response.status_code != 200:
+            return response
+
+        data = response.json()
+        embeddings = data.get("embeddings", [])
+
+        openai_data = []
+        for i, emb in enumerate(embeddings):
+            openai_data.append({
+                "object": "embedding",
+                "embedding": emb.get("values", []),
+                "index": i,
+            })
+
+        openai_resp = {
+            "object": "list",
+            "data": openai_data,
+            "model": model,
+            "usage": {
+                "prompt_tokens": sum(len(t.split()) for t in inputs),
+                "total_tokens": sum(len(t.split()) for t in inputs),
+            },
+        }
+
         response._content = json.dumps(openai_resp).encode()
         return response
 

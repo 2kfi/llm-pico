@@ -11,6 +11,14 @@ dependencies = [
     "click>=8.1.0",
     "pyyaml>=6.0",
     "pydantic>=2.0",
+    "python-multipart>=0.0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28.0",
 ]
 
 [project.scripts]
@@ -22,3 +30,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["core*", "providers*", "api*", "website*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

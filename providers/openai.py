@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import httpx
@@ -16,6 +17,9 @@ class OpenAIAdapter(BaseAdapter):
     supports_images = True
     supports_embeddings = True
 
+    def __init__(self, provider_slug: str = "openai", api_key: str | None = None, api_base: str | None = None) -> None:
+        super().__init__(provider_slug=provider_slug, api_key=api_key, api_base=api_base)
+
     def _set_auth_headers(self, headers: dict[str, str]) -> None:
         super()._set_auth_headers(headers)
         headers["Authorization"] = f"Bearer {self.api_key}"
@@ -24,16 +28,20 @@ class OpenAIAdapter(BaseAdapter):
         return (self.api_base or "https://api.openai.com/v1").rstrip("/")
 
     async def proxy_request(self, body_bytes: bytes, model_string: str) -> httpx.Response:
+        body = json.loads(body_bytes)
+        # Newer OpenAI models (gpt-5.4-mini+) reject max_tokens and require max_completion_tokens
+        if "max_tokens" in body and "max_completion_tokens" not in body:
+            body["max_completion_tokens"] = body.pop("max_tokens")
         url = f"{self._base_url()}/chat/completions"
-        return await self.client.post(url, content=body_bytes)
+        return await self.client.post(url, content=json.dumps(body), headers=self._headers())
 
     async def proxy_completions(self, body_bytes: bytes) -> httpx.Response:
         url = f"{self._base_url()}/completions"
-        return await self.client.post(url, content=body_bytes)
+        return await self.client.post(url, content=body_bytes, headers=self._headers())
 
     async def proxy_embeddings(self, body_bytes: bytes) -> httpx.Response:
         url = f"{self._base_url()}/embeddings"
-        return await self.client.post(url, content=body_bytes)
+        return await self.client.post(url, content=body_bytes, headers=self._headers())
 
     async def proxy_audio_transcriptions(
         self,
@@ -49,8 +57,10 @@ class OpenAIAdapter(BaseAdapter):
         data = {"model": model}
         if extra_data:
             data.update(extra_data)
-        return await self.client.post(url, files=files, data=data)
+        h = self._headers()
+        h.pop("Content-Type", None)
+        return await self.client.post(url, files=files, data=data, headers=h)
 
     async def proxy_tts(self, body_bytes: bytes, model_string: str) -> httpx.Response:
         url = f"{self._base_url()}/audio/speech"
-        return await self.client.post(url, content=body_bytes)
+        return await self.client.post(url, content=body_bytes, headers=self._headers())

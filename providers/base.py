@@ -9,6 +9,47 @@ import httpx
 
 _log = logging.getLogger("llm-pico.providers.base")
 
+_shared_clients: dict[str, httpx.AsyncClient] = {}
+_shared_clients_lock: Any = None
+
+
+def _get_lock():
+    global _shared_clients_lock
+    if _shared_clients_lock is None:
+        import asyncio
+        try:
+            _shared_clients_lock = asyncio.Lock()
+        except RuntimeError:
+            _shared_clients_lock = None
+    return _shared_clients_lock
+
+
+def _get_client(provider_slug: str) -> httpx.AsyncClient:
+    if provider_slug in _shared_clients:
+        return _shared_clients[provider_slug]
+
+    limits = httpx.Limits(
+        max_connections=10,
+        max_keepalive_connections=5,
+        keepalive_expiry=15,
+    )
+    timeout = httpx.Timeout(timeout=300.0, connect=10.0, pool=5.0)
+
+    client = httpx.AsyncClient(limits=limits, timeout=timeout)
+    _shared_clients[provider_slug] = client
+    _log.debug("created shared httpx client for provider=%s", provider_slug)
+    return client
+
+
+async def close_all_clients() -> None:
+    for slug, client in list(_shared_clients.items()):
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        _log.debug("closed shared httpx client for provider=%s", slug)
+    _shared_clients.clear()
+
 
 class BaseAdapter(ABC):
     provider: str = ""
@@ -17,28 +58,35 @@ class BaseAdapter(ABC):
     supports_stt: bool = False
     supports_tts: bool = False
 
-    def __init__(self, api_key: str | None = None, api_base: str | None = None) -> None:
+    def __init__(
+        self,
+        provider_slug: str = "",
+        api_key: str | None = None,
+        api_base: str | None = None,
+    ) -> None:
         self.api_key = api_key or ""
         self.api_base = api_base
+        self._provider_slug = provider_slug
 
-        pool_limits = httpx.Limits(
-            max_connections=5,
-            max_keepalive_connections=3,
-            keepalive_expiry=30.0,
-        )
-        pool_timeout = httpx.Timeout(300.0, connect=10.0, pool=10.0)
-
-        headers = {}
-        self._set_auth_headers(headers)
-
-        self.client = httpx.AsyncClient(
-            limits=pool_limits,
-            timeout=pool_timeout,
-            headers=headers,
-        )
+        if provider_slug:
+            self.client = _get_client(provider_slug)
+        else:
+            limits = httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+                keepalive_expiry=15,
+            )
+            timeout = httpx.Timeout(timeout=300.0, connect=10.0, pool=5.0)
+            self.client = httpx.AsyncClient(limits=limits, timeout=timeout)
+            self._owns_client = True
 
     def _set_auth_headers(self, headers: dict[str, str]) -> None:
         headers["Content-Type"] = "application/json"
+
+    def _headers(self) -> dict[str, str]:
+        h: dict[str, str] = {}
+        self._set_auth_headers(h)
+        return h
 
     def peek_request(self, body: bytes) -> tuple[str, bool, int]:
         obj = json.loads(body)
@@ -90,4 +138,4 @@ class BaseAdapter(ABC):
         return chunks, usage
 
     async def close(self) -> None:
-        await self.client.aclose()
+        pass

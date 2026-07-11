@@ -12,11 +12,24 @@ from providers import register
 
 _log = logging.getLogger("llm-pico.providers.anthropic")
 
+_AUDIO_MIME = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "opus": "audio/opus",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
+    "ogg": "audio/ogg",
+    "pcm": "audio/L16",
+}
+
 
 @register("anthropic")
 class AnthropicAdapter(BaseAdapter):
     provider = "anthropic"
     supports_images = True
+
+    def __init__(self, provider_slug: str = "anthropic", api_key: str | None = None, api_base: str | None = None) -> None:
+        super().__init__(provider_slug=provider_slug, api_key=api_key, api_base=api_base)
 
     def _set_auth_headers(self, headers: dict[str, str]) -> None:
         super()._set_auth_headers(headers)
@@ -61,6 +74,14 @@ class AnthropicAdapter(BaseAdapter):
                         parts.append({
                             "type": "image",
                             "source": {"type": "base64", "media_type": media_type, "data": b64},
+                        })
+                    elif p.get("type") == "input_audio":
+                        audio = p["input_audio"]
+                        fmt = audio.get("format", "mp3")
+                        media_type = _AUDIO_MIME.get(fmt, f"audio/{fmt}")
+                        parts.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": audio["data"]},
                         })
                 messages.append({"role": role, "content": parts})
 
@@ -120,7 +141,7 @@ class AnthropicAdapter(BaseAdapter):
         body = json.loads(body_bytes)
         anthropic_req = self._build_anthropic_request(body, model_string)
         url = f"{self._base_url()}/messages"
-        response = await self.client.post(url, content=json.dumps(anthropic_req))
+        response = await self.client.post(url, content=json.dumps(anthropic_req), headers=self._headers())
 
         if response.status_code != 200:
             return response

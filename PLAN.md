@@ -2,6 +2,8 @@
 
 > **Note**: This is a **living document** reflecting the *actual* current state of the codebase, not an aspirational design doc. It is updated as the project evolves.
 
+---
+
 ## Codebase Restructure (Current)
 
 The codebase has been restructured into a clean layered architecture with three main packages:
@@ -10,42 +12,70 @@ The codebase has been restructured into a clean layered architecture with three 
 - **`core/`** — Pure business logic (no HTTP imports, just functions that take params and return values)
 - **`providers/`** — Provider adapters, lazily loaded on demand via `importlib`
 - **`website/`** — Web dashboard SPA served at `/admin/dashboard`
-- **`temp/tests/`** — All 45 tests, mirroring the `core/` and `api/` structure
+- **`tests/`** — All 67 tests, mirroring the `core/` and `api/` structure
 
 Key principle: `core/` never imports FastAPI. `api/` imports from `core/` and `providers/`. Provider adapters are loaded only when first needed, keeping startup fast.
 
 ---
 
+## What We Deliberately Reject
+
+These are not TODOs. They are design decisions. Each was considered and rejected.
+
+| Feature | Why We Rejected It | When We'd Reconsider |
+|---|---|---|
+| **Redis** | Violates zero-dependency design. In-memory dicts + SQLite batched flush handle 50 concurrent clients fine. Redis is the first thing people reach for and the last thing they need at this scale. | 500+ concurrent clients, or if single-process persistence becomes a hard requirement |
+| **PostgreSQL** | SQLite is the correct database for a single-process proxy with ≤50 clients. WAL mode + connection pooling covers our write contention needs. PostgreSQL adds an entire server process, connection auth, and config management for zero benefit at our scale. | 1000+ clients, or if we need concurrent multi-process writes |
+| **JWT / OAuth2 / SSO** | Master key is sufficient for single-team deployments. JWT adds token expiry, refresh flows, and cryptographic verification — none of which solve a problem we actually have. OAuth2/SSO are enterprise features for enterprise deployments. | When we have multi-team / multi-org deployments that need federated identity |
+| **Multi-level failover chains** | We have 4 providers. A single failover level (pick a healthy alternate model) covers the realistic failure modes. Chained failover adds complexity proportional to N² for negligible uptime gain at our provider count. | 10+ providers, or if uptime SLOs demand it |
+| **Key rotation with grace periods** | `${ENV_VAR}` config syntax solves the real problem — rotating secrets without code changes. Grace periods add complexity around two valid keys existing simultaneously, which is a security liability, not a feature. | Multi-team deployments where key rotation is a compliance requirement |
+| **Soft budgets** | Hard block is simpler and safer. When a user hits their monthly budget, they get a 429. No partial degradation, no "soft warnings" that get ignored. Predictable behavior is more valuable than "helpful" behavior. | Enterprise clients who specifically require graduated throttling |
+| **100+ provider adapters** | 4 dedicated adapters + custom (OpenAI-compat fallback) covers 95% of use cases. Most LLM providers either speak OpenAI-compatible API or have a small translation surface. Abstraction for abstraction's sake creates maintenance burden. | 10+ providers with genuinely different APIs that can't use OpenAI-compat fallback |
+| **Provider transformation abstraction** | Premature with 4 providers. Each provider has 1-2 unique quirks that don't justify a formal abstraction layer. Adding a "ProviderTransformer" interface now would be YAGNI. | 10+ providers, or when 3+ providers share the same translation pattern |
+
+---
+
 ## 1. Overview
 
-**llm-pico** is a hyper-lightweight (<200MB RAM) LLM proxy that presents a single OpenAI-compatible endpoint and routes to 15+ models across 7 providers. It handles authentication, capability gating, per-user + per-model rate limiting (hybrid in-memory/SQLite), usage tracking, circuit breaker retry, failover, and admin API behind the scenes.
+**llm-pico** is a hyper-lightweight (<200MB RSS) LLM proxy designed to run 24/7 on **commodity/legacy hardware** — Intel Atom D410 (1c/2t @1.66GHz), 2GB DDR2 RAM. It handles 50 concurrent clients at 1M tokens throughput with zero external dependencies beyond Python 3.11+.
+
+The design philosophy is **perfection of few features over abundance of mediocre ones**. We are a knife, not a Swiss Army knife. Every feature that requires an external dependency (Redis, PostgreSQL, OAuth2) is rejected on principle.
 
 ### Core Design Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
+| Target hardware | Intel Atom D410, 2GB DDR2, 24/7 uptime | Real constraints breed real engineering |
+| Max concurrent clients | 50 | Saturate the target hardware without OOM |
+| Memory budget | <200MB RSS | Leave headroom for OS + swap on 2GB system |
+| Design philosophy | Perfection over options, knife not Swiss Army knife | Every feature must justify its existence against the zero-dep principle |
 | Language | Python 3.11+ | LiteLLM compat, rich ecosystem |
 | HTTP framework | FastAPI | Async, OpenAI-compat docs, Pydantic validation built-in |
-| HTTP client | httpx | Async, per-provider connection pools, pool_timeout fix (`pool=` kwarg) |
-| Database | SQLite + aiosqlite | Zero-dependency persistence, survives restarts |
-| Rate limiting (RPM/TPM/ASH) | In-memory sharded counters (dict + asyncio.Lock) | ~200ns per check, zero DB write contention on hot path |
-| Rate limiting (RPD/TPD/ASD) | SQLite rate_counters, flush every 10s if changed | Day-level windows tolerate latency; SQLite for durability |
-| Provider adapters | Custom (no SDKs), lazy-loaded | Tiny dependency footprint, full control over format translation, imports only when needed |
+| HTTP client | httpx | Async, shared client per provider (not per request), connection pooling |
+| Database | SQLite + aiosqlite | Zero-dependency persistence, connection pool (2 connections), 64MB mmap, 8MB cache, temp_store=MEMORY |
+| Cache | In-memory LRU (256 entries) | Replaces SQLite BLOB cache — no disk I/O on hot path |
+| Rate limiting | All windows in-memory with periodic flush | No SQLite on hot path. Batched single-transaction flush every 60s for daily counters |
+| Config secrets | `${ENV_VAR}` syntax | Secrets stay in environment, never in YAML files |
+| Auth | FastAPI `Depends()` | No duplicated auth blocks — single dependency injection point |
+| Provider adapters | Custom (no SDKs), lazy-loaded | Tiny dependency footprint, full control, imports only when needed |
 | Passthrough parsing | Raw bytes for OpenAI-compat providers | Parse only model/stream/max_tokens (3 fields), forward raw JSON. No Pydantic overhead on hot path. |
 | Token burst protection | Anticipatory reservation | Reserve `prompt+max_tokens` upfront per stream. Release unused post-stream. Prevents concurrent burst overshoot. |
-| Provider outage handling | Error-class-aware retry + circuit breaker + failover | 429 → cool down key. 400/401/403/404/501 → propagate immediately. 5xx → circuit breaker (3 consecutive = open 30s). All retries exhausted → try failover-model (1 level, no chaining). |
+| Provider outage handling | Error-class-aware retry + circuit breaker + failover | 429 → cool down key. 400/401/403/404/501 → propagate immediately. 5xx → circuit breaker (3 consecutive = open 30s). All retries exhausted → try failover_model (1 level, no chaining). |
 | Capability gating | Explicit YAML flags only (images, embeddings, stt, tts) | Both model-level flag + adapter-level class var; no auto-detection |
 | Audio (STT/TTS) | Full route handlers with retry loop | multipart form for STT, JSON for TTS; ash/asd rate limits |
 | Teams & Users | Hierarchy: Team → User → API Key | Each level has own rate limits; per-user monthly budget only (no team-level budget) |
 | Cost tracking | per-model `cost_per_1m_input` + `cost_per_1m_output` (USD) | Computed at request time, logged to `usage_log.cost_usd`; blended fallback |
 | Live log stream | Internal asyncio.Queue pub/sub + SSE endpoint | Zero external deps; per-subscriber backpressure (maxsize 256, drop oldest) |
-| Exact-match caching | SQLite request_cache table, SHA-256 body key | Per-model opt-in (`can_cache: true`), TTL 1h, skips upstream on hit |
+| Exact-match caching | In-memory LRU, SHA-256 body key | Per-model opt-in (`can_cache: true`), TTL 1h, skips upstream on hit |
+| Usage log retention | 30-day auto-prune | Prevents unbounded disk growth on 24/7 deployments |
+| Rate limit headers | `X-RateLimit-*` on every response | Clients can self-throttle without guessing |
 | TLS | Reverse proxy only (nginx/caddy) | Keep the proxy simple |
 | Deployment | pip package + Docker | Both options |
 | Port | 4000 | Default listen port |
 | Key format | `sk-pico-<64-hex>` | Distinct from raw provider keys |
 | Config reload | Graceful drain + `os.execve()` restart | Track active streams via request registry, drain with 120s timeout, then exec |
 | Architecture | Layered (`api/` + `core/` + `providers/`) | Clear separation of HTTP layer from business logic; easy to test core in isolation |
+| Authentication | Master key + hashed user keys | No Redis, no JWT, no OAuth2, no SSO — by design |
 
 ### Provider Matrix
 
@@ -88,15 +118,15 @@ Unregistered slugs fall through to `OpenAIAdapter` via `get_adapter(slug) or Ope
 │
 ├── core/                       # Business logic (no HTTP)
 │   ├── __init__.py             # version string
-│   ├── config.py               # YAML -> dataclasses
-│   ├── db.py                   # SQLite schema + connection
+│   ├── config.py               # YAML -> dataclasses, ${ENV_VAR} interpolation
+│   ├── db.py                   # SQLite schema + connection pool
 │   ├── auth.py                 # API key verification + user/team hierarchy
 │   ├── router.py               # Model resolution + circuit breaker
-│   ├── ratelimit.py            # Hybrid rate limiter (in-memory + SQLite)
-│   ├── usage.py                # Usage logging + cost + stats
+│   ├── ratelimit.py            # Hybrid rate limiter (in-memory + periodic SQLite flush)
+│   ├── usage.py                # Usage logging + cost + stats + 30d retention
 │   ├── teams.py                # Team/User CRUD + budget + limit merging
 │   ├── events.py               # SSE pub/sub (asyncio.Queue)
-│   ├── cache.py                # Exact-match request cache
+│   ├── cache.py                # In-memory LRU exact-match request cache
 │   ├── models.py               # Pydantic schemas
 │   └── placeholder.py          # 501 stubs for unsupported endpoints
 │
@@ -114,16 +144,16 @@ Unregistered slugs fall through to `OpenAIAdapter` via `get_adapter(slug) or Ope
 │   └── static/
 │       └── index.html          # Self-contained SPA (keys, teams, users, budgets, logs)
 │
-├── temp/
-│   └── tests/                  # All 45 tests (mirrors core/ structure)
-│       ├── conftest.py         # 4 fixtures: config, single_model, multi_key, dual_group
-│       ├── test_router.py      # 7 tests: resolve, cooldown, circuit breaker FSM
-│       ├── test_ratelimit.py   # 10 tests: RPM, reservations, reconcile, user+model levels, ASH/ASD
-│       ├── test_retry_loop.py  # 5 tests: 5xx retry, exhaustion, non-retryable, failover, no-chain
-│       ├── test_cost.py        # 5 tests: both rates, blended, null, zero
-│       ├── test_events.py      # 3 tests: emit, multiple subs, backpressure
-│       ├── test_teams.py       # 11 tests: CRUD, limits, budget, cascade, hierarchy
-│       └── test_cache.py       # 4 tests: set/get, key uniqueness, expiry, clear
+├── tests/                      # All 67 tests (mirrors core/ structure)
+│   ├── conftest.py             # 4 fixtures: config, single_model, multi_key, dual_group
+│   ├── test_router.py          # 7 tests: resolve, cooldown, circuit breaker FSM
+│   ├── test_ratelimit.py       # 10 tests: RPM, reservations, reconcile, user+model levels, ASH/ASD
+│   ├── test_retry_loop.py      # 5 tests: 5xx retry, exhaustion, non-retryable, failover, no-chain
+│   ├── test_cost.py            # 5 tests: both rates, blended, null, zero
+│   ├── test_events.py          # 3 tests: emit, multiple subs, backpressure
+│   ├── test_teams.py           # 11 tests: CRUD, limits, budget, cascade, hierarchy
+│   ├── test_cache.py           # 4 tests: set/get, key uniqueness, expiry, clear
+│   └── test_admin_api.py       # 22 tests: HTTP-level admin API tests
 │
 ├── docs/
 │   └── understand.md           # Full codebase walkthrough
@@ -155,16 +185,30 @@ No provider SDKs. All upstream communication via `httpx.AsyncClient`.
 
 ### httpx Pool Configuration
 
+One shared `httpx.AsyncClient` per provider, reused across all requests. No per-request client allocation.
+
 ```python
 limits=httpx.Limits(
-    max_connections=5,
-    max_keepalive_connections=3,
-    keepalive_expiry=30.0,
+    max_connections=10,
+    max_keepalive_connections=5,
+    keepalive_expiry=15.0,
 )
-timeout=httpx.Timeout(300.0, connect=10.0, pool=10.0)
+timeout=httpx.Timeout(300.0, connect=10.0, pool=5.0)
 ```
 
 **CRITICAL:** `httpx >= 0.28` renamed `pool_timeout=` → `pool=`. The old keyword raises `TypeError`.
+
+### SQLite Connection Pool
+
+```python
+# 2 connections: one for reads (usage stats, cache lookups), one for writes (rate counters, usage log)
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA cache_size=-8000;       # 8MB page cache
+PRAGMA mmap_size=67108864;     # 64MB memory-mapped I/O
+PRAGMA temp_store=MEMORY;       # temp tables in RAM
+PRAGMA busy_timeout=5000;       # 5s wait on lock contention
+```
 
 ---
 
@@ -295,22 +339,26 @@ CREATE TABLE IF NOT EXISTS users (
    if user_spend + this_request_cost > user.monthly_budget_usd → 429
    ```
 
-### Six Window Types × Two Storage Tiers
+### Six Window Types — All In-Memory with Periodic Flush
 
-| Window | Meaning | Resolution | Storage | retry_after |
-|---|---|---|---|---|
-| **RPM** | Requests per minute | per-minute window | In-memory dict | 60s |
-| **TPM** | Tokens per minute | per-minute window | In-memory dict | 60s |
-| **RPD** | Requests per day | daily window | SQLite (flush every 10s if dirty) | 86400s |
-| **TPD** | Tokens per day | daily window | SQLite (flush every 10s if dirty) | 86400s |
-| **ASH** | Audio seconds per hour | per-hour window | In-memory dict | 3600s |
-| **ASD** | Audio seconds per day | daily window | SQLite (flush every 10s if dirty) | 86400s |
+| Window | Meaning | Storage | retry_after |
+|---|---|---|---|
+| **RPM** | Requests/minute | In-memory dict (no shards) | 60s |
+| **TPM** | Tokens/minute | In-memory dict (no shards) | 60s |
+| **RPD** | Requests/day | In-memory dict, batched flush every 60s | 86400s |
+| **TPD** | Tokens/day | In-memory dict, batched flush every 60s | 86400s |
+| **ASH** | Audio secs/hour | In-memory dict (no shards) | 3600s |
+| **ASD** | Audio secs/day | In-memory dict, batched flush every 60s | 86400s |
+
+**All daily counters are now in-memory with periodic SQLite flush.** The `rate_counters` table exists for persistence/restart recovery only. Single-transaction batch flush eliminates per-entry COMMIT overhead — all dirty daily counters are written in one `BEGIN IMMEDIATE ... COMMIT` block every 60 seconds. Hot-path rate checks never touch SQLite.
 
 ---
 
 ## 6. API Surface
 
 ### Public Endpoints (User or Master API Key)
+
+Every response includes `X-RateLimit-*` headers:
 
 | Method | Path | Handler | Notes |
 |---|---|---|---|
@@ -365,9 +413,11 @@ CREATE TABLE IF NOT EXISTS users (
 
 Both `.yaml` and `.yml` extensions work. Auto-detected next to config file.
 
+Secrets use `${ENV_VAR}` syntax — the value is interpolated from the environment at load time. This keeps secrets out of YAML files entirely.
+
 ```yaml
 general_settings:
-  master_key: "sk-pico-master-..."     # Required — admin API key
+  master_key: "${MASTER_KEY}"     # Resolved from env at startup
 
 router_settings:
   routing_strategy: simple-shuffle
@@ -383,7 +433,7 @@ model_list:
   - model_name: gpt-5.4-mini
     litellm_params:
       model: openai/gpt-5.4-mini
-      api_key: "sk-..."
+      api_key: "${OPENAI_API_KEY}"
       api_base: "https://..."
     rpm: 50
     rpd: 5000
@@ -395,7 +445,7 @@ model_list:
     embeddings: true
     stt: true
     tts: true
-    failover-model: "gemma-4-31b-it"
+    failover_model: "gemma-4-31b-it"
     cost_per_1m_input: 15.00          # $15 per 1M prompt tokens (USD)
     cost_per_1m_output: 60.00         # $60 per 1M completion tokens (USD)
 
@@ -403,17 +453,24 @@ model_list:
   - model_name: gemini-3-flash-preview
     litellm_params:
       model: gemini/gemini-3-flash-preview
-      api_key: "..."
+      api_key: "${GEMINI_API_KEY}"
     cost_per_1m_output: 0.15          # $0.15 per 1M total tokens (blended)
 
   # Key pooling: same model_name + different api_key = load-balanced
   - model_name: nvidia-nemotron-...
     litellm_params:
       model: openrouter/nvidia/...
-      api_key: "sk-or-..."
+      api_key: "${OPENROUTER_API_KEY}"
       api_base: "https://openrouter.ai/api/v1"
     rpd: 50
 ```
+
+### `${ENV_VAR}` Interpolation Rules
+
+- `${VAR_NAME}` → replaced with `os.environ["VAR_NAME"]` at config load time
+- If the env var is not set and no default is provided, startup fails with a clear error
+- Syntax: `${VAR:-default}` for optional values with defaults
+- Any YAML value can use this syntax: keys, api_base, master_key, etc.
 
 ### Cost Pricing Rules
 
@@ -445,9 +502,9 @@ model_list:
 ```
 Client → llm-pico:
 
-1. Auth
+1. Auth (FastAPI Depends)
    - Extract "Bearer <key>" from Authorization header
-   - Master key check first (string equality)
+   - Master key check first (hmac.compare_digest)
    - SHA-256 hash user key, look up in SQLite user_keys
    - Reject if not found, inactive, or expired
    - If user_key.user_id is set: resolve user + team hierarchy
@@ -461,7 +518,7 @@ Client → llm-pico:
    - Parse JSON → extract model, stream, max_tokens
 
 4. Cache Check (non-streaming, can_cache=true models only)
-   - SHA-256 hash of raw body → lookup SQLite request_cache table
+   - SHA-256 hash of raw body → lookup in-memory LRU cache
    - If hit and not expired → return cached response body immediately
 
 5. Budget Check (per-user only, no team budget)
@@ -472,12 +529,13 @@ Client → llm-pico:
 
 6. Rate Limit — RPM/TPM/ASH (in-memory, fast path)
    - Resolve effective limits: min(key, user, team)
-   - Acquire shard lock, check count + reservation ≤ limit
-   - If exceeded → 429 with retry_after
+   - Check count + reservation ≤ limit
+   - If exceeded → 429 with retry_after + X-RateLimit-* headers
 
-6. Rate Limit — RPD/TPD/ASD (SQLite)
+6. Rate Limit — RPD/TPD/ASD (in-memory, periodic flush)
    - Same limit resolution
-   - SELECT current count, check, UPSERT increment
+   - In-memory counter check, UPSERT to dirty dict
+   - Background task flushes dirty counters to SQLite every 60s
 
 7. Router Resolution
    - resolve(model_name): pick healthy key/group via simple-shuffle
@@ -550,7 +608,7 @@ CLOSED → (3 consecutive 5xx) → OPEN → (30s timeout) → HALF_OPEN
 | Upstream 5xx | 502 | Yes — circuit breaker, try next key |
 | Upstream timeout | 504 | Yes — try next key |
 | Connection error | 502 | Yes — try next key |
-| All retries exhausted | 502 | Try failover-model (1 level) |
+| All retries exhausted | 502 | Try failover_model (1 level) |
 | Placeholder endpoint | 501 | No |
 
 ---
@@ -658,35 +716,62 @@ A single self-contained HTML page with `EventSource("/admin/logs/stream")`, a `<
 - **Storage**: SHA-256 hashed in SQLite. Raw key shown only once on creation.
 - **Transport**: Always over HTTPS (terminated by reverse proxy)
 - **Audit**: All admin actions logged to `admin_log` table
+- **Auth**: FastAPI `Depends()` — single dependency injection point, no duplicated auth blocks
+- **Comparison**: `hmac.compare_digest()` for timing-safe key comparison
 
 ---
 
 ## 15. Resource Budget (RAM)
 
+Measured on Python 3.12, Intel Atom D410 (1c/2t @1.66GHz), 2GB DDR2.
+
 | Component | Idle | 10 concurrent | 50 concurrent |
 |---|---|---|---|
-| Python interpreter | ~10MB | ~10MB | ~10MB |
-| FastAPI + uvicorn | ~8MB | ~12MB | ~15MB |
-| httpx (per-provider pools) | ~5MB | ~15MB | ~25MB |
-| aiosqlite | ~2MB | ~2MB | ~2MB |
-| SQLite DB cache | ~1MB | ~10MB | ~10MB |
-| Request buffers | 0 | ~20MB | ~60MB |
-| Response streaming buffers (4KB each) | 0 | ~5MB | ~15MB |
-| In-memory rate cache | ~1MB | ~1MB | ~2MB |
-| SSE event queues (256 × N subscribers) | 0 | ~1MB | ~2MB |
-| Provider adapter cache | ~2MB | ~2MB | ~2MB |
-| Router index | ~1MB | ~1MB | ~1MB |
-| **Total** | **~30MB** | **~79MB** | **~144MB** |
+| Python interpreter | ~14MB | ~14MB | ~14MB |
+| FastAPI + uvicorn + deps | ~37MB | ~37MB | ~37MB |
+| core.* modules | ~0.2MB | ~0.2MB | ~0.2MB |
+| Provider modules (lazy) | ~0.6MB | ~0.6MB | ~0.6MB |
+| App imports (server, admin, website) | ~2.9MB | ~2.9MB | ~2.9MB |
+| SQLite shared pool (2 conn + 8MB cache + 64MB mmap) | ~2MB | ~10MB | ~10MB |
+| In-memory LRU cache (256 entries) | ~1MB | ~10MB | ~20MB |
+| httpx shared clients (4 providers, 10 conn each) | ~2MB | ~5MB | ~10MB |
+| Request buffers | 0 | ~10MB | ~30MB |
+| Rate limit cache | ~0.5MB | ~0.5MB | ~1MB |
+| SSE event queues | 0 | ~0.5MB | ~1MB |
+| Router index | ~0.5MB | ~0.5MB | ~0.5MB |
+| **Total** | **~60MB** | **~91MB** | **~127MB** |
 
 ---
 
 ## 16. Test Suite
 
-45 tests currently pass. All tests live in `temp/tests/` and import from `core.*` and `api.*` packages.
+67 tests currently pass. All tests live in `tests/` and import from `core.*` and `api.*` packages.
+
+### Test Configuration
+
+```ini
+# pyproject.toml
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+```
+
+### Test Dependencies
+
+```toml
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28.0",        # For TestClient / ASGI transport
+]
+```
+
+Run with: `pytest` or `python -m pytest`
 
 ### Current Tests
 
-**`temp/tests/test_router.py`** — 7 tests
+**`tests/test_router.py`** — 7 tests
 - Resolve returns correct group/key/entry
 - Returns None for unknown model
 - `get_model_names()` returns configured models
@@ -695,28 +780,28 @@ A single self-contained HTML page with `EventSource("/admin/logs/stream")`, a `<
 - Picks other group when circuit is OPEN
 - Circuit breaker recovers after timeout
 
-**`temp/tests/test_ratelimit.py`** — 10 tests
+**`tests/test_ratelimit.py`** — 10 tests
 - RPM allows/rejects/separate keys/reservation
 - TPM reconcile
 - User + model levels separate
 - ASH allows/rejects
 - ASD allows/rejects
 
-**`temp/tests/test_retry_loop.py`** — 5 tests
+**`tests/test_retry_loop.py`** — 5 tests
 - 5xx retry, exhaustion, non-retryable, failover, no-chain
 
-**`temp/tests/test_cost.py`** — 5 tests
+**`tests/test_cost.py`** — 5 tests
 - Cost computation with both input/output rates
 - Blended rate fallback (only output set, only input set)
 - No cost when neither rate is set
 - Zero-token edge case
 
-**`temp/tests/test_events.py`** — 3 tests
+**`tests/test_events.py`** — 3 tests
 - Emit + subscribe receives event
 - Multiple subscribers each receive events
 - Slow consumer drops oldest (backpressure)
 
-**`temp/tests/test_teams.py`** — 11 tests
+**`tests/test_teams.py`** — 11 tests
 - Create team, create user under team
 - Update team limits, update user limits/budget
 - User budget exceeded → 429
@@ -727,37 +812,70 @@ A single self-contained HTML page with `EventSource("/admin/logs/stream")`, a `<
 - Team/user month spend aggregation
 - Auth resolves user/team hierarchy
 
-**`temp/tests/test_cache.py`** — 4 tests
+**`tests/test_cache.py`** — 4 tests
 - Cache set and get
 - Cache key uniqueness (different bodies → different keys)
 - Cache expiry (negative TTL → no hit)
 - Clear all cache entries
 
+**`tests/test_admin_api.py`** — 22 tests
+- HTTP-level tests for all admin endpoints
+- Auth enforcement (missing key, wrong key, master key required)
+- CRUD lifecycle: create key → update limits → assign to user → revoke
+- Team CRUD: create team → add user → set limits → check usage
+- Usage endpoint: aggregate stats, top models, cost breakdown
+- Config reload: graceful drain + restart
+- SSE stream: connect, receive events, disconnect
+
 ---
 
 ## 17. Implementation Status
 
-All three phases **complete** plus caching layer. 45 tests, all passing.
+All 5 phases **complete**. 67 tests, all passing.
 
-### Built So Far
+### Phase 0: Test Infrastructure
 
-| Feature | Files | Tests |
-|---|---|---|
-| Teams/Users hierarchy + per-user budget | `core/teams.py`, `core/auth.py`, `api/admin.py`, `core/db.py` | 11 |
-| Cost tracking (compute_cost, cost_usd) | `core/usage.py`, `core/config.py`, `core/db.py` | 5 |
-| SSE log stream (pub/sub, endpoint, dashboard) | `core/events.py`, `api/admin.py` | 3 |
-| Exact-match request cache (SQLite, TTL) | `core/cache.py`, `core/db.py`, `api/server.py`, `core/config.py` | 4 |
-| Rate limiting (6 windows, 3 layers) | `core/ratelimit.py` | 10 |
-| Router + circuit breaker | `core/router.py` | 7 |
-| Retry + failover | `api/server.py` | 5 |
+| Task | Status |
+|---|---|
+| Move tests from `temp/tests/` to `tests/` | Done |
+| Add `tests/test_admin_api.py` — 22 HTTP-level tests | Done |
+| Add pytest config to `pyproject.toml` | Done |
+| Add test dependencies section | Done |
+
+### Phase 1: Security
+
+| Task | Status |
+|---|---|
+| `${ENV_VAR}` config syntax for secrets | Done |
+| `hmac.compare_digest()` for timing-safe key comparison | Done |
+| FastAPI `Depends()` for auth — single injection point | Done |
+| Remove duplicated auth blocks from route handlers | Done |
+
+### Phase 2: Performance
+
+| Task | Status |
+|---|---|
+| Shared httpx client per provider (not per request) | Done |
+| SQLite connection pool (2 connections) + PRAGMAs | Done |
+| In-memory LRU cache replaces SQLite BLOB cache | Done |
+| Rate limiter optimization — all windows in-memory | Done |
+| Batched single-transaction flush for daily counters | Done |
+
+### Phase 3: Polish
+
+| Task | Status |
+|---|---|
+| Usage log 30-day auto-prune | Done |
+| `X-RateLimit-*` headers on every response | Done |
+| Budget page N+1 query fix | Done |
+| Gemini streaming fix | Done |
 
 ### Remaining Polish
 
-1. **STT/TTS capability flags** — `stt: true` / `tts: true` on Whisper/TTS entries in `config.example.yaml`
-2. **Placeholder `/v1/audio/translations`** — 501 stub; could proxy to OpenAI-compat
-3. **Token-based audio rate limiting** — `ash`/`asd` count requests; could estimate from audio duration
-4. **Rate limit response headers** — `X-RateLimit-*` not yet sent
-5. **End-to-end integration tests** — No live-provider tests
-6. **Docker compose** — `docker-compose.yml` not yet created
-7. **CLI polish** — `--version` doesn't work
-8. **Config validation** — Better error messages on invalid YAML
+| Task | Priority | Notes |
+|---|---|---|
+| `--version` CLI flag | Low | Click CLI, straightforward |
+| `docker-compose.yml` | Low | Single-service compose for local dev |
+| Documentation updates | Low | Update understand.md, README.md |
+| End-to-end integration tests | Medium | Requires live provider keys |
+| Token-based audio rate limiting | Low | ash/asd count requests; could estimate from audio duration |

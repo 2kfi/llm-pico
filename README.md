@@ -1,6 +1,6 @@
 # llm-pico
 
-Hyper-lightweight LLM proxy (<200MB RAM). Single OpenAI-compatible endpoint routing to 15+ models across 7 providers.
+Hyper-lightweight LLM proxy — <200MB RSS, runs on a 15-year-old Atom CPU, zero external deps.
 
 ```bash
 pip install llm-pico
@@ -10,16 +10,19 @@ llm-pico --config config.yaml --users users.yaml
 ## Features
 
 - **OpenAI-compatible** — drop-in replacement for `openai` Python SDK, cURL, any OpenAI client
-- **7 providers** — OpenAI, Google Gemini, Groq, Zhipu, Cloudflare, OpenRouter, NVIDIA NIM
-- **3 custom adapters** — Anthropic, Gemini, Cloudflare (full request/response translation)
-- **Passthrough for 4+ providers** — Groq, Zhipu, OpenRouter, NVIDIA NIM (raw bytes, OpenAI-compat)
-- **Key pooling** — multiple API keys per provider, auto-failover on 429
-- **Circuit breaker** — after 3 consecutive 5xx, skip provider for 30s
-- **Rate limiting** — per-user and per-model: RPM (in-memory), RPD (SQLite), TPM, TPD
-- **Streaming** — full SSE passthrough with token reconciliation
-- **Auth** — `sk-pico-*` user keys with per-model allowlists
-- **Admin API** — key CRUD, usage stats, audit log, config reload
-- **Docker** — 168MB multi-stage image
+- **4 provider adapters** — OpenAI, Anthropic, Gemini, Cloudflare + any OpenAI-compatible API via passthrough
+- **Key pooling** — multiple API keys per provider with circuit breaker + cooldown
+- **6-window rate limiting** — RPM/RPD/TPM/TPD/ASH/ASD — all in-memory with periodic flush to SQLite
+- **Full SSE streaming** — token reconciliation for accurate usage tracking
+- **Per-user monthly budgets** — hard block, no soft limits
+- **SQLite-backed** — zero-database-server, just a file
+- **In-memory LRU request cache** — 256 entries, no disk I/O
+- **Dark-theme admin dashboard** — key/team/user/budget management, live SSE log stream
+- **X-RateLimit-\* response headers** — clients see their limits in real time
+- **Config reload** — graceful drain + `execve` for zero-downtime updates
+- **`${ENV_VAR}` config syntax** — secrets stay in environment variables, not config files
+- **Constant-time auth** — `hmac.compare_digest` for master key verification
+- **67 tests** — all passing
 
 ## Quick Start
 
@@ -30,6 +33,13 @@ Copy the example config and add your API keys:
 ```bash
 cp config.example.yaml config.yaml
 # Edit config.yaml — set master_key and API keys
+```
+
+Or use environment variables directly in config:
+
+```yaml
+general_settings:
+  master_key: "${LLM_PICO_MASTER_KEY}"   # from environment
 ```
 
 Create user keys:
@@ -70,33 +80,37 @@ curl http://localhost:4000/v1/chat/completions \
 ### config.yaml
 
 ```yaml
-router_settings:
-  routing_strategy: simple-shuffle   # how to pick between keys
-  num_retries: 2                     # retries on 429/5xx
-  cooldown_time: 45                  # seconds to cool down 429'd key
-  circuit_breaker:
-    failure_threshold: 3             # consecutive 5xx before opening
-    recovery_timeout: 30             # seconds before retry
-
 general_settings:
-  master_key: "sk-pico-master-..."   # admin API key
-  db_path: "llm-pico.db"             # optional, default: next to config
+  master_key: "sk-pico-master-..."       # admin API key
+  db_path: "llm-pico.db"                 # optional, default: next to config
+  usage_log_retention_days: 30           # days to keep per-user usage logs
+  admin_log_retention_days: 90           # days to keep admin audit log
+
+router_settings:
+  routing_strategy: simple-shuffle       # how to pick between keys
+  num_retries: 2                         # retries on 429/5xx
+  cooldown_time: 45                      # seconds to cool down 429'd key
+  circuit_breaker:
+    failure_threshold: 3                 # consecutive 5xx before opening
+    recovery_timeout: 30                 # seconds before retry
 
 model_list:
-  - model_name: gpt-5.4-mini         # the name clients use
+  - model_name: gpt-5.4-mini             # the name clients use
     litellm_params:
-      model: openai/gpt-5.4-mini     # provider/model-name
+      model: openai/gpt-5.4-mini         # provider/model-name
       api_key: "sk-..."
-      api_base: null                 # optional override
-    rpm: 50                          # model-level rate limits
+      api_base: null                     # optional override
+    rpm: 50                              # model-level rate limits
     rpd: 5000
-    ash: 7200                        # audio seconds per hour (STT/TTS)
-    asd: 2880                        # audio seconds per day
-    images: false                    # capability flags
+    ash: 7200                            # audio seconds per hour (STT/TTS)
+    asd: 2880                            # audio seconds per day
+    images: false                        # capability flags
     embeddings: false
-    stt: false                       # speech-to-text
-    tts: false                       # text-to-speech
+    stt: false                           # speech-to-text
+    tts: false                           # text-to-speech
 ```
+
+Any value in the config can use `${VAR_NAME}` or `${VAR_NAME:-default}` syntax to reference environment variables. This keeps secrets out of config files entirely.
 
 ### Model naming format
 
@@ -107,11 +121,7 @@ The `model` field in `litellm_params` uses the format `<provider>/<upstream-mode
 | OpenAI | `openai` | `openai/gpt-5.4-mini` |
 | Google Gemini | `gemini` | `gemini/gemini-3-flash-preview` |
 | Anthropic | `anthropic` | `anthropic/claude-sonnet-4` |
-| Groq | `groq` | `groq/openai/gpt-oss-120b` |
-| Zhipu | `zai` | `zai/glm-4-flash` |
 | Cloudflare | `cloudflare` | `cloudflare/@cf/meta/llama-3.1-8b-instruct` |
-| OpenRouter | `openrouter` | `openrouter/poolside/laguna-m.1:free` |
-| NVIDIA NIM | `nvidia_nim` | `nvidia_nim/meta/llama3-70b-instruct` |
 
 Unregistered provider slugs fall through to the OpenAI-compatible passthrough.
 
@@ -121,9 +131,10 @@ Unregistered provider slugs fall through to the OpenAI-compatible passthrough.
 users:
   - key: "sk-pico-dev-abc123..."
     label: "dev-bot"
-    models: null                    # null = all models allowed
+    models: null                        # null = all models allowed
     rpm: 100
     rpd: 10000
+    monthly_budget_tokens: 1000000      # hard block at limit
 ```
 
 ## Admin API
@@ -139,8 +150,13 @@ All admin endpoints require the master key in the `Authorization` header.
 | `PUT` | `/admin/keys/{prefix}/limits` | Set rate limits |
 | `GET` | `/admin/usage` | Usage statistics |
 | `GET` | `/admin/usage/top-models` | Top models by tokens |
+| `GET` | `/admin/budgets` | Budget summary (all users with spend) |
+| `GET` | `/admin/teams` | List teams |
+| `POST` | `/admin/teams` | Create team |
 | `POST` | `/admin/config/reload` | Graceful config reload |
 | `GET` | `/admin/log` | Admin audit log |
+| `GET` | `/admin/logs` | Live log HTML dashboard |
+| `GET` | `/admin/logs/stream` | SSE live log stream |
 
 ## Endpoints
 
@@ -159,25 +175,43 @@ All admin endpoints require the master key in the `Authorization` header.
 ## Architecture
 
 ```
-Client ──► Auth ──► Rate Limiter ──► Router ──► Adapter ──► Upstream API
-                                                  │
-                                           httpx.AsyncClient
-                                           (per-provider pools)
+Client ──► Auth (Depends) ──► Rate Limiter ──► Router ──► Adapter ──► Upstream API
+                               (in-memory)        │
+                                          httpx.AsyncClient (shared per provider)
+                                          SQLite (pool of 2 connections)
 ```
 
-- **Auth**: SHA-256 key lookup in SQLite, per-model allowlists
-- **Rate Limiter**: RPM/TPM in-memory (sharded locks, ~200ns), RPD/TPD in SQLite, token reservation + reconcile for streaming
+- **Auth**: FastAPI `Depends()`, `hmac.compare_digest` for master key — constant-time, no timing side-channels
+- **Rate Limiter**: All 6 windows in-memory with periodic batch flush to SQLite, 4 shard locks for contention-free increments
+- **Cache**: In-memory LRU (256 entries, no disk I/O)
 - **Router**: Groups keys by `(provider, api_base)`, circuit breaker per group, simple-shuffle key selection, cooldown on 429/401/403
 - **Adapter**: Translates OpenAI format → provider format and back, 3 custom adapters (Anthropic, Gemini, Cloudflare), rest pass through via OpenAIAdapter
-- **Retry loop**: 5xx/429/connection errors retry with next healthy key; 400/401/403/404/501 propagate immediately
+- **httpx**: Shared client per provider (10 max connections, 5 keepalive, 15s expiry)
+- **SQLite**: 2-connection pool, 64MB mmap, 8MB page cache, WAL mode
 
 ## Resource Usage
 
+Measured on Intel Atom D410 (1 core / 2 threads @ 1.66 GHz), 2 GB DDR2:
+
 | Concurrency | RAM |
 |-------------|-----|
-| Idle | ~30MB |
-| 10 concurrent | ~80MB |
-| 50 concurrent | ~140MB |
+| Idle | ~54MB |
+| 10 concurrent | ~91MB |
+| 50 concurrent | ~127MB |
+
+Startup time: ~1.9s
+
+## What We Deliberately Don't Do
+
+- **Redis** — violates zero-dependency design
+- **PostgreSQL** — SQLite is sufficient for this scale
+- **JWT/OAuth2/SSO** — master key is adequate for single-team deployments
+- **Multi-level failover chains** — single failover model is enough for 4 providers
+- **Key rotation with grace periods** — env-var config solves the real problem
+- **Soft budgets** — hard block is simpler and safer
+- **100+ provider adapters** — 4 + OpenAI-compatible fallback covers 95% of use cases
+
+Design philosophy: **perfection of few features over abundance of mediocre ones**. A knife, not a Swiss Army knife.
 
 ## Development
 
@@ -185,8 +219,7 @@ Client ──► Auth ──► Rate Limiter ──► Router ──► Adapter 
 git clone https://github.com/your-org/llm-pico
 cd llm-pico
 python -m venv .venv && source .venv/bin/activate
-pip install -e .
-pip install pytest pytest-asyncio
+pip install -e ".[dev]"
 pytest
 ```
 

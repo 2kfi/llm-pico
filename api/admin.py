@@ -8,14 +8,14 @@ import sys
 import time
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.responses import StreamingResponse
 
 from core.auth import (
     check_model_access,
-    extract_bearer,
     hash_key,
     prefix_from_key,
+    require_master_key,
     verify_api_key,
 )
 from core.config import Config
@@ -88,20 +88,6 @@ es.onerror=()=>{el.innerHTML='<div style="color:#e55">Disconnected. <a href="" s
 </html>"""
 
 
-async def _require_master(request: Request) -> str:
-    config: Config = getattr(request.app.state, "config")
-    master_key = config.general_settings.master_key
-
-    auth_header = request.headers.get("Authorization")
-    raw_key = extract_bearer(auth_header)
-    if not raw_key or raw_key != master_key:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Invalid or missing master API key", "type": "unauthorized", "code": 401}
-        })
-
-    return raw_key
-
-
 async def _log_admin(action: str, actor_hash: str, details: dict[str, Any] | None = None) -> None:
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
     async with get_db() as db:
@@ -115,8 +101,7 @@ async def _log_admin(action: str, actor_hash: str, details: dict[str, Any] | Non
 # ---- Key endpoints ----
 
 @router.get("/keys")
-async def list_keys(request: Request) -> Response:
-    actor_hash = await _require_master(request)
+async def list_keys(request: Request, actor_hash: str = Depends(require_master_key)) -> Response:
 
     async with get_db() as db:
         cursor = await db.execute(
@@ -155,8 +140,7 @@ async def list_keys(request: Request) -> Response:
 
 
 @router.post("/keys")
-async def create_key(request: Request) -> Response:
-    actor_hash = await _require_master(request)
+async def create_key(request: Request, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -208,8 +192,7 @@ async def create_key(request: Request) -> Response:
 
 
 @router.delete("/keys/{prefix}")
-async def delete_key(request: Request, prefix: str) -> Response:
-    actor_hash = await _require_master(request)
+async def delete_key(request: Request, prefix: str, actor_hash: str = Depends(require_master_key)) -> Response:
 
     pattern = prefix.rstrip("...") + "%"
 
@@ -235,8 +218,7 @@ async def delete_key(request: Request, prefix: str) -> Response:
 
 
 @router.put("/keys/{prefix}/models")
-async def set_key_models(request: Request, prefix: str) -> Response:
-    actor_hash = await _require_master(request)
+async def set_key_models(request: Request, prefix: str, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -276,8 +258,7 @@ async def set_key_models(request: Request, prefix: str) -> Response:
 
 
 @router.put("/keys/{prefix}/limits")
-async def set_key_limits(request: Request, prefix: str) -> Response:
-    actor_hash = await _require_master(request)
+async def set_key_limits(request: Request, prefix: str, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -314,8 +295,7 @@ async def set_key_limits(request: Request, prefix: str) -> Response:
 
 
 @router.put("/keys/{prefix}/user")
-async def assign_key_user(request: Request, prefix: str) -> Response:
-    actor_hash = await _require_master(request)
+async def assign_key_user(request: Request, prefix: str, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -351,8 +331,7 @@ async def assign_key_user(request: Request, prefix: str) -> Response:
 # ---- Team endpoints ----
 
 @router.post("/teams")
-async def api_create_team(request: Request) -> Response:
-    actor_hash = await _require_master(request)
+async def api_create_team(request: Request, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -378,8 +357,7 @@ async def api_create_team(request: Request) -> Response:
 
 
 @router.get("/teams")
-async def api_list_teams(request: Request) -> Response:
-    await _require_master(request)
+async def api_list_teams(request: Request, _actor: str = Depends(require_master_key)) -> Response:
     teams = await get_teams()
     return Response(
         content=json.dumps({"teams": teams, "total": len(teams)}),
@@ -388,8 +366,7 @@ async def api_list_teams(request: Request) -> Response:
 
 
 @router.get("/teams/{team_id}")
-async def api_get_team(request: Request, team_id: int) -> Response:
-    await _require_master(request)
+async def api_get_team(request: Request, team_id: int, _actor: str = Depends(require_master_key)) -> Response:
 
     team = await get_team(team_id)
     if team is None:
@@ -407,8 +384,7 @@ async def api_get_team(request: Request, team_id: int) -> Response:
 
 
 @router.put("/teams/{team_id}/limits")
-async def api_update_team_limits(request: Request, team_id: int) -> Response:
-    actor_hash = await _require_master(request)
+async def api_update_team_limits(request: Request, team_id: int, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -432,8 +408,7 @@ async def api_update_team_limits(request: Request, team_id: int) -> Response:
 
 
 @router.put("/teams/{team_id}/models")
-async def api_update_team_models(request: Request, team_id: int) -> Response:
-    actor_hash = await _require_master(request)
+async def api_update_team_models(request: Request, team_id: int, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -463,8 +438,7 @@ async def api_update_team_models(request: Request, team_id: int) -> Response:
 
 
 @router.delete("/teams/{team_id}")
-async def api_deactivate_team(request: Request, team_id: int) -> Response:
-    actor_hash = await _require_master(request)
+async def api_deactivate_team(request: Request, team_id: int, actor_hash: str = Depends(require_master_key)) -> Response:
 
     updated = await deactivate_team(team_id)
     if not updated:
@@ -481,8 +455,7 @@ async def api_deactivate_team(request: Request, team_id: int) -> Response:
 
 
 @router.get("/teams/{team_id}/usage")
-async def api_team_usage(request: Request, team_id: int) -> Response:
-    await _require_master(request)
+async def api_team_usage(request: Request, team_id: int, _actor: str = Depends(require_master_key)) -> Response:
 
     params = dict(request.query_params)
     stats = await get_usage_stats(
@@ -501,8 +474,7 @@ async def api_team_usage(request: Request, team_id: int) -> Response:
 # ---- User endpoints ----
 
 @router.post("/teams/{team_id}/users")
-async def api_create_user(request: Request, team_id: int) -> Response:
-    actor_hash = await _require_master(request)
+async def api_create_user(request: Request, team_id: int, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -529,8 +501,7 @@ async def api_create_user(request: Request, team_id: int) -> Response:
 
 
 @router.get("/teams/{team_id}/users")
-async def api_list_users(request: Request, team_id: int) -> Response:
-    await _require_master(request)
+async def api_list_users(request: Request, team_id: int, _actor: str = Depends(require_master_key)) -> Response:
     users = await get_users(team_id)
     return Response(
         content=json.dumps({"users": users, "total": len(users)}),
@@ -539,8 +510,7 @@ async def api_list_users(request: Request, team_id: int) -> Response:
 
 
 @router.get("/users/{user_id}")
-async def api_get_user(request: Request, user_id: int) -> Response:
-    await _require_master(request)
+async def api_get_user(request: Request, user_id: int, _actor: str = Depends(require_master_key)) -> Response:
 
     user = await get_user(user_id)
     if user is None:
@@ -558,8 +528,7 @@ async def api_get_user(request: Request, user_id: int) -> Response:
 
 
 @router.put("/users/{user_id}/limits")
-async def api_update_user_limits(request: Request, user_id: int) -> Response:
-    actor_hash = await _require_master(request)
+async def api_update_user_limits(request: Request, user_id: int, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -583,8 +552,7 @@ async def api_update_user_limits(request: Request, user_id: int) -> Response:
 
 
 @router.put("/users/{user_id}/budget")
-async def api_update_user_budget(request: Request, user_id: int) -> Response:
-    actor_hash = await _require_master(request)
+async def api_update_user_budget(request: Request, user_id: int, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -612,8 +580,7 @@ async def api_update_user_budget(request: Request, user_id: int) -> Response:
 
 
 @router.put("/users/{user_id}/models")
-async def api_update_user_models(request: Request, user_id: int) -> Response:
-    actor_hash = await _require_master(request)
+async def api_update_user_models(request: Request, user_id: int, actor_hash: str = Depends(require_master_key)) -> Response:
 
     try:
         body = await request.json()
@@ -643,8 +610,7 @@ async def api_update_user_models(request: Request, user_id: int) -> Response:
 
 
 @router.get("/users/{user_id}/usage")
-async def api_user_usage(request: Request, user_id: int) -> Response:
-    await _require_master(request)
+async def api_user_usage(request: Request, user_id: int, _actor: str = Depends(require_master_key)) -> Response:
 
     params = dict(request.query_params)
     stats = await get_usage_stats(
@@ -660,11 +626,53 @@ async def api_user_usage(request: Request, user_id: int) -> Response:
     )
 
 
+# ---- Budgets aggregate endpoint ----
+
+@router.get("/budgets")
+async def budgets_summary(
+    request: Request,
+    actor_hash: str = Depends(require_master_key),
+) -> Response:
+    """Return all users across all teams with their budget info and current month spend."""
+    async with get_db() as conn:
+        cursor = await conn.execute("""
+            SELECT u.id, u.name, u.email, u.monthly_budget_usd,
+                   t.name as team_name, t.id as team_id,
+                   COALESCE(SUM(ul.cost_usd), 0) as current_spend
+            FROM users u
+            JOIN teams t ON u.team_id = t.id
+            LEFT JOIN user_keys uk ON uk.user_id = u.id
+            LEFT JOIN usage_log ul ON ul.key_hash = uk.key_hash
+                AND ul.created_at >= date('now', 'start of month')
+            WHERE u.is_active = 1
+            GROUP BY u.id
+            ORDER BY t.name, u.name
+        """)
+        rows = await cursor.fetchall()
+
+    return Response(
+        content=json.dumps({
+            "users": [
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "email": row["email"],
+                    "team_id": row["team_id"],
+                    "team_name": row["team_name"],
+                    "monthly_budget_usd": row["monthly_budget_usd"],
+                    "current_spend": row["current_spend"],
+                }
+                for row in rows
+            ]
+        }),
+        media_type="application/json",
+    )
+
+
 # ---- Stats endpoints ----
 
 @router.get("/usage")
-async def usage(request: Request) -> Response:
-    actor_hash = await _require_master(request)
+async def usage(request: Request, actor_hash: str = Depends(require_master_key)) -> Response:
 
     params = dict(request.query_params)
     stats = await get_usage_stats(
@@ -681,8 +689,7 @@ async def usage(request: Request) -> Response:
 
 
 @router.get("/usage/top-models")
-async def top_models(request: Request) -> Response:
-    actor_hash = await _require_master(request)
+async def top_models(request: Request, actor_hash: str = Depends(require_master_key)) -> Response:
 
     params = dict(request.query_params)
     models = await get_top_models(
@@ -698,8 +705,7 @@ async def top_models(request: Request) -> Response:
 
 
 @router.get("/stats/costs")
-async def cost_stats(request: Request) -> Response:
-    await _require_master(request)
+async def cost_stats(request: Request, _actor: str = Depends(require_master_key)) -> Response:
 
     params = dict(request.query_params)
     group_by = params.get("group_by", "user")
@@ -723,8 +729,7 @@ async def cost_stats(request: Request) -> Response:
 # ---- Log endpoints ----
 
 @router.get("/log")
-async def admin_log(request: Request) -> Response:
-    actor_hash = await _require_master(request)
+async def admin_log(request: Request, actor_hash: str = Depends(require_master_key)) -> Response:
 
     limit = int(request.query_params.get("limit", 50))
 
@@ -757,8 +762,7 @@ async def admin_log(request: Request) -> Response:
 
 
 @router.get("/logs/stream")
-async def log_stream(request: Request) -> StreamingResponse:
-    await _require_master(request)
+async def log_stream(request: Request, _actor: str = Depends(require_master_key)) -> StreamingResponse:
     q = subscribe()
 
     async def generate():
@@ -775,16 +779,14 @@ async def log_stream(request: Request) -> StreamingResponse:
 
 
 @router.get("/logs", include_in_schema=False)
-async def log_dashboard(request: Request) -> Response:
-    await _require_master(request)
+async def log_dashboard(request: Request, _actor: str = Depends(require_master_key)) -> Response:
     return Response(content=HTML_DASHBOARD, media_type="text/html")
 
 
 # ---- Config reload ----
 
 @router.post("/config/reload")
-async def reload_config(request: Request) -> Response:
-    actor_hash = await _require_master(request)
+async def reload_config(request: Request, actor_hash: str = Depends(require_master_key)) -> Response:
 
     import api.server as srv
 

@@ -316,18 +316,13 @@ async function deleteTeam(id) {
 async function loadBudgets() {
   const el = document.getElementById('page-budgets');
   el.innerHTML = '<div class="page-header"><h2>Budgets</h2><button onclick="loadBudgets()">Refresh</button></div><div id="budget-list"></div>';
-  const teams = await api('/admin/teams').catch(() => []);
-  let allUsers = [];
-  for (const t of (Array.isArray(teams) ? teams : [])) {
-    const users = await api(`/admin/teams/${t.id}/users`).catch(() => []);
-    for (const u of (Array.isArray(users) ? users : [])) allUsers.push({ ...u, team_name: t.name, team_id: t.id });
-  }
-  if (!allUsers.length) { document.getElementById('budget-list').innerHTML = '<div class="card" style="color:var(--muted)">No users found</div>'; return; }
+  const data = await api('/admin/budgets').catch(() => ({ users: [] }));
+  const users = data.users || [];
+  if (!users.length) { document.getElementById('budget-list').innerHTML = '<div class="card" style="color:var(--muted)">No users found</div>'; return; }
   let html = '';
-  for (const u of allUsers) {
-    const usage = await api(`/admin/users/${u.id}/usage`).catch(() => ({}));
+  for (const u of users) {
     const budget = u.monthly_budget_usd || 0;
-    const spent = usage.total_cost_usd || usage.cost_usd || 0;
+    const spent = u.current_spend || 0;
     const pct = budget > 0 ? Math.min(100, (spent / budget) * 100) : 0;
     const barColor = pct > 90 ? 'var(--red)' : pct > 70 ? 'var(--orange)' : 'var(--green)';
     html += `<div class="card" style="margin-bottom:12px">
