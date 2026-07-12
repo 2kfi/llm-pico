@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -173,6 +174,7 @@ class AnthropicAdapter(BaseAdapter):
         chunks: list[bytes] = []
         usage: dict[str, Any] | None = None
 
+        event_type = None
         async for line in response.aiter_lines():
             if not line:
                 continue

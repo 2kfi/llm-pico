@@ -30,8 +30,10 @@ class OpenAIAdapter(BaseAdapter):
 
     async def proxy_request(self, body_bytes: bytes, model_string: str) -> httpx.Response:
         body = json.loads(body_bytes)
-        # Newer OpenAI models (gpt-5.4-mini+) reject max_tokens and require max_completion_tokens
-        if "max_tokens" in body and "max_completion_tokens" not in body:
+        # Newer OpenAI models (gpt-5*, o3*, o4*) reject max_tokens and require max_completion_tokens
+        model_str = body.get("model", "")
+        is_newer_model = any(model_str.startswith(p) for p in ("gpt-5", "o3", "o4"))
+        if is_newer_model and "max_tokens" in body and "max_completion_tokens" not in body:
             body["max_completion_tokens"] = body.pop("max_tokens")
         url = f"{self._base_url()}/chat/completions"
         response = await self.client.post(url, content=json.dumps(body), headers=self._headers())

@@ -18,16 +18,15 @@ from api.server import create_app
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 @click.version_option(version="0.1.0", prog_name="llm-pico")
 def main(host: str, port: int, config: str, users: str | None, db: str | None, verbose: bool):
-    level = logging.DEBUG if verbose else logging.WARNING
+    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
-    if verbose:
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("aiosqlite").setLevel(logging.WARNING)
-        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
     log = logging.getLogger("llm-pico")
     config_path = Path(config).resolve()
@@ -71,7 +70,7 @@ def main(host: str, port: int, config: str, users: str | None, db: str | None, v
         app,
         host=host,
         port=port,
-        log_level="debug" if verbose else "warning",
+        log_level="debug" if verbose else "info",
         lifespan="on",
     )
 

@@ -91,6 +91,8 @@ async def verify_api_key(
         "rpd_limit": merged_limits.get("rpd"),
         "tpm_limit": merged_limits.get("tpm"),
         "tpd_limit": merged_limits.get("tpd"),
+        "ash_limit": merged_limits.get("ash"),
+        "asd_limit": merged_limits.get("asd"),
         "user_id": user_id,
     }
 

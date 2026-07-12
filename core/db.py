@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS teams (
     rpm_limit       INTEGER,
     rpd_limit       INTEGER,
     tpm_limit       INTEGER,
-    tpd_limit       INTEGER
+    tpd_limit       INTEGER,
+    monthly_budget_usd REAL
 );
 
 CREATE TABLE IF NOT EXISTS users (

@@ -195,14 +195,15 @@ async function loadDashboard() {
   const el = document.getElementById('page-dashboard');
   el.innerHTML = '<div class="page-header"><h2>Dashboard</h2><button onclick="loadDashboard()">Refresh</button></div><div class="grid grid-4" id="dash-stats"></div><div class="card" style="margin-top:16px" id="dash-health">Checking health...</div>';
   const [health, keysData, teamsData] = await Promise.all([api('/health').catch(() => null), api('/admin/keys').catch(() => ({keys: []})), api('/admin/teams').catch(() => ({teams: []}))]);
-  const usage = await api('/admin/usage').catch(() => ({}));
+  const usage = await api('/admin/usage').catch(() => ({summary: {}}));
   const keysArr = (keysData && keysData.keys) || [];
   const teamsArr = (teamsData && teamsData.teams) || [];
+  const summary = usage.summary || {};
   document.getElementById('dash-stats').innerHTML = `
     <div class="card stat-card"><div class="val">${keysArr.length}</div><div class="lbl">API Keys</div></div>
     <div class="card stat-card"><div class="val">${teamsArr.length}</div><div class="lbl">Teams</div></div>
-    <div class="card stat-card"><div class="val">${usage.total_requests || 0}</div><div class="lbl">Total Requests</div></div>
-    <div class="card stat-card"><div class="val">${fmt$(usage.total_cost_usd || 0)}</div><div class="lbl">Total Cost</div></div>`;
+    <div class="card stat-card"><div class="val">${summary.total_requests || 0}</div><div class="lbl">Total Requests</div></div>
+    <div class="card stat-card"><div class="val">${fmt$(summary.total_cost_usd || 0)}</div><div class="lbl">Total Cost</div></div>`;
   document.getElementById('dash-health').innerHTML = health
     ? `<span class="badge green">Healthy</span> &mdash; Server responding`
     : `<span class="badge red">Unreachable</span> &mdash; Check server`;
@@ -272,8 +273,8 @@ async function loadTeams() {
 }
 
 async function loadTeamUsers(teamId) {
-  const users = await api(`/admin/teams/${teamId}/users`).catch(() => []);
-  const arr = Array.isArray(users) ? users : [];
+  const data = await api(`/admin/teams/${teamId}/users`).catch(() => ({users: []}));
+  const arr = Array.isArray(data) ? data : (data.users || []);
   const el = document.getElementById(`team-users-${teamId}`);
   if (!el) return;
   el.innerHTML = arr.length === 0 ? 'No users'
@@ -347,17 +348,18 @@ async function loadBudgets() {
 async function loadUsage() {
   const el = document.getElementById('page-usage');
   el.innerHTML = '<div class="page-header"><h2>Usage & Costs</h2><div><select id="cost-group" onchange="loadCosts()"><option value="user">By User</option><option value="model">By Model</option><option value="day">By Day</option></select></div></div>';
-  const [usage, topModels] = await Promise.all([api('/admin/usage').catch(() => ({})), api('/admin/usage/top-models').catch(() => [])]);
+  const [usageData, topModels] = await Promise.all([api('/admin/usage').catch(() => ({summary: {}})), api('/admin/usage/top-models').catch(() => ({models: []}))]);
   const topArr = Array.isArray(topModels) ? topModels : (topModels?.models || []);
+  const summary = usageData.summary || {};
   el.innerHTML += `<div class="grid grid-4" style="margin-bottom:16px">
-    <div class="card stat-card"><div class="val">${usage.total_requests || 0}</div><div class="lbl">Total Requests</div></div>
-    <div class="card stat-card"><div class="val">${(usage.total_tokens || 0).toLocaleString()}</div><div class="lbl">Total Tokens</div></div>
-    <div class="card stat-card"><div class="val">${fmt$(usage.total_cost_usd || 0)}</div><div class="lbl">Total Cost</div></div>
-    <div class="card stat-card"><div class="val">${usage.active_keys || usage.keys || 0}</div><div class="lbl">Active Keys</div></div>
+    <div class="card stat-card"><div class="val">${summary.total_requests || 0}</div><div class="lbl">Total Requests</div></div>
+    <div class="card stat-card"><div class="val">${(summary.total_tokens || 0).toLocaleString()}</div><div class="lbl">Total Tokens</div></div>
+    <div class="card stat-card"><div class="val">${fmt$(summary.total_cost_usd || 0)}</div><div class="lbl">Total Cost</div></div>
+    <div class="card stat-card"><div class="val">${summary.active_keys || summary.keys || 0}</div><div class="lbl">Active Keys</div></div>
   </div>
   <div class="grid grid-2">
     <div class="card"><h3 style="font-size:13px;margin-bottom:12px">Top Models</h3><table><thead><tr><th>Model</th><th>Requests</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>
-    ${topArr.length === 0 ? '<tr><td colspan="4" style="color:var(--muted)">No data</td></tr>' : topArr.map(m => `<tr><td>${m.model || '-'}</td><td>${m.requests || 0}</td><td>${(m.tokens||0).toLocaleString()}</td><td>${fmt$(m.cost_usd || m.cost || 0)}</td></tr>`).join('')}
+    ${topArr.length === 0 ? '<tr><td colspan="4" style="color:var(--muted)">No data</td></tr>' : topArr.map(m => `<tr><td>${m.model_name || '-'}</td><td>${m.requests || 0}</td><td>${(m.total_tokens||0).toLocaleString()}</td><td>${fmt$(m.total_cost_usd || 0)}</td></tr>`).join('')}
     </tbody></table></div>
     <div class="card"><h3 style="font-size:13px;margin-bottom:12px">Cost Breakdown</h3><div id="cost-chart"></div></div>
   </div>`;
@@ -366,18 +368,18 @@ async function loadUsage() {
 
 async function loadCosts() {
   const group = document.getElementById('cost-group')?.value || 'user';
-  const data = await api(`/admin/stats/costs?group_by=${group}`).catch(() => []);
-  const arr = Array.isArray(data) ? data : [];
+  const data = await api(`/admin/stats/costs?group_by=${group}`).catch(() => ({}));
+  const arr = Array.isArray(data) ? data : (data[`costs_by_${group}`] || []);
   const el = document.getElementById('cost-chart');
   if (!el) return;
   if (!arr.length) { el.innerHTML = '<div style="color:var(--muted)">No cost data</div>'; return; }
-  const max = Math.max(...arr.map(i => i.cost_usd || i.cost || 0), 0.001);
+  const max = Math.max(...arr.map(i => i.total_cost_usd || 0), 0.001);
   el.innerHTML = '<div class="bar-chart">' + arr.slice(0, 12).map(i => {
-    const val = i.cost_usd || i.cost || 0;
+    const val = i.total_cost_usd || 0;
     const h = Math.max(4, (val / max) * 120);
-    const label = i.name || i.label || i.group || i.user || i.model || i.day || '?';
+    const label = i.key_prefix || i.model_name || i.day || '?';
     return `<div class="bar" style="height:${h}px;width:${Math.max(24, 100/Math.min(arr.length,12)-4)}px"><div class="bar-label">${label.length > 10 ? label.slice(0,10) : label}</div></div>`;
-  }).join('') + '</div><div style="text-align:center;font-size:11px;color:var(--muted);margin-top:24px">' + arr.slice(0, 12).map(i => `${i.name||i.label||'?'}: ${fmt$(i.cost_usd||i.cost||0)}`).join(' &nbsp;&middot;&nbsp; ') + '</div>';
+  }).join('') + '</div><div style="text-align:center;font-size:11px;color:var(--muted);margin-top:24px">' + arr.slice(0, 12).map(i => `${i.key_prefix||i.model_name||'?'}: ${fmt$(i.total_cost_usd||0)}`).join(' &nbsp;&middot;&nbsp; ') + '</div>';
 }
 
 // Live Logs
@@ -387,7 +389,7 @@ function loadLogs() {
   if (!el.classList.contains('active')) return;
   el.innerHTML = '<div class="page-header"><h2>Live Logs</h2><div><button onclick="clearLogs()">Clear</button> <span id="log-status" class="badge green">Connected</span></div></div><div class="log-container" id="log-output"></div>';
   if (logSource) logSource.close();
-  logSource = new EventSource(`${API_BASE}/admin/logs/stream`);
+  logSource = new EventSource(`${API_BASE}/admin/logs/stream?token=${MASTER_KEY}`);
   logConnected = true;
   logSource.onmessage = (e) => {
     const out = document.getElementById('log-output');

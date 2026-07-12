@@ -189,6 +189,8 @@ async def _proxy_request(
             "rpd": user_key.get("rpd_limit") if user_key else None,
             "tpm": user_key.get("tpm_limit") if user_key else None,
             "tpd": user_key.get("tpd_limit") if user_key else None,
+            "ash": user_key.get("ash_limit") if user_key else None,
+            "asd": user_key.get("asd_limit") if user_key else None,
         } if user_key else {}
 
         model_limits = { "_level": "model" }
@@ -276,6 +278,8 @@ async def _proxy_request(
                     "rpd": model_entry.rpd,
                     "tpm": model_entry.tpm,
                     "tpd": model_entry.tpd,
+                    "ash": model_entry.ash,
+                    "asd": model_entry.asd,
                 }
                 for l in (limits, model_limits):
                     has_any = any(v is not None for k, v in l.items() if k != "_level")
@@ -422,9 +426,15 @@ async def _handle_streaming(
 
     if upstream.status_code >= 400:
         body = await upstream.aread()
-        raise HTTPException(status_code=upstream.status_code, detail=json.loads(body or b"{}"))
+        try:
+            detail = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            detail = {"error": {"message": body.decode(errors="replace"), "code": upstream.status_code}}
+        raise HTTPException(status_code=upstream.status_code, detail=detail)
 
     actual_tokens = 0
+    actual_prompt_tokens = 0
+    actual_completion_tokens = 0
 
     has_custom_stream = type(adapter).proxy_stream is not BaseAdapter.proxy_stream
 
@@ -432,7 +442,7 @@ async def _handle_streaming(
         stream_chunks, stream_usage = await adapter.proxy_stream(upstream)
 
         async def generate():
-            nonlocal actual_tokens
+            nonlocal actual_tokens, actual_prompt_tokens, actual_completion_tokens
             for chunk in stream_chunks:
                 if b"usage" in chunk:
                     try:
@@ -442,15 +452,19 @@ async def _handle_streaming(
                                 data = json.loads(line[6:])
                                 if "usage" in data:
                                     actual_tokens = data["usage"].get("total_tokens", 0)
+                                    actual_prompt_tokens = data["usage"].get("prompt_tokens", 0)
+                                    actual_completion_tokens = data["usage"].get("completion_tokens", 0)
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         pass
                 yield chunk
 
         if stream_usage:
             actual_tokens = stream_usage.get("total_tokens", 0)
+            actual_prompt_tokens = stream_usage.get("prompt_tokens", 0)
+            actual_completion_tokens = stream_usage.get("completion_tokens", 0)
     else:
         async def generate():
-            nonlocal actual_tokens
+            nonlocal actual_tokens, actual_prompt_tokens, actual_completion_tokens
             async for chunk in upstream.aiter_bytes():
                 if b"usage" in chunk:
                     try:
@@ -460,6 +474,8 @@ async def _handle_streaming(
                                 data = json.loads(line[6:])
                                 if "usage" in data:
                                     actual_tokens = data["usage"].get("total_tokens", 0)
+                                    actual_prompt_tokens = data["usage"].get("prompt_tokens", 0)
+                                    actual_completion_tokens = data["usage"].get("completion_tokens", 0)
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         pass
                 yield chunk
@@ -472,11 +488,12 @@ async def _handle_streaming(
 
     async def _log_and_reconcile():
         try:
-            nonlocal actual_tokens
-            while True:
+            nonlocal actual_tokens, actual_prompt_tokens, actual_completion_tokens
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
                 try:
                     await asyncio.sleep(0.1)
-                    if actual_tokens > 0 or response.headers.get("x-llm-pico-done"):
+                    if actual_tokens > 0:
                         break
                 except (asyncio.CancelledError, GeneratorExit):
                     break
@@ -486,10 +503,10 @@ async def _handle_streaming(
             if actual_tokens == 0:
                 actual_tokens = reservation
 
-            pt = 0
-            ct = 0
+            pt = actual_prompt_tokens
+            ct = actual_completion_tokens
             cost = compute_cost(pt, ct, cost_in, cost_out)
-            if cost is None and actual_tokens:
+            if not cost and actual_tokens:
                 cost = compute_cost(actual_tokens, 0, cost_in, cost_out)
 
             await log_usage(
@@ -571,7 +588,11 @@ async def _handle_buffered(
     latency = int((time.monotonic() - t0) * 1000)
 
     if upstream.status_code >= 400:
-        raise HTTPException(status_code=upstream.status_code, detail=json.loads(body or b"{}"))
+        try:
+            detail = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            detail = {"error": {"message": body.decode(errors="replace"), "code": upstream.status_code}}
+        raise HTTPException(status_code=upstream.status_code, detail=detail)
 
     try:
         resp_data = json.loads(body)
@@ -724,7 +745,7 @@ async def _health_check() -> Response:
 
 
 async def _route_completions(request: Request, user_key: dict = Depends(require_api_key)) -> Response:
-    return await _route_chat_completions(request)
+    return await _route_chat_completions(request, user_key=user_key)
 
 
 async def _proxy_audio_request(
@@ -997,7 +1018,18 @@ async def _proxy_audio_speech(
     try:
         config: Config = getattr(app_state, "config")
         router: Router = getattr(app_state, "router")
+        limiter = getattr(app_state, "limiter")
         num_retries = config.router_settings.num_retries
+
+        limits = {
+            "_level": "user",
+            "rpm": user_key.get("rpm_limit") if user_key else None,
+            "rpd": user_key.get("rpd_limit") if user_key else None,
+            "tpm": user_key.get("tpm_limit") if user_key else None,
+            "tpd": user_key.get("tpd_limit") if user_key else None,
+            "ash": user_key.get("ash_limit") if user_key else None,
+            "asd": user_key.get("asd_limit") if user_key else None,
+        } if user_key else {}
 
         last_error: HTTPException | None = None
 
@@ -1032,6 +1064,44 @@ async def _proxy_audio_speech(
             model_for_api = adapter_model.split("/", 1)[1] if "/" in adapter_model else adapter_model
             rewritten_body = _rewrite_model_field(body_bytes, model_for_api)
             t0 = time.monotonic()
+
+            if attempt == 0:
+                model_limits = {
+                    "_level": "model",
+                    "rpm": model_entry.rpm,
+                    "rpd": model_entry.rpd,
+                    "tpm": model_entry.tpm,
+                    "tpd": model_entry.tpd,
+                    "ash": model_entry.ash,
+                    "asd": model_entry.asd,
+                }
+                rl_headers: dict[str, str] = {}
+                for l in (limits, model_limits):
+                    has_any = any(v is not None for k, v in l.items() if k != "_level")
+                    if has_any:
+                        rejected = await limiter.check_and_reserve(
+                            key_hash=user_key["key_hash"] if user_key else master_key or "admin",
+                            model_name=model_name,
+                            limits=l,
+                            reservation=1,
+                        )
+                        if rejected:
+                            await adapter.close()
+                            raise HTTPException(status_code=429, detail={
+                                "error": {
+                                    "message": f"Rate limit exceeded: {rejected['exceeded']}",
+                                    "type": "rate_limit_exceeded",
+                                    "code": 429,
+                                    "retry_after": rejected["retry_after"],
+                                }
+                            })
+                rl_headers = await _build_rate_limit_headers(
+                    limiter,
+                    key_hash=user_key["key_hash"] if user_key else master_key or "admin",
+                    model_name=model_name,
+                    user_limits=limits,
+                    model_limits=model_limits,
+                )
 
             try:
                 upstream = await adapter.proxy_tts(
@@ -1107,7 +1177,20 @@ async def _proxy_audio_speech(
                 "cost_usd": cost,
             })
 
-            return Response(content=body, media_type=upstream.headers.get("content-type", "audio/mpeg"))
+            if user_key:
+                await limiter.reconcile(
+                    key_hash=user_key["key_hash"],
+                    model_name=model_name,
+                    limits=limits,
+                    actual_tokens=1,
+                    reserved_tokens=1,
+                )
+
+            resp = Response(content=body, media_type=upstream.headers.get("content-type", "audio/mpeg"))
+            resp.headers["X-Request-Id"] = request_id
+            for k, v in rl_headers.items():
+                resp.headers[k] = v
+            return resp
 
         if not _is_failover and model_entry and model_entry.failover_model:
             return await _proxy_audio_speech(

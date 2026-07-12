@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -9,6 +10,8 @@ from typing import Any, Literal
 import yaml
 
 _ENV_VAR_RE = re.compile(r"\$\{([^}:]+)(?::(-?[^}]*))?\}")
+
+_log = logging.getLogger("llm-pico.config")
 
 
 def _resolve_env_vars(raw: dict) -> dict:
@@ -203,8 +206,12 @@ def load_users(path: str) -> list[UserKey]:
 
     users = []
     for entry in raw.get("users") or []:
+        raw_key = entry.get("key", "")
+        if not raw_key:
+            _log.warning("skipping user entry with empty key")
+            continue
         users.append(UserKey(
-            key=entry.get("key", ""),
+            key=raw_key,
             label=entry.get("label"),
             models=entry.get("models"),
             rpm=entry.get("rpm"),

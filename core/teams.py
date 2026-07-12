@@ -25,7 +25,7 @@ async def get_teams() -> list[dict[str, Any]]:
         cursor = await db.execute(
             """SELECT id, name, description, is_active, created_at,
                       rpm_limit, rpd_limit, tpm_limit, tpd_limit,
-                      model_allowlist
+                      monthly_budget_usd, model_allowlist
                FROM teams ORDER BY created_at DESC"""
         )
         rows = await cursor.fetchall()
@@ -37,7 +37,7 @@ async def get_team(team_id: int) -> dict[str, Any] | None:
         cursor = await db.execute(
             """SELECT id, name, description, is_active, created_at,
                       rpm_limit, rpd_limit, tpm_limit, tpd_limit,
-                      model_allowlist
+                      monthly_budget_usd, model_allowlist
                FROM teams WHERE id = ?""",
             (team_id,),
         )

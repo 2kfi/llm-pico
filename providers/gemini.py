@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -40,8 +41,9 @@ class GeminiAdapter(BaseAdapter):
 
     def _build_url(self, model: str, stream: bool = False) -> str:
         base = self._base_url()
+        clean_model = model.split("/", 1)[1] if "/" in model else model
         endpoint = "streamGenerateContent" if stream else "generateContent"
-        return f"{base}/models/{model}:{endpoint}?key={self.api_key}"
+        return f"{base}/models/{clean_model}:{endpoint}?key={self.api_key}"
 
     def _openai_to_gemini_contents(self, body: dict) -> tuple[list[dict], dict | None]:
         system_instruction = None
@@ -168,14 +170,15 @@ class GeminiAdapter(BaseAdapter):
         inputs = inp if isinstance(inp, list) else [inp]
 
         model = body.get("model", "")
-        gemini_model = f"models/{model}"
+        clean_model = model.split("/", 1)[1] if "/" in model else model
+        gemini_model = f"models/{clean_model}"
         requests_list = []
         for text in inputs:
             requests_list.append({
                 "model": gemini_model,
                 "content": {"parts": [{"text": text}]},
             })
-        url = f"{self._base_url()}/models/{model}:batchEmbedContents?key={self.api_key}"
+        url = f"{self._base_url()}/models/{clean_model}:batchEmbedContents?key={self.api_key}"
         response = await self.client.post(url, content=json.dumps({"requests": requests_list}))
 
         if response.status_code != 200:

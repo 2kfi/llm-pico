@@ -45,6 +45,21 @@ _log = logging.getLogger("llm-pico.admin")
 
 router = APIRouter()
 
+
+def _parse_limit(params: dict, default: int = 100) -> int:
+    try:
+        return int(params.get("limit", default))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail={
+            "error": {"message": "limit must be an integer", "type": "bad_request", "code": 400}
+        })
+
+
+def _prefix_pattern(prefix: str) -> str:
+    suffix_idx = prefix.rfind("...")
+    base = prefix[:suffix_idx] if suffix_idx != -1 else prefix
+    return base + "...%"
+
 HTML_DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -70,7 +85,7 @@ h1 span { color:#3a8; }
 <div id="log"><div style="color:#555">Connecting...</div></div>
 <script>
 const el=document.getElementById('log');
-const es=new EventSource('/admin/logs/stream');
+const es=new EventSource('/admin/logs/stream?token=__MASTER_KEY__');
 es.onmessage=e=>{
   const d=JSON.parse(e.data);
   if(d.type==='keepalive') return;
@@ -199,7 +214,7 @@ async def create_key(request: Request, actor_hash: str = Depends(require_master_
 @router.delete("/keys/{prefix}")
 async def delete_key(request: Request, prefix: str, actor_hash: str = Depends(require_master_key)) -> Response:
 
-    pattern = prefix.rstrip("...") + "%"
+    pattern = _prefix_pattern(prefix)
 
     async with get_db() as db:
         cursor = await db.execute(
@@ -239,7 +254,7 @@ async def set_key_models(request: Request, prefix: str, actor_hash: str = Depend
         })
 
     allowlist_json = json.dumps(models) if models is not None else None
-    pattern = prefix.rstrip("...") + "%"
+    pattern = _prefix_pattern(prefix)
 
     async with get_db() as db:
         cursor = await db.execute(
@@ -272,7 +287,7 @@ async def set_key_limits(request: Request, prefix: str, actor_hash: str = Depend
             "error": {"message": "Invalid JSON body", "type": "bad_request", "code": 400}
         })
 
-    pattern = prefix.rstrip("...") + "%"
+    pattern = _prefix_pattern(prefix)
     async with get_db() as db:
         cursor = await db.execute(
             """UPDATE user_keys SET
@@ -310,7 +325,7 @@ async def assign_key_user(request: Request, prefix: str, actor_hash: str = Depen
         })
 
     user_id = body.get("user_id")
-    pattern = prefix.rstrip("...") + "%"
+    pattern = _prefix_pattern(prefix)
 
     async with get_db() as db:
         cursor = await db.execute(
@@ -466,7 +481,7 @@ async def api_team_usage(request: Request, team_id: int, _actor: str = Depends(r
     stats = await get_usage_stats(
         from_date=params.get("from"),
         to_date=params.get("to"),
-        limit=int(params.get("limit", 100)),
+        limit=_parse_limit(params),
         team_id=team_id,
     )
 
@@ -621,7 +636,7 @@ async def api_user_usage(request: Request, user_id: int, _actor: str = Depends(r
     stats = await get_usage_stats(
         from_date=params.get("from"),
         to_date=params.get("to"),
-        limit=int(params.get("limit", 100)),
+        limit=_parse_limit(params),
         user_id=user_id,
     )
 
@@ -684,7 +699,7 @@ async def usage(request: Request, actor_hash: str = Depends(require_master_key))
         key_hash=params.get("key_hash"),
         from_date=params.get("from"),
         to_date=params.get("to"),
-        limit=int(params.get("limit", 100)),
+        limit=_parse_limit(params),
     )
 
     return Response(
@@ -700,7 +715,7 @@ async def top_models(request: Request, actor_hash: str = Depends(require_master_
     models = await get_top_models(
         from_date=params.get("from"),
         to_date=params.get("to"),
-        limit=int(params.get("limit", 10)),
+        limit=_parse_limit(params, default=10),
     )
 
     return Response(
@@ -736,7 +751,7 @@ async def cost_stats(request: Request, _actor: str = Depends(require_master_key)
 @router.get("/log")
 async def admin_log(request: Request, actor_hash: str = Depends(require_master_key)) -> Response:
 
-    limit = int(request.query_params.get("limit", 50))
+    limit = _parse_limit(dict(request.query_params), default=50)
 
     async with get_db() as db:
         cursor = await db.execute(
@@ -767,7 +782,21 @@ async def admin_log(request: Request, actor_hash: str = Depends(require_master_k
 
 
 @router.get("/logs/stream")
-async def log_stream(request: Request, _actor: str = Depends(require_master_key)) -> StreamingResponse:
+async def log_stream(request: Request, token: str | None = None) -> StreamingResponse:
+    from fastapi import HTTPException
+    import hmac
+    config = request.app.state.config
+    master_key = config.general_settings.master_key
+    raw_key = token
+    if not raw_key:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            raw_key = auth_header[7:].strip()
+    if not raw_key or not hmac.compare_digest(raw_key, master_key):
+        raise HTTPException(status_code=401, detail={
+            "error": {"message": "Invalid or missing master API key",
+                       "type": "unauthorized", "code": 401}
+        })
     q = subscribe()
 
     async def generate():
@@ -785,7 +814,10 @@ async def log_stream(request: Request, _actor: str = Depends(require_master_key)
 
 @router.get("/logs", include_in_schema=False)
 async def log_dashboard(request: Request, _actor: str = Depends(require_master_key)) -> Response:
-    return Response(content=HTML_DASHBOARD, media_type="text/html")
+    config = request.app.state.config
+    master_key = config.general_settings.master_key
+    html = HTML_DASHBOARD.replace("__MASTER_KEY__", master_key)
+    return Response(content=html, media_type="text/html")
 
 
 # ---- Config reload ----

@@ -11,13 +11,13 @@ def test_cost_both_rates():
 
 def test_cost_blended_output_only():
     cost = compute_cost(100, 200, None, 15.0)
-    expected = (100 + 200) / 1_000_000 * 15.0
+    expected = 200 / 1_000_000 * 15.0
     assert cost == expected
 
 
 def test_cost_blended_input_only():
     cost = compute_cost(100, 200, 15.0, None)
-    expected = (100 + 200) / 1_000_000 * 15.0
+    expected = 100 / 1_000_000 * 15.0
     assert cost == expected
 
 

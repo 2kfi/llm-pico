@@ -20,9 +20,9 @@ def compute_cost(
         return None
     total = prompt_tokens + completion_tokens
     if cost_in is None:
-        return total / 1_000_000 * cost_out
+        return completion_tokens / 1_000_000 * cost_out
     if cost_out is None:
-        return total / 1_000_000 * cost_in
+        return prompt_tokens / 1_000_000 * cost_in
     return (prompt_tokens / 1_000_000 * cost_in) + (completion_tokens / 1_000_000 * cost_out)
 
 
@@ -153,7 +153,8 @@ async def get_top_models(
                        COUNT(*) as requests,
                        SUM(prompt_tokens) as prompt_tokens,
                        SUM(completion_tokens) as completion_tokens,
-                       SUM(total_tokens) as total_tokens
+                       SUM(total_tokens) as total_tokens,
+                       COALESCE(SUM(cost_usd), 0) as total_cost_usd
                 FROM usage_log{where}
                 GROUP BY model_name, provider
                 ORDER BY total_tokens DESC

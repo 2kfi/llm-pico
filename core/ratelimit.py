@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import datetime as _dt
 import logging
 import time
 from collections import defaultdict
@@ -47,8 +48,9 @@ class RateLimiter:
             return int(ts) + 3600 - int(ts) % 3600
         # daily windows: next midnight UTC
         utc = time.gmtime(ts)
-        tomorrow = time.struct_time((utc.tm_year, utc.tm_mon, utc.tm_mday + 1, 0, 0, 0, 0, 0, 0))
-        return int(calendar.timegm(tomorrow))
+        today = _dt.date(utc.tm_year, utc.tm_mon, utc.tm_mday)
+        tomorrow = today + _dt.timedelta(days=1)
+        return int(calendar.timegm(tomorrow.timetuple()))
 
     def _mem_key(self, key_hash: str, model_name: str, level: str, window_type: str) -> tuple[str, str, str, str]:
         return (key_hash, model_name, level, window_type)
@@ -72,6 +74,9 @@ class RateLimiter:
         reservation: int = 0,
     ) -> dict[str, Any] | None:
         now = time.time()
+
+        # Phase 1: Check all windows without committing
+        pending: list[tuple[str, str, _InMemCounter, int]] = []
         for window_type in ("rpm", "tpm", "ash", "rpd", "tpd", "asd"):
             limit = limits.get(window_type)
             if limit is None:
@@ -87,6 +92,9 @@ class RateLimiter:
                 mk = self._mem_key(key_hash, model_name, level, window_type)
                 entry = self._mem.get(mk)
                 if entry is None or entry["window_start"] != ws:
+                    # Flush any dirty entry before overwriting
+                    if entry is not None and entry.get("dirty") and entry["window_start"]:
+                        await self._flush_single(key_hash, model_name, level, window_type, entry)
                     if entry is None and window_type in ("rpd", "tpd", "asd"):
                         entry = await self._load_from_db(key_hash, model_name, level, window_type)
                     else:
@@ -95,8 +103,10 @@ class RateLimiter:
 
                 check_count = entry["count"] + reserve_amount
                 if check_count > limit:
-                    if window_type in ("rpm", "ash"):
-                        retry = 60 if window_type == "rpm" else 3600
+                    if window_type in ("rpm", "tpm"):
+                        retry = 60
+                    elif window_type == "ash":
+                        retry = 3600
                     else:
                         retry = 86400
                     return {
@@ -105,9 +115,13 @@ class RateLimiter:
                         "count": entry["count"],
                         "retry_after": retry,
                     }
-                entry["count"] += reserve_amount
-                entry["dirty"] = True
-                self._dirty.add(self._mem_key(key_hash, model_name, level, window_type))
+                pending.append((mk[3], window_type, entry, reserve_amount))
+
+        # Phase 2: All checks passed — commit increments
+        for _, window_type, entry, reserve_amount in pending:
+            entry["count"] += reserve_amount
+            entry["dirty"] = True
+            self._dirty.add(self._mem_key(key_hash, model_name, level, window_type))
 
         return None
 
@@ -150,6 +164,24 @@ class RateLimiter:
                 entry["count"] += delta
                 entry["dirty"] = True
                 self._dirty.add(self._mem_key(key_hash, model_name, level, window_type))
+
+    async def _flush_single(self, key_hash: str, model_name: str, level: str, window_type: str, entry: _InMemCounter) -> None:
+        """Flush a single dirty entry to the DB."""
+        if window_type not in ("rpd", "tpd", "asd"):
+            return
+        if not entry.get("dirty"):
+            return
+        async with db_module.get_db() as db:
+            await db.execute(
+                """INSERT INTO rate_counters (key_hash, model_name, level, window_type, window_start, count)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(key_hash, model_name, level, window_type, window_start)
+                   DO UPDATE SET count = ?""",
+                (key_hash, model_name, level, window_type, entry["window_start"], entry["count"], entry["count"]),
+            )
+            await db.commit()
+        entry["dirty"] = False
+        self._dirty.discard((key_hash, model_name, level, window_type))
 
     async def _flush_dirty(self) -> None:
         if not self._dirty:
