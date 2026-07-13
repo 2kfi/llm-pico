@@ -10,6 +10,7 @@ from typing import Any, Literal
 import yaml
 
 _ENV_VAR_RE = re.compile(r"\$\{([^}:]+)(?::(-?[^}]*))?\}")
+_KEY_REF_RE = re.compile(r"^(KEYS|ENV)/(.+)$")
 
 _log = logging.getLogger("llm-pico.config")
 
@@ -47,6 +48,70 @@ def _resolve_env_vars(raw: dict) -> dict:
     return _walk(raw)
 
 
+def _resolve_api_keys(raw: dict, keys_yaml_path: str = "keys.yaml") -> dict:
+    """Resolve KEYS/XXX and ENV/XXX references in api_key fields.
+
+    KEYS/XXX → loads keys.yaml, returns list[str] (multiple backup keys)
+    ENV/XXX  → os.environ.get(XXX), returns str (single key)
+    """
+    keys_data: dict[str, list[str]] | None = None
+
+    def _load_keys_yaml():
+        nonlocal keys_data
+        if keys_data is not None:
+            return
+        keys_path = Path(keys_yaml_path)
+        if not keys_path.exists():
+            keys_data = {}
+            return
+        with open(keys_path) as f:
+            loaded = yaml.safe_load(f)
+        if not isinstance(loaded, dict):
+            keys_data = {}
+            return
+        # Normalize: ensure all values are lists of strings
+        keys_data = {}
+        for k, v in loaded.items():
+            if isinstance(v, list):
+                keys_data[k] = [str(item) for item in v]
+            elif isinstance(v, str):
+                keys_data[k] = [v]
+            else:
+                keys_data[k] = []
+
+    def _walk(value):
+        if isinstance(value, str):
+            match = _KEY_REF_RE.fullmatch(value)
+            if not match:
+                return value
+            ref_type = match.group(1)
+            ref_name = match.group(2)
+
+            if ref_type == "KEYS":
+                _load_keys_yaml()
+                key_list = (keys_data or {}).get(ref_name)
+                if key_list:
+                    return key_list  # Returns list[str] for rotation
+                raise ValueError(
+                    f"Key '{ref_name}' not found in {keys_yaml_path}. "
+                    f"Add it with: {ref_name}:\n  - \"sk-your-key\""
+                )
+            elif ref_type == "ENV":
+                env_val = os.environ.get(ref_name)
+                if env_val is not None:
+                    return env_val  # Returns str (single key)
+                raise ValueError(
+                    f"Environment variable {ref_name} is not set"
+                )
+        elif isinstance(value, dict):
+            return {k: _walk(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [_walk(item) for item in value]
+        return value
+
+    return _walk(raw)
+
+
 @dataclass
 class CircuitBreakerSettings:
     enabled: bool = True
@@ -56,10 +121,8 @@ class CircuitBreakerSettings:
 
 @dataclass
 class RouterSettings:
-    routing_strategy: str = "simple-shuffle"
     num_retries: int = 2
     cooldown_time: int = 45
-    allowed_fails: int = 1
     circuit_breaker: CircuitBreakerSettings = field(default_factory=CircuitBreakerSettings)
 
 
@@ -74,7 +137,7 @@ class GeneralSettings:
 @dataclass
 class ModelParams:
     model: str = ""
-    api_key: str | None = None
+    api_key: str | list[str] | None = None
     api_base: str | None = None
 
 
@@ -124,6 +187,7 @@ def load_config(path: str) -> Config:
     with open(path_obj) as f:
         raw = yaml.safe_load(f)
 
+    raw = _resolve_api_keys(raw)
     raw = _resolve_env_vars(raw)
 
     if not isinstance(raw, dict):
@@ -144,10 +208,8 @@ def load_config(path: str) -> Config:
     rs = raw.get("router_settings") or {}
     cb = rs.get("circuit_breaker") or {}
     cfg.router_settings = RouterSettings(
-        routing_strategy=rs.get("routing_strategy", "simple-shuffle"),
         num_retries=rs.get("num_retries", 2),
         cooldown_time=rs.get("cooldown_time", 45),
-        allowed_fails=rs.get("allowed_fails", 1),
         circuit_breaker=CircuitBreakerSettings(
             enabled=cb.get("enabled", True),
             failure_threshold=cb.get("failure_threshold", 3),
@@ -187,6 +249,31 @@ def load_config(path: str) -> Config:
 
     if not cfg.general_settings.master_key:
         raise ValueError("general_settings.master_key is required")
+
+    for entry in cfg.model_list:
+        base = entry.model_params.api_base or ""
+        if "UNSET" in base:
+            raise ValueError(
+                f"model '{entry.model_name}' has UNSET placeholder in api_base: {base}. "
+                f"Set api_base to the actual Cloudflare Workers AI URL or set CLOUDFLARE_ACCOUNT_ID."
+            )
+
+        # Warn about STT/TTS on providers that don't support them
+        provider_slug = entry.model_params.model.split("/", 1)[0] if "/" in entry.model_params.model else ""
+        unsupported_stt_tts = {"anthropic", "gemini"}
+        if provider_slug in unsupported_stt_tts:
+            if entry.stt:
+                _log.warning(
+                    "model '%s' has stt=true under provider '%s', which does not support STT. "
+                    "This will fail at runtime.",
+                    entry.model_name, provider_slug,
+                )
+            if entry.tts:
+                _log.warning(
+                    "model '%s' has tts=true under provider '%s', which does not support TTS. "
+                    "This will fail at runtime.",
+                    entry.model_name, provider_slug,
+                )
 
     return cfg
 

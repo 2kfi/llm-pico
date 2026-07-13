@@ -10,3 +10,10 @@ __pycache__/
 .env
 *.pyo
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+docs/
+assets/
+tests/
+*.md
+!README.md

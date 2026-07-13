@@ -57,6 +57,7 @@ class ProviderGroup:
     keys: list[KeyState] = field(default_factory=list)
     circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
     api_base: str | None = None
+    next_key_index: int = 0
 
 
 class Router:
@@ -93,7 +94,13 @@ class Router:
                 )
                 groups.append(matching_group)
 
-            matching_group.keys.append(KeyState(api_key=entry.model_params.api_key or ""))
+            # Handle both str and list[str] api_key (KEYS/ returns list)
+            api_key = entry.model_params.api_key
+            if isinstance(api_key, list):
+                for k in api_key:
+                    matching_group.keys.append(KeyState(api_key=k))
+            else:
+                matching_group.keys.append(KeyState(api_key=api_key or ""))
 
         _log.info("router indexed %d model names", len(self._model_map))
 
@@ -110,27 +117,44 @@ class Router:
         if not groups:
             return None
 
-        strategy = self._settings.routing_strategy
         now = time.monotonic()
+        last_group = None
+        earliest_recovery = float("inf")
 
         for group in groups:
             if not group.circuit_breaker.is_request_allowed():
                 continue
 
-            active_keys = [k for k in group.keys if k.cooldown_until < now]
-            if not active_keys:
-                continue
+            last_group = group
 
-            if strategy == "simple-shuffle":
-                key = active_keys[hash(str(now) + group.provider_slug) % len(active_keys)]
-            else:
-                key = active_keys[0]
+            # Round-robin: try each key in order, skip cooled-down ones
+            for _ in range(len(group.keys)):
+                idx = group.next_key_index % len(group.keys)
+                group.next_key_index += 1
+                key = group.keys[idx]
+                if key.cooldown_until < now:
+                    entry = self._model_entries.get(model_name)
+                    if entry is None:
+                        return None
+                    return group, key, entry
+                # Track earliest recovery for Retry-After
+                earliest_recovery = min(earliest_recovery, key.cooldown_until)
 
-            entry = self._model_entries.get(model_name)
-            if entry is None:
-                return None
-
-            return group, key, entry
+        # All keys exhausted — raise 429 with Retry-After
+        if last_group and earliest_recovery < float("inf"):
+            retry_after = max(1, int(earliest_recovery - now))
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "message": f"All keys for model '{model_name}' are rate-limited. Retry after {retry_after}s.",
+                        "type": "rate_limit_exceeded",
+                        "code": 429,
+                    }
+                },
+                headers={"Retry-After": str(retry_after)},
+            )
 
         return None
 
@@ -138,11 +162,14 @@ class Router:
         now = time.monotonic()
 
         if status_code == 429:
-            key_state.cooldown_until = now + self._settings.cooldown_time
+            # Progressive cooldown: 10s for first 3 fails, then 30s
+            cooldown = 30 if key_state.fails >= 3 else 10
+            key_state.cooldown_until = now + cooldown
             key_state.fails += 1
-            _log.debug("key cooled down for %.0fs (429)", self._settings.cooldown_time)
+            _log.debug("key cooled down for %ds (429, fail #%d)", cooldown, key_state.fails)
 
-        elif status_code in (401, 403):
+        elif status_code in (401, 403, 402):
+            # 401/403 = invalid key, 402 = insufficient funds — mark invalid for 1 year
             key_state.cooldown_until = now + 86400 * 365
             _log.warning("key marked as invalid (status=%d)", status_code)
 

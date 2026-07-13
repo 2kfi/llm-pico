@@ -91,15 +91,6 @@ CREATE TABLE IF NOT EXISTS rate_counters (
     UNIQUE(key_hash, model_name, level, window_type, window_start)
 );
 
-CREATE TABLE IF NOT EXISTS request_cache (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    cache_key     TEXT    NOT NULL UNIQUE,
-    response_body BLOB   NOT NULL,
-    content_type  TEXT    NOT NULL DEFAULT 'application/json',
-    created_at    TEXT    NOT NULL,
-    expires_at    TEXT    NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS admin_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     action      TEXT    NOT NULL,

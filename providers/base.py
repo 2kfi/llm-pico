@@ -110,7 +110,8 @@ class BaseAdapter(ABC):
 
         async for chunk in response.aiter_bytes():
             chunks.append(chunk)
-            if b"usage" in chunk:
+            # Only check SSE data lines (b"data: ...") for usage, not raw text
+            if b"data: " in chunk and b"usage" in chunk:
                 try:
                     text = chunk.decode("utf-8", errors="replace")
                     for line in text.split("\n"):

@@ -16,6 +16,7 @@ _KNOWN_PROVIDERS = {
     "anthropic": "providers.anthropic",
     "gemini": "providers.gemini",
     "cloudflare": "providers.cloudflare",
+    "cohere": "providers.cohere",
 }
 
 

@@ -12,7 +12,6 @@ build/
 .ruff_cache/
 *.whl
 config.yaml
-config-litellm.yml
 users.yaml
-config.yml
-litellm
+keys.yaml
+docker-compose.yml

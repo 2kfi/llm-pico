@@ -9,15 +9,8 @@ from core.config import load_config, load_users
 from api.server import create_app
 
 
-@click.command()
-@click.option("--host", default="0.0.0.0", show_default=True, help="Listen host")
-@click.option("--port", default=4000, show_default=True, help="Listen port", type=int)
-@click.option("--config", default="config.yaml", show_default=True, help="Path to config.yaml", type=click.Path(exists=True, dir_okay=False))
-@click.option("--users", default=None, help="Path to users.yaml (auto-detected if not set)", type=click.Path(dir_okay=False))
-@click.option("--db", default=None, help="Path to SQLite database (auto-detected if not set)", type=click.Path(dir_okay=False))
-@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-@click.version_option(version="0.1.0", prog_name="llm-pico")
-def main(host: str, port: int, config: str, users: str | None, db: str | None, verbose: bool):
+def _run_server(host: str, port: int, config: str, users: str | None, db: str | None, verbose: bool):
+    """Shared server startup logic."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -31,6 +24,11 @@ def main(host: str, port: int, config: str, users: str | None, db: str | None, v
     log = logging.getLogger("llm-pico")
     config_path = Path(config).resolve()
     config_dir = config_path.parent
+
+    if not config_path.exists():
+        click.echo(f"Error: config file not found: {config}")
+        click.echo("Run 'llm-pico init' to create one.")
+        raise SystemExit(1)
 
     if users is None:
         users_path = config_dir / "users.yaml"
@@ -73,6 +71,38 @@ def main(host: str, port: int, config: str, users: str | None, db: str | None, v
         log_level="debug" if verbose else "info",
         lifespan="on",
     )
+
+
+@click.group(invoke_without_command=True)
+@click.option("--host", default="0.0.0.0", show_default=True, help="Listen host")
+@click.option("--port", default=4000, show_default=True, help="Listen port", type=int)
+@click.option("--config", default="config.yaml", show_default=True, help="Path to config.yaml", type=click.Path(dir_okay=False))
+@click.option("--users", default=None, help="Path to users.yaml (auto-detected if not set)", type=click.Path(dir_okay=False))
+@click.option("--db", default=None, help="Path to SQLite database (auto-detected if not set)", type=click.Path(dir_okay=False))
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+@click.version_option(version="0.1.0", prog_name="llm-pico")
+@click.pass_context
+def main(ctx, host: str, port: int, config: str, users: str | None, db: str | None, verbose: bool):
+    if ctx.invoked_subcommand is not None:
+        return
+    _run_server(host, port, config, users, db, verbose)
+
+
+@main.command()
+@click.option("--host", default="0.0.0.0", show_default=True, help="Listen host")
+@click.option("--port", default=4000, show_default=True, help="Listen port", type=int)
+@click.option("--config", default="config.yaml", show_default=True, help="Path to config.yaml", type=click.Path(exists=True, dir_okay=False))
+@click.option("--users", default=None, help="Path to users.yaml (auto-detected if not set)", type=click.Path(dir_okay=False))
+@click.option("--db", default=None, help="Path to SQLite database (auto-detected if not set)", type=click.Path(dir_okay=False))
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def serve(host: str, port: int, config: str, users: str | None, db: str | None, verbose: bool):
+    """Start the llm-pico server."""
+    _run_server(host, port, config, users, db, verbose)
+
+
+from api.init_cmd import init_command
+
+main.add_command(init_command, "init")
 
 
 if __name__ == "__main__":

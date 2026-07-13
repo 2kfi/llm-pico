@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any
@@ -12,6 +13,26 @@ from providers.base import BaseAdapter
 from providers import register
 
 _log = logging.getLogger("llm-pico.providers.gemini")
+
+
+class _URLSanitizeFilter(logging.Filter):
+    """Strip API keys from URLs in log messages."""
+
+    _KEY_RE = re.compile(r"([?&]key=)[^&\s]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = self._KEY_RE.sub(r"\1[REDACTED]", record.msg)
+        if record.args:
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    self._KEY_RE.sub(r"\1[REDACTED]", a) if isinstance(a, str) else a
+                    for a in record.args
+                )
+        return True
+
+
+_log.addFilter(_URLSanitizeFilter())
 
 _AUDIO_MIME = {
     "mp3": "audio/mpeg",

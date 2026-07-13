@@ -444,7 +444,7 @@ async def _handle_streaming(
         async def generate():
             nonlocal actual_tokens, actual_prompt_tokens, actual_completion_tokens
             for chunk in stream_chunks:
-                if b"usage" in chunk:
+                if b"data: " in chunk and b"usage" in chunk:
                     try:
                         text = chunk.decode("utf-8", errors="replace")
                         for line in text.split("\n"):
@@ -466,7 +466,7 @@ async def _handle_streaming(
         async def generate():
             nonlocal actual_tokens, actual_prompt_tokens, actual_completion_tokens
             async for chunk in upstream.aiter_bytes():
-                if b"usage" in chunk:
+                if b"data: " in chunk and b"usage" in chunk:
                     try:
                         text = chunk.decode("utf-8", errors="replace")
                         for line in text.split("\n"):

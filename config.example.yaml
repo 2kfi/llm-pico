@@ -1,13 +1,7 @@
 
-model_settings:
-  drop_params: true
-  modify_params: true
-
 router_settings:
-  routing_strategy: simple-shuffle
   num_retries: 2
   cooldown_time: 45
-  allowed_fails: 1
 
 general_settings:
   master_key: "sk-pico-master-CHANGE-ME"
