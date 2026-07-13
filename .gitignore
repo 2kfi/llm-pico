@@ -15,3 +15,4 @@ config.yaml
 users.yaml
 keys.yaml
 docker-compose.yml
+config-litellm.yml
