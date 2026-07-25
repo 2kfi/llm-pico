@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
+import hmac as hmac_mod
+import ipaddress
 import json
 import logging
 import time
@@ -10,7 +11,6 @@ from typing import Any, TYPE_CHECKING
 from core.db import get_db
 from core.teams import merge_allowlist, merge_limits, resolve_user_limits
 
-from fastapi import Request
 
 _log = logging.getLogger("llm-pico.auth")
 
@@ -37,7 +37,7 @@ async def verify_api_key(
     raw_key: str,
     master_key: str | None = None,
 ) -> dict[str, Any] | None:
-    if master_key and hmac.compare_digest(raw_key, master_key):
+    if master_key and hmac_mod.compare_digest(raw_key, master_key):
         return {"role": "admin", "key_prefix": "master"}
 
     key_hash = hash_key(raw_key)
@@ -66,6 +66,8 @@ async def verify_api_key(
         "rpd": row["rpd_limit"],
         "tpm": row["tpm_limit"],
         "tpd": row["tpd_limit"],
+        "ash": row["ash_limit"],
+        "asd": row["asd_limit"],
     }
 
     user_id = row["user_id"]
@@ -94,6 +96,8 @@ async def verify_api_key(
         "ash_limit": merged_limits.get("ash"),
         "asd_limit": merged_limits.get("asd"),
         "user_id": user_id,
+        "ip_allowlist": row["ip_allowlist"],
+        "scopes": await get_key_scopes(row["id"]),
     }
 
     if user_id:
@@ -110,46 +114,99 @@ def check_model_access(user: dict[str, Any], model_name: str) -> bool:
     return model_name in allowlist
 
 
-async def require_api_key(request: Request) -> dict:
-    """FastAPI dependency: verify a valid Bearer API key (user or master).
+# ---- API Key Scopes ----
 
-    Returns the user_key dict. Raises 401 on failure.
-    """
+async def get_key_scopes(key_id: int) -> list[str]:
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT scope FROM api_key_scopes WHERE key_id = ?", (key_id,)
+        )
+        return [row["scope"] for row in await cursor.fetchall()]
+
+
+async def set_key_scopes(key_id: int, scopes: list[str]) -> None:
+    async with get_db() as db:
+        await db.execute("DELETE FROM api_key_scopes WHERE key_id = ?", (key_id,))
+        for scope in scopes:
+            await db.execute(
+                "INSERT INTO api_key_scopes (key_id, scope) VALUES (?, ?)",
+                (key_id, scope),
+            )
+        await db.commit()
+
+
+async def get_key_id_by_hash(key_hash: str) -> int | None:
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT id FROM user_keys WHERE key_hash = ? AND is_active = 1",
+            (key_hash,),
+        )
+        row = await cursor.fetchone()
+        return row["id"] if row else None
+
+
+async def has_scope(key_hash: str, scope: str) -> bool:
+    async with get_db() as db:
+        cursor = await db.execute(
+            """SELECT 1 FROM api_key_scopes s
+               JOIN user_keys k ON k.id = s.key_id
+               WHERE k.key_hash = ? AND s.scope = ?""",
+            (key_hash, scope),
+        )
+        return await cursor.fetchone() is not None
+
+
+def require_scope(scope: str):
+    """Dependency factory: returns a FastAPI dependency that checks for `scope`."""
     from fastapi import HTTPException
-    auth_header = request.headers.get("Authorization")
-    raw_key = extract_bearer(auth_header)
-    if not raw_key:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Missing or invalid Authorization header",
-                       "type": "unauthorized", "code": 401}
+
+    async def _check(user: dict[str, Any]) -> dict[str, Any]:
+        if user.get("role") == "admin":
+            return user
+        key_hash = user.get("key_hash")
+        if key_hash and user.get("scopes"):
+            if scope in user["scopes"]:
+                return user
+        if key_hash and await has_scope(key_hash, scope):
+            return user
+        raise HTTPException(status_code=403, detail={
+            "error": {"message": f"Missing required scope: {scope}",
+                       "type": "forbidden", "code": 403}
         })
-    config = request.app.state.config
-    master_key = config.general_settings.master_key
-    user_key = await verify_api_key(raw_key, master_key)
-    if user_key is None:
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Invalid API key",
-                       "type": "unauthorized", "code": 401}
-        })
-    return user_key
+    return _check
 
 
-async def require_master_key(request: Request) -> str:
-    """FastAPI dependency: require the master API key (admin only).
+# ---- IP Allowlist ----
 
-    Returns the raw key string for audit logging. Raises 401 on failure.
-    """
-    from fastapi import HTTPException
-    config = request.app.state.config
-    master_key = config.general_settings.master_key
-    auth_header = request.headers.get("Authorization")
-    raw_key = extract_bearer(auth_header)
-    if not raw_key or not hmac.compare_digest(raw_key, master_key):
-        raise HTTPException(status_code=401, detail={
-            "error": {"message": "Invalid or missing master API key",
-                       "type": "unauthorized", "code": 401}
-        })
-    return raw_key
+def check_ip_allowed(key_hash: str, client_ip: str, ip_allowlist: str | None) -> bool:
+    if not ip_allowlist:
+        return True
+    try:
+        allowed = json.loads(ip_allowlist)
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not allowed:
+        return True
+    try:
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    for cidr in allowed:
+        try:
+            if addr in ipaddress.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+# ---- HMAC Request Signing ----
+
+def verify_hmac_signature(secret: str, body: bytes, signature: str) -> bool:
+    expected = hmac_mod.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac_mod.compare_digest(f"sha256={expected}", signature)
+
+
 
 
 async def seed_users(users: list[Any]) -> None:
@@ -186,3 +243,27 @@ async def seed_users(users: list[Any]) -> None:
             )
         await db.commit()
     _log.info("seeded %d user keys", len(users))
+
+
+# ponytail: JSONL audit log — one line per admin action, append-only
+import os as _os
+_audit_log_path: str | None = None
+
+
+def init_audit_log(db_path: str) -> None:
+    global _audit_log_path
+    _audit_log_path = _os.path.join(_os.path.dirname(db_path), "audit.jsonl")
+
+
+def audit_log(action: str, actor: str = "admin", **details: Any) -> None:
+    """Append a structured audit entry. Best-effort, never raises."""
+    if not _audit_log_path:
+        return
+    try:
+        import json as _json
+        from datetime import datetime, timezone
+        entry = {"ts": datetime.now(timezone.utc).isoformat(), "action": action, "actor": actor, **details}
+        with open(_audit_log_path, "a") as f:
+            f.write(_json.dumps(entry) + "\n")
+    except Exception:
+        pass

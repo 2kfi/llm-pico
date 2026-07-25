@@ -10,10 +10,8 @@ def config(tmp_path):
     return Config(
         general_settings=GeneralSettings(master_key="sk-pico-master-test"),
         router_settings=RouterSettings(
-            routing_strategy="simple-shuffle",
             num_retries=2,
             cooldown_time=45,
-            allowed_fails=1,
         ),
     )
 

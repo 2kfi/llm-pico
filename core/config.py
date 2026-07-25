@@ -1,115 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
-import os
-import re
+import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-import yaml
-
-_ENV_VAR_RE = re.compile(r"\$\{([^}:]+)(?::(-?[^}]*))?\}")
-_KEY_REF_RE = re.compile(r"^(KEYS|ENV)/(.+)$")
+from core.db import get_db
 
 _log = logging.getLogger("llm-pico.config")
-
-
-def _resolve_env_vars(raw: dict) -> dict:
-    """Walk a parsed-YAML dict and resolve ${VAR_NAME} or ${VAR_NAME:-default} strings.
-
-    Recursively traverses nested dicts and lists. Any string value matching
-    the ${VAR} or ${VAR:-default} pattern is replaced with the environment
-    variable value. Raises ValueError if a variable is not set and has no default.
-    """
-
-    def _walk(value):
-        if isinstance(value, str):
-            match = _ENV_VAR_RE.fullmatch(value)
-            if not match:
-                return value
-            var_name = match.group(1)
-            default = match.group(2)
-            env_val = os.environ.get(var_name)
-            if env_val is not None:
-                return env_val
-            if default is not None:
-                return default
-            raise ValueError(
-                f"Environment variable ${var_name} is not set "
-                f"and no default value was provided"
-            )
-        elif isinstance(value, dict):
-            return {k: _walk(v) for k, v in value.items()}
-        elif isinstance(value, list):
-            return [_walk(item) for item in value]
-        return value
-
-    return _walk(raw)
-
-
-def _resolve_api_keys(raw: dict, keys_yaml_path: str = "keys.yaml") -> dict:
-    """Resolve KEYS/XXX and ENV/XXX references in api_key fields.
-
-    KEYS/XXX → loads keys.yaml, returns list[str] (multiple backup keys)
-    ENV/XXX  → os.environ.get(XXX), returns str (single key)
-    """
-    keys_data: dict[str, list[str]] | None = None
-
-    def _load_keys_yaml():
-        nonlocal keys_data
-        if keys_data is not None:
-            return
-        keys_path = Path(keys_yaml_path)
-        if not keys_path.exists():
-            keys_data = {}
-            return
-        with open(keys_path) as f:
-            loaded = yaml.safe_load(f)
-        if not isinstance(loaded, dict):
-            keys_data = {}
-            return
-        # Normalize: ensure all values are lists of strings
-        keys_data = {}
-        for k, v in loaded.items():
-            if isinstance(v, list):
-                keys_data[k] = [str(item) for item in v]
-            elif isinstance(v, str):
-                keys_data[k] = [v]
-            else:
-                keys_data[k] = []
-
-    def _walk(value):
-        if isinstance(value, str):
-            match = _KEY_REF_RE.fullmatch(value)
-            if not match:
-                return value
-            ref_type = match.group(1)
-            ref_name = match.group(2)
-
-            if ref_type == "KEYS":
-                _load_keys_yaml()
-                key_list = (keys_data or {}).get(ref_name)
-                if key_list:
-                    return key_list  # Returns list[str] for rotation
-                raise ValueError(
-                    f"Key '{ref_name}' not found in {keys_yaml_path}. "
-                    f"Add it with: {ref_name}:\n  - \"sk-your-key\""
-                )
-            elif ref_type == "ENV":
-                env_val = os.environ.get(ref_name)
-                if env_val is not None:
-                    return env_val  # Returns str (single key)
-                raise ValueError(
-                    f"Environment variable {ref_name} is not set"
-                )
-        elif isinstance(value, dict):
-            return {k: _walk(v) for k, v in value.items()}
-        elif isinstance(value, list):
-            return [_walk(item) for item in value]
-        return value
-
-    return _walk(raw)
 
 
 @dataclass
@@ -132,6 +31,8 @@ class GeneralSettings:
     db_path: str | None = None
     usage_log_retention_days: int = 30
     admin_log_retention_days: int = 90
+    hmac_enabled: bool = False
+    hmac_secret: str = ""
 
 
 @dataclass
@@ -156,20 +57,11 @@ class ModelEntry:
     stt: bool = False
     tts: bool = False
     failover_model: str | None = None
+    fallbacks: list[dict[str, Any]] | None = None  # ponytail: ordered fallback chain
     can_cache: bool = False
     cost_per_1m_input: float | None = None
     cost_per_1m_output: float | None = None
-
-
-@dataclass
-class UserKey:
-    key: str
-    label: str | None = None
-    models: list[str] | None = None
-    rpm: int | None = None
-    rpd: int | None = None
-    tpm: int | None = None
-    tpd: int | None = None
+    db_model_id: int | None = None
 
 
 @dataclass
@@ -177,133 +69,212 @@ class Config:
     general_settings: GeneralSettings = field(default_factory=GeneralSettings)
     router_settings: RouterSettings = field(default_factory=RouterSettings)
     model_list: list[ModelEntry] = field(default_factory=list)
+    degradation_mode: str = "normal"
 
 
-def load_config(path: str) -> Config:
-    path_obj = Path(path)
-    if not path_obj.exists():
-        raise FileNotFoundError(f"config file not found: {path}")
+async def _get_settings() -> dict[str, str | None]:
+    async with get_db() as db:
+        cursor = await db.execute("SELECT key, value FROM settings")
+        rows = await cursor.fetchall()
+    return {row["key"]: row["value"] for row in rows}
 
-    with open(path_obj) as f:
-        raw = yaml.safe_load(f)
 
-    raw = _resolve_api_keys(raw)
-    raw = _resolve_env_vars(raw)
+async def _set_setting(key: str, value: str) -> None:
+    async with get_db() as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        await db.commit()
 
-    if not isinstance(raw, dict):
-        raise ValueError("config must be a YAML dictionary")
+
+async def load_config_from_db() -> Config:
+    s = await _get_settings()
+
+    def _int(key: str, default: int) -> int:
+        v = s.get(key)
+        return int(v) if v is not None else default
+
+    def _bool(key: str, default: bool) -> bool:
+        v = s.get(key)
+        if v is None:
+            return default
+        return v not in ("0", "false", "")
 
     cfg = Config()
-
-    # general_settings
-    gs = raw.get("general_settings") or {}
     cfg.general_settings = GeneralSettings(
-        master_key=gs.get("master_key", ""),
-        db_path=gs.get("db_path"),
-        usage_log_retention_days=gs.get("usage_log_retention_days", 30),
-        admin_log_retention_days=gs.get("admin_log_retention_days", 90),
+        master_key=s.get("master_key") or "",
+        db_path=s.get("db_path"),
+        usage_log_retention_days=_int("usage_log_retention_days", 30),
+        admin_log_retention_days=_int("admin_log_retention_days", 90),
+        hmac_enabled=_bool("hmac_enabled", False),
+        hmac_secret=s.get("hmac_secret") or "",
     )
-
-    # router_settings
-    rs = raw.get("router_settings") or {}
-    cb = rs.get("circuit_breaker") or {}
     cfg.router_settings = RouterSettings(
-        num_retries=rs.get("num_retries", 2),
-        cooldown_time=rs.get("cooldown_time", 45),
+        num_retries=_int("num_retries", 2),
+        cooldown_time=_int("cooldown_time", 45),
         circuit_breaker=CircuitBreakerSettings(
-            enabled=cb.get("enabled", True),
-            failure_threshold=cb.get("failure_threshold", 3),
-            recovery_timeout=cb.get("recovery_timeout", 30),
+            enabled=_bool("circuit_breaker_enabled", True),
+            failure_threshold=_int("circuit_breaker_failure_threshold", 3),
+            recovery_timeout=_int("circuit_breaker_recovery_timeout", 30),
         ),
     )
+    cfg.degradation_mode = s.get("degradation_mode") or "normal"
 
-    # model_list
-    for entry in raw.get("model_list") or []:
-        lp = entry.get("model_params") or {}
-        model_entry = ModelEntry(
-            model_name=entry["model_name"],
-            model_params=ModelParams(
-                model=lp.get("model", ""),
-                api_key=lp.get("api_key"),
-                api_base=lp.get("api_base"),
-            ),
-            rpm=entry.get("rpm"),
-            rpd=entry.get("rpd"),
-            tpm=entry.get("tpm"),
-            tpd=entry.get("tpd"),
-            ash=entry.get("ash"),
-            asd=entry.get("asd"),
-            images=entry.get("images", False),
-            embeddings=entry.get("embeddings", False),
-            stt=entry.get("stt", False),
-            tts=entry.get("tts", False),
-            failover_model=entry.get("failover_model"),
-            can_cache=entry.get("can_cache", False),
-            cost_per_1m_input=entry.get("cost_per_1m_input"),
-            cost_per_1m_output=entry.get("cost_per_1m_output"),
+    async with get_db() as db:
+        cursor = await db.execute(
+            """SELECT m.id, m.model_name, m.model, m.api_base,
+                      m.images, m.embeddings, m.stt, m.tts,
+                      m.failover_model, m.can_cache,
+                      m.cost_per_1m_input, m.cost_per_1m_output,
+                      m.rpm, m.rpd, m.tpm, m.tpd, m.ash, m.asd,
+                      GROUP_CONCAT(pk.api_key) as api_keys
+               FROM models m
+               LEFT JOIN provider_keys pk ON pk.model_id = m.id AND pk.is_active = 1
+               WHERE m.is_active = 1
+               GROUP BY m.id
+               ORDER BY m.id"""
         )
-        cfg.model_list.append(model_entry)
+        rows = await cursor.fetchall()
+
+    for row in rows:
+        raw_keys = row["api_keys"]
+        if raw_keys:
+            keys = raw_keys.split(",")
+            api_key = keys if len(keys) > 1 else keys[0]
+        else:
+            api_key = None
+
+        cfg.model_list.append(ModelEntry(
+            model_name=row["model_name"],
+            model_params=ModelParams(
+                model=row["model"],
+                api_key=api_key,
+                api_base=row["api_base"],
+            ),
+            rpm=row["rpm"],
+            rpd=row["rpd"],
+            tpm=row["tpm"],
+            tpd=row["tpd"],
+            ash=row["ash"],
+            asd=row["asd"],
+            images=bool(row["images"]),
+            embeddings=bool(row["embeddings"]),
+            stt=bool(row["stt"]),
+            tts=bool(row["tts"]),
+            failover_model=row["failover_model"],
+            can_cache=bool(row["can_cache"]),
+            cost_per_1m_input=row["cost_per_1m_input"],
+            cost_per_1m_output=row["cost_per_1m_output"],
+            db_model_id=row["id"],
+        ))
 
     if not cfg.model_list:
-        raise ValueError("config must have at least one model in model_list")
-
-    if not cfg.general_settings.master_key:
-        raise ValueError("general_settings.master_key is required")
-
-    for entry in cfg.model_list:
-        base = entry.model_params.api_base or ""
-        if "UNSET" in base:
-            raise ValueError(
-                f"model '{entry.model_name}' has UNSET placeholder in api_base: {base}. "
-                f"Set api_base to the actual Cloudflare Workers AI URL or set CLOUDFLARE_ACCOUNT_ID."
-            )
-
-        # Warn about STT/TTS on providers that don't support them
-        provider_slug = entry.model_params.model.split("/", 1)[0] if "/" in entry.model_params.model else ""
-        unsupported_stt_tts = {"anthropic", "gemini"}
-        if provider_slug in unsupported_stt_tts:
-            if entry.stt:
-                _log.warning(
-                    "model '%s' has stt=true under provider '%s', which does not support STT. "
-                    "This will fail at runtime.",
-                    entry.model_name, provider_slug,
-                )
-            if entry.tts:
-                _log.warning(
-                    "model '%s' has tts=true under provider '%s', which does not support TTS. "
-                    "This will fail at runtime.",
-                    entry.model_name, provider_slug,
-                )
+        _log.warning("no models configured in database")
 
     return cfg
 
 
-def load_users(path: str) -> list[UserKey]:
-    path_obj = Path(path)
-    if not path_obj.exists():
-        return []
-
-    with open(path_obj) as f:
-        raw = yaml.safe_load(f)
-
-    raw = _resolve_env_vars(raw)
-
-    if not isinstance(raw, dict):
-        return []
-
-    users = []
-    for entry in raw.get("users") or []:
-        raw_key = entry.get("key", "")
-        if not raw_key:
-            _log.warning("skipping user entry with empty key")
+async def save_settings(settings: dict[str, Any]) -> None:
+    for key, value in settings.items():
+        if value is None:
             continue
-        users.append(UserKey(
-            key=raw_key,
-            label=entry.get("label"),
-            models=entry.get("models"),
-            rpm=entry.get("rpm"),
-            rpd=entry.get("rpd"),
-            tpm=entry.get("tpm"),
-            tpd=entry.get("tpd"),
-        ))
-    return users
+        await _set_setting(key, str(value))
+
+
+async def save_model(model_id: int | None, data: dict[str, Any]) -> int:
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    async with get_db() as db:
+        if model_id is not None:
+            await db.execute(
+                """UPDATE models SET
+                   model_name=?, model=?, api_base=?, images=?, embeddings=?,
+                   stt=?, tts=?, failover_model=?, can_cache=?,
+                   cost_per_1m_input=?, cost_per_1m_output=?,
+                   rpm=?, rpd=?, tpm=?, tpd=?, ash=?, asd=?, is_active=1
+                   WHERE id=?""",
+                (
+                    data["model_name"], data["model"], data.get("api_base"),
+                    int(data.get("images", False)), int(data.get("embeddings", False)),
+                    int(data.get("stt", False)), int(data.get("tts", False)),
+                    data.get("failover_model"), int(data.get("can_cache", False)),
+                    data.get("cost_per_1m_input"), data.get("cost_per_1m_output"),
+                    data.get("rpm"), data.get("rpd"), data.get("tpm"), data.get("tpd"),
+                    data.get("ash"), data.get("asd"),
+                    model_id,
+                ),
+            )
+            await db.commit()
+            return model_id
+        else:
+            cursor = await db.execute(
+                """INSERT INTO models
+                   (model_name, model, api_base, images, embeddings, stt, tts,
+                    failover_model, can_cache, cost_per_1m_input, cost_per_1m_output,
+                    rpm, rpd, tpm, tpd, ash, asd, is_active, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
+                (
+                    data["model_name"], data["model"], data.get("api_base"),
+                    int(data.get("images", False)), int(data.get("embeddings", False)),
+                    int(data.get("stt", False)), int(data.get("tts", False)),
+                    data.get("failover_model"), int(data.get("can_cache", False)),
+                    data.get("cost_per_1m_input"), data.get("cost_per_1m_output"),
+                    data.get("rpm"), data.get("rpd"), data.get("tpm"), data.get("tpd"),
+                    data.get("ash"), data.get("asd"),
+                    now,
+                ),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+
+async def delete_model(model_id: int) -> bool:
+    async with get_db() as db:
+        cursor = await db.execute("UPDATE models SET is_active = 0 WHERE id = ?", (model_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def save_provider_key(model_id: int, api_key: str, priority: int = 0) -> int:
+    async with get_db() as db:
+        cursor = await db.execute(
+            "INSERT INTO provider_keys (model_id, api_key, priority, is_active) VALUES (?,?,?,1)",
+            (model_id, api_key, priority),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def delete_provider_key(key_id: int) -> bool:
+    async with get_db() as db:
+        cursor = await db.execute("UPDATE provider_keys SET is_active = 0 WHERE id = ?", (key_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_provider_keys(model_id: int) -> list[dict[str, Any]]:
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT id, api_key, priority, is_active FROM provider_keys WHERE model_id = ? ORDER BY priority, id",
+            (model_id,),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def reload_config(app_state) -> bool:
+    """Hot-reload config from DB and swap router. Returns True on success."""
+    try:
+        new_config = await load_config_from_db()
+        from core.router import Router
+        new_router = Router(new_config)
+        app_state.router = new_router
+        app_state.config = new_config
+        _log.info("hot-reloaded config: %d models", len(new_config.model_list))
+        return True
+    except Exception:
+        _log.exception("hot-reload failed, falling back to os.execve")
+        return False
+
+
+

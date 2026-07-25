@@ -11,8 +11,5 @@ build/
 .mypy_cache/
 .ruff_cache/
 *.whl
-config.yaml
-users.yaml
-keys.yaml
 docker-compose.yml
-config-litellm.yml
+ui-ux.md

@@ -1,0 +1,51 @@
+{
+  "families": [
+    "Times New Roman",
+    "SpotifyMixUI"
+  ],
+  "scale": {
+    "heading-1": {
+      "fontFamily": "Times New Roman",
+      "fontSize": "48px / 3rem",
+      "fontWeight": "700",
+      "lineHeight": null,
+      "source": "computed"
+    },
+    "heading-2": {
+      "fontFamily": "Times New Roman",
+      "fontSize": "32px / 2rem",
+      "fontWeight": "600",
+      "lineHeight": null,
+      "source": "computed"
+    },
+    "heading-3": {
+      "fontFamily": "Times New Roman",
+      "fontSize": "24px / 1.5rem",
+      "fontWeight": "600",
+      "lineHeight": null,
+      "source": "computed"
+    },
+    "body": {
+      "fontFamily": "SpotifyMixUI",
+      "fontSize": "16px / 1rem",
+      "fontWeight": "400",
+      "lineHeight": null,
+      "source": "computed"
+    },
+    "caption": {
+      "fontFamily": "SpotifyMixUI",
+      "fontSize": "12px / 0.75rem",
+      "fontWeight": "400",
+      "lineHeight": null,
+      "source": "computed"
+    }
+  },
+  "fontFaces": [],
+  "rules": {
+    "maxSizesPerScreen": 4,
+    "headingWeightRange": "600-700",
+    "bodyWeight": 400,
+    "lineHeightBody": 1.5,
+    "lineHeightHeading": 1.2
+  }
+}

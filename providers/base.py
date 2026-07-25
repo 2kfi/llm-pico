@@ -95,22 +95,29 @@ class BaseAdapter(ABC):
         except Exception:
             return False
 
+    async def probe_capabilities(self, model: str) -> dict:
+        """Probe model capabilities. Override in subclasses for real detection."""
+        return {"supports_tools": False, "supports_vision": False, "supports_json": False}
+
     @abstractmethod
     async def proxy_request(self, body_bytes: bytes, model_string: str) -> httpx.Response:
         ...
 
+    async def proxy_embeddings(self, body_bytes: bytes) -> httpx.Response:
+        raise NotImplementedError("Embeddings not supported by this adapter")
+
+    async def proxy_audio_transcriptions(
+        self, audio_bytes: bytes, filename: str, content_type: str, extra_data: dict[str, str] | None
+    ) -> httpx.Response:
+        raise NotImplementedError("Audio transcriptions not supported by this adapter")
+
     async def proxy_tts(self, body_bytes: bytes, model_string: str) -> httpx.Response:
         raise NotImplementedError("TTS not supported by this adapter")
 
-    async def proxy_stream(
-        self, response: httpx.Response
-    ) -> tuple[list[bytes], dict[str, Any] | None]:
-        chunks: list[bytes] = []
+    async def proxy_stream(self, response: httpx.Response):
+        """Stream response chunks and accumulate usage. Async generator — yields bytes."""
         usage: dict[str, Any] | None = None
-
         async for chunk in response.aiter_bytes():
-            chunks.append(chunk)
-            # Only check SSE data lines (b"data: ...") for usage, not raw text
             if b"data: " in chunk and b"usage" in chunk:
                 try:
                     text = chunk.decode("utf-8", errors="replace")
@@ -121,8 +128,8 @@ class BaseAdapter(ABC):
                                 usage = data["usage"]
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
-
-        return chunks, usage
+            yield chunk
+        self._last_usage = usage
 
     async def close(self) -> None:
         if getattr(self, '_owns_client', False) and hasattr(self, 'client'):

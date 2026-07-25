@@ -1,0 +1,206 @@
+@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --lp-bg-primary: #020617;
+  --lp-bg-secondary: #0F172A;
+  --lp-bg-tertiary: #1E293B;
+  --lp-bg-card: #0F172B;
+  --lp-surface: #162032;
+  --lp-surface-hover: #1E293B;
+  --lp-surface-active: #273548;
+  --lp-elevated: #1A2744;
+  --lp-border: #1E2D3D;
+  --lp-border-hover: #334155;
+  --lp-border-focus: #22C55E;
+
+  --lp-text-primary: #F1F5F9;
+  --lp-text-secondary: #94A3B8;
+  --lp-text-tertiary: #64748B;
+  --lp-text-disabled: #475569;
+
+  --lp-accent: #22C55E;
+  --lp-accent-hover: #16A34A;
+  --lp-accent-subtle: rgba(34, 197, 94, 0.12);
+  --lp-accent-glow: rgba(34, 197, 94, 0.25);
+
+  --lp-green: #22C55E;
+  --lp-red: #EF4444;
+  --lp-red-subtle: rgba(239, 68, 68, 0.12);
+  --lp-orange: #F59E0B;
+  --lp-orange-subtle: rgba(245, 158, 11, 0.12);
+  --lp-blue: #38BDF8;
+  --lp-blue-subtle: rgba(56, 189, 248, 0.12);
+  --lp-purple: #A78BFA;
+  --lp-cyan: #2DD4BF;
+
+  --lp-badge-text: var(--lp-text-secondary);
+  --lp-badge-text-bg: rgba(148, 163, 184, 0.12);
+  --lp-badge-image: #7DD3FC;
+  --lp-badge-image-bg: rgba(125, 211, 252, 0.12);
+  --lp-badge-vision: #7DD3FC;
+  --lp-badge-vision-bg: rgba(125, 211, 252, 0.12);
+  --lp-badge-stt: #4ADE80;
+  --lp-badge-stt-bg: rgba(74, 222, 128, 0.12);
+  --lp-badge-tts: #C4B5FD;
+  --lp-badge-tts-bg: rgba(196, 181, 253, 0.12);
+  --lp-badge-embeddings: #FCD34D;
+  --lp-badge-embeddings-bg: rgba(252, 211, 77, 0.12);
+
+  --lp-space-0: 0px;
+  --lp-space-1: 4px;
+  --lp-space-2: 8px;
+  --lp-space-3: 12px;
+  --lp-space-4: 16px;
+  --lp-space-5: 20px;
+  --lp-space-6: 24px;
+  --lp-space-8: 32px;
+  --lp-space-10: 40px;
+  --lp-space-12: 48px;
+  --lp-space-16: 64px;
+
+  --lp-font-sans: 'Fira Sans', system-ui, -apple-system, sans-serif;
+  --lp-font-mono: 'Fira Code', 'SF Mono', 'Cascadia Code', monospace;
+  --lp-font-size-xs: 12px;
+  --lp-font-size-sm: 13px;
+  --lp-font-size-base: 14px;
+  --lp-font-size-md: 14px;
+  --lp-font-size-lg: 16px;
+  --lp-font-size-xl: 18px;
+  --lp-font-size-2xl: 24px;
+  --lp-font-size-3xl: 30px;
+  --lp-font-size-4xl: 36px;
+  --lp-font-weight-normal: 400;
+  --lp-font-weight-medium: 500;
+  --lp-font-weight-semibold: 600;
+  --lp-font-weight-bold: 700;
+
+  --lp-radius-sm: 6px;
+  --lp-radius-md: 8px;
+  --lp-radius-lg: 12px;
+  --lp-radius-xl: 16px;
+  --lp-radius-full: 9999px;
+
+  --lp-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --lp-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
+  --lp-shadow-md: 0 4px 6px rgba(0, 0, 0, 0.3), 0 2px 4px rgba(0, 0, 0, 0.2);
+  --lp-shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.3), 0 4px 6px rgba(0, 0, 0, 0.2);
+  --lp-shadow-xl: 0 20px 25px rgba(0, 0, 0, 0.4), 0 8px 10px rgba(0, 0, 0, 0.2);
+  --lp-shadow-ring: 0 0 0 3px var(--lp-accent-subtle);
+
+  --lp-duration-fast: 100ms;
+  --lp-duration-normal: 150ms;
+  --lp-duration-slow: 250ms;
+  --lp-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --lp-ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --lp-ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --lp-ease-in-out: cubic-bezier(0, 0, 0.2, 1);
+  --lp-ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --lp-ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --lp-sidebar-width: 240px;
+  --lp-sidebar-collapsed-width: 56px;
+  --lp-header-height: 56px;
+  --lp-content-max-width: 1400px;
+
+  --lp-text-muted: var(--lp-text-tertiary);
+  --lp-transition: var(--lp-duration-normal) var(--lp-ease);
+  --lp-space-xs: var(--lp-space-1);
+  --lp-space-sm: var(--lp-space-2);
+  --lp-space-md: var(--lp-space-3);
+  --lp-space-lg: var(--lp-space-6);
+  --lp-space-xl: var(--lp-space-8);
+  --lp-space-2xl: var(--lp-space-10);
+  --lp-space-3xl: var(--lp-space-16);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  html { scroll-behavior: auto; }
+}
+
+body {
+  font-family: var(--lp-font-sans);
+  font-size: var(--lp-font-size-base);
+  line-height: 1.5;
+  color: var(--lp-text-primary);
+  background: var(--lp-bg-primary);
+  min-height: 100vh;
+}
+
+a {
+  color: var(--lp-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--lp-accent-hover);
+  text-decoration: underline;
+}
+
+.light-mode {
+  --lp-bg-primary: #FFFFFF;
+  --lp-bg-secondary: #F8FAFC;
+  --lp-bg-tertiary: #F1F5F9;
+  --lp-bg-card: #FFFFFF;
+  --lp-surface: #F8FAFC;
+  --lp-surface-hover: #F1F5F9;
+  --lp-surface-active: #E2E8F0;
+  --lp-elevated: #FFFFFF;
+  --lp-border: #E2E8F0;
+  --lp-border-hover: #CBD5E1;
+  --lp-border-focus: #16A34A;
+  --lp-text-primary: #0F172A;
+  --lp-text-secondary: #475569;
+  --lp-text-tertiary: #94A3B8;
+  --lp-text-disabled: #CBD5E1;
+  --lp-accent: #16A34A;
+  --lp-accent-hover: #15803D;
+  --lp-accent-subtle: rgba(22, 163, 74, 0.10);
+  --lp-accent-glow: rgba(22, 163, 74, 0.18);
+  --lp-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --lp-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.06);
+  --lp-shadow-md: 0 4px 6px rgba(0, 0, 0, 0.06), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --lp-shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.06), 0 4px 6px rgba(0, 0, 0, 0.04);
+  --lp-shadow-xl: 0 20px 25px rgba(0, 0, 0, 0.08), 0 8px 10px rgba(0, 0, 0, 0.04);
+  --lp-shadow-ring: 0 0 0 3px rgba(22, 163, 74, 0.15);
+  --lp-badge-text: #475569;
+  --lp-badge-text-bg: rgba(71, 85, 105, 0.10);
+  --lp-badge-image: #0284C7;
+  --lp-badge-image-bg: rgba(2, 132, 199, 0.10);
+  --lp-badge-vision: #0284C7;
+  --lp-badge-vision-bg: rgba(2, 132, 199, 0.10);
+  --lp-badge-stt: #16A34A;
+  --lp-badge-stt-bg: rgba(22, 163, 74, 0.10);
+  --lp-badge-tts: #7C3AED;
+  --lp-badge-tts-bg: rgba(124, 58, 237, 0.10);
+  --lp-badge-embeddings: #D97706;
+  --lp-badge-embeddings-bg: rgba(217, 119, 6, 0.10);
+}
+
+.hidden { display: none !important; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0; }
+
+code,
+pre,
+.lp-mono {
+  font-family: var(--lp-font-mono);
+}

@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from core.router import Router
+from core.router import Router, ProviderGroup, KeyState
 
 
 class TestResolve:
@@ -55,18 +55,16 @@ class TestResolve:
         result2 = router.resolve("test-model")
         router.record_failure(result2[0], result2[1], 429)
 
-        result3 = router.resolve("test-model")
-        assert result3 is None
+        with pytest.raises(Exception, match="429"):
+            router.resolve("test-model")
 
     def test_picks_other_group_when_circuit_open(self, dual_group_config):
         router = Router(dual_group_config)
-
-        # Get the first group, fail it 3 times to open circuit
+        # Force openai circuit open directly (weighted random may pick either group)
+        oa_group = [g for g in router._model_map["test-model"] if g.provider_slug == "openai"][0]
         for _ in range(3):
-            result = router.resolve("test-model")
-            assert result is not None
-            group, _, _ = result
-            router.record_failure(group, result[1], 502)
+            oa_group.circuit_breaker.record_failure()
+        assert oa_group.circuit_breaker.state == "OPEN"
 
         result = router.resolve("test-model")
         assert result is not None
@@ -76,15 +74,11 @@ class TestResolve:
 
     def test_circuit_breaker_recovers_after_timeout(self, dual_group_config):
         router = Router(dual_group_config)
-        cb = None
+        oa_group = [g for g in router._model_map["test-model"] if g.provider_slug == "openai"][0]
+        cb = oa_group.circuit_breaker
 
         for _ in range(3):
-            result = router.resolve("test-model")
-            assert result is not None
-            group, key, _ = result
-            cb = group.circuit_breaker
-            if group.provider_slug == "openai":
-                router.record_failure(group, key, 502)
+            cb.record_failure()
 
         assert cb.state == "OPEN"
 
@@ -97,3 +91,94 @@ class TestResolve:
         cb.record_success()
         assert cb.state == "CLOSED"
         assert cb.error_count == 0
+
+
+class TestLatencyTracking:
+    def test_record_latency_computes_percentiles(self):
+        group = ProviderGroup(provider_slug="openai")
+        for ms in range(10, 110):  # 10ms to 109ms
+            group.record_latency(float(ms))
+        assert group.latency_p50 == pytest.approx(59.5)
+        assert group.latency_p95 == pytest.approx(105.0)
+
+    def test_latency_samples_capped_at_100(self):
+        group = ProviderGroup(provider_slug="openai")
+        for i in range(150):
+            group.record_latency(float(i))
+        assert len(group.latency_samples) == 100
+        assert group.latency_samples[0] == 50.0  # oldest kept is index 50
+
+    def test_single_sample(self):
+        group = ProviderGroup(provider_slug="openai")
+        group.record_latency(42.0)
+        assert group.latency_p50 == 42.0
+        assert group.latency_p95 == 42.0
+
+
+class TestCostAwareRouting:
+    def test_filters_by_max_cost(self, dual_group_config):
+        router = Router(dual_group_config)
+        # Set different costs on the two groups
+        for g in router._model_map["test-model"]:
+            if g.provider_slug == "openai":
+                g.cost_per_1k = 30.0
+            else:
+                g.cost_per_1k = 0.5
+
+        # max_cost=1.0 should only allow the cheap group
+        result = router.resolve("test-model", max_cost=1.0)
+        assert result is not None
+        assert result[0].provider_slug == "groq"
+
+    def test_no_max_cost_returns_any_group(self, dual_group_config):
+        router = Router(dual_group_config)
+        for g in router._model_map["test-model"]:
+            g.cost_per_1k = 999.0
+        result = router.resolve("test-model", max_cost=None)
+        assert result is not None
+
+    def test_all_groups_over_cost_returns_none(self, dual_group_config):
+        router = Router(dual_group_config)
+        for g in router._model_map["test-model"]:
+            g.cost_per_1k = 50.0
+        result = router.resolve("test-model", max_cost=1.0)
+        assert result is None
+
+
+class TestWeightedRoundRobin:
+    def test_fewer_failures_gets_higher_weight(self):
+        group = ProviderGroup(provider_slug="openai")
+        k1 = KeyState(api_key="key-1", fails=0)
+        k2 = KeyState(api_key="key-2", fails=10)
+        group.keys = [k1, k2]
+
+        # With weight formula 1/(1+fails*0.1): k1=1.0, k2=0.5
+        # k1 should be chosen ~2x more often
+        counts = {"key-1": 0, "key-2": 0}
+        for _ in range(1000):
+            w1 = 1.0 / (1.0 + k1.fails * 0.1)
+            w2 = 1.0 / (1.0 + k2.fails * 0.1)
+            import random as _r
+            chosen = _r.choices(["key-1", "key-2"], weights=[w1, w2], k=1)[0]
+            counts[chosen] += 1
+        assert counts["key-1"] > counts["key-2"]
+
+    def test_resolve_returns_key_with_fewer_fails_more_often(self, multi_key_config):
+        router = Router(multi_key_config)
+        result = router.resolve("test-model")
+        group, first_key, _ = result
+        # Give the first key many failures
+        for _ in range(20):
+            router.record_failure(group, first_key, 429)
+
+        counts = {first_key.api_key: 0}
+        other_key = [k for k in group.keys if k is not first_key][0]
+        counts[other_key.api_key] = 0
+
+        # Resolve many times — the low-fail key should dominate
+        for _ in range(200):
+            r = router.resolve("test-model")
+            if r is not None:
+                counts[r[1].api_key] += 1
+
+        assert counts[other_key.api_key] > counts[first_key.api_key]

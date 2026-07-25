@@ -25,6 +25,7 @@ async def get_teams() -> list[dict[str, Any]]:
         cursor = await db.execute(
             """SELECT id, name, description, is_active, created_at,
                       rpm_limit, rpd_limit, tpm_limit, tpd_limit,
+                      ash_limit, asd_limit,
                       monthly_budget_usd, model_allowlist
                FROM teams ORDER BY created_at DESC"""
         )
@@ -37,6 +38,7 @@ async def get_team(team_id: int) -> dict[str, Any] | None:
         cursor = await db.execute(
             """SELECT id, name, description, is_active, created_at,
                       rpm_limit, rpd_limit, tpm_limit, tpd_limit,
+                      ash_limit, asd_limit,
                       monthly_budget_usd, model_allowlist
                FROM teams WHERE id = ?""",
             (team_id,),
@@ -52,9 +54,12 @@ async def update_team_limits(team_id: int, limits: dict[str, Any]) -> bool:
                rpm_limit = COALESCE(?, rpm_limit),
                rpd_limit = COALESCE(?, rpd_limit),
                tpm_limit = COALESCE(?, tpm_limit),
-               tpd_limit = COALESCE(?, tpd_limit)
+               tpd_limit = COALESCE(?, tpd_limit),
+               ash_limit = COALESCE(?, ash_limit),
+               asd_limit = COALESCE(?, asd_limit)
                WHERE id = ?""",
-            (limits.get("rpm"), limits.get("rpd"), limits.get("tpm"), limits.get("tpd"), team_id),
+            (limits.get("rpm"), limits.get("rpd"), limits.get("tpm"), limits.get("tpd"),
+             limits.get("ash"), limits.get("asd"), team_id),
         )
         await db.commit()
         return cursor.rowcount > 0
@@ -90,6 +95,7 @@ async def get_users(team_id: int | None = None) -> list[dict[str, Any]]:
             cursor = await db.execute(
                 """SELECT id, team_id, email, name, is_active, created_at,
                           rpm_limit, rpd_limit, tpm_limit, tpd_limit,
+                          ash_limit, asd_limit,
                           monthly_budget_usd, model_allowlist
                    FROM users WHERE team_id = ? ORDER BY created_at DESC""",
                 (team_id,),
@@ -98,6 +104,7 @@ async def get_users(team_id: int | None = None) -> list[dict[str, Any]]:
             cursor = await db.execute(
                 """SELECT id, team_id, email, name, is_active, created_at,
                           rpm_limit, rpd_limit, tpm_limit, tpd_limit,
+                          ash_limit, asd_limit,
                           monthly_budget_usd, model_allowlist
                    FROM users ORDER BY created_at DESC"""
             )
@@ -110,6 +117,7 @@ async def get_user(user_id: int) -> dict[str, Any] | None:
         cursor = await db.execute(
             """SELECT id, team_id, email, name, is_active, created_at,
                       rpm_limit, rpd_limit, tpm_limit, tpd_limit,
+                      ash_limit, asd_limit,
                       monthly_budget_usd, model_allowlist
                FROM users WHERE id = ?""",
             (user_id,),
@@ -125,9 +133,12 @@ async def update_user_limits(user_id: int, limits: dict[str, Any]) -> bool:
                rpm_limit = COALESCE(?, rpm_limit),
                rpd_limit = COALESCE(?, rpd_limit),
                tpm_limit = COALESCE(?, tpm_limit),
-               tpd_limit = COALESCE(?, tpd_limit)
+               tpd_limit = COALESCE(?, tpd_limit),
+               ash_limit = COALESCE(?, ash_limit),
+               asd_limit = COALESCE(?, asd_limit)
                WHERE id = ?""",
-            (limits.get("rpm"), limits.get("rpd"), limits.get("tpm"), limits.get("tpd"), user_id),
+            (limits.get("rpm"), limits.get("rpd"), limits.get("tpm"), limits.get("tpd"),
+             limits.get("ash"), limits.get("asd"), user_id),
         )
         await db.commit()
         return cursor.rowcount > 0
@@ -294,3 +305,39 @@ async def deactivate_team(team_id: int) -> bool:
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def get_model_chain(team_id: int) -> list[str] | None:
+    """Get the model chain for a team. Returns None if no chain set."""
+    async with get_db() as db:
+        cursor = await db.execute("SELECT model_chain FROM teams WHERE id = ?", (team_id,))
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return json.loads(row[0])
+        return None
+
+
+async def set_model_chain(team_id: int, model_chain: list[str]) -> None:
+    """Set the model chain for a team (replaces entire array)."""
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE teams SET model_chain = ? WHERE id = ?",
+            (json.dumps(model_chain), team_id),
+        )
+        await db.commit()
+
+
+async def get_chain_rewrites_response(team_id: int) -> str | None:
+    async with get_db() as db:
+        cursor = await db.execute("SELECT chain_rewrites_response FROM teams WHERE id = ?", (team_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_chain_rewrites_response(team_id: int, text: str | None) -> None:
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE teams SET chain_rewrites_response = ? WHERE id = ?",
+            (text, team_id),
+        )
+        await db.commit()

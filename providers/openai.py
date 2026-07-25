@@ -78,3 +78,32 @@ class OpenAIAdapter(BaseAdapter):
     async def proxy_tts(self, body_bytes: bytes, model_string: str) -> httpx.Response:
         url = f"{self._base_url()}/audio/speech"
         return await self.client.post(url, content=body_bytes, headers=self._headers())
+
+    async def probe_capabilities(self, model: str) -> dict:
+        """Send minimal request to detect model capabilities."""
+        caps = {"supports_tools": False, "supports_vision": False, "supports_json": False}
+        try:
+            probe_body = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 1,
+                "tools": [{"type": "function", "function": {"name": "test", "parameters": {"type": "object", "properties": {}}}}],
+                "response_format": {"type": "json_object"},
+            })
+            resp = await self.client.post(
+                f"{self._base_url()}/chat/completions",
+                content=probe_body,
+                headers=self._headers(),
+            )
+            if resp.status_code == 200:
+                caps["supports_tools"] = True
+                caps["supports_json"] = True
+            elif resp.status_code == 400:
+                text = resp.text.lower()
+                if "tools" in text or "function" in text:
+                    caps["supports_tools"] = False
+                if "response_format" in text:
+                    caps["supports_json"] = False
+        except Exception:
+            pass
+        return caps

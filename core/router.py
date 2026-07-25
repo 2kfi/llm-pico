@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import random
+import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -58,6 +60,29 @@ class ProviderGroup:
     circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
     api_base: str | None = None
     next_key_index: int = 0
+    health_score: float = 1.0
+    total_requests: int = 0
+    error_count: int = 0
+    cost_per_1k: float = 0.0
+    latency_p50: float = 0.0
+    latency_p95: float = 0.0
+    latency_samples: list[float] = field(default_factory=list)
+
+    def update_health(self) -> None:
+        # ponytail: simple composite score, swap factors for better signals as needed
+        total = max(1, self.total_requests)
+        availability = 1.0 - (self.error_count / total)
+        error_factor = 1.0 / max(0.01, self.error_count / total + 0.01)
+        self.health_score = min(1.0, availability * min(1.0, error_factor))
+
+    def record_latency(self, ms: float) -> None:
+        self.latency_samples.append(ms)
+        # ponytail: keep last 100, no need for a ring buffer
+        if len(self.latency_samples) > 100:
+            self.latency_samples = self.latency_samples[-100:]
+        s = sorted(self.latency_samples)
+        self.latency_p50 = statistics.median(s)
+        self.latency_p95 = s[int(len(s) * 0.95)] if len(s) >= 2 else s[0]
 
 
 class Router:
@@ -65,6 +90,8 @@ class Router:
         self._model_map: dict[str, list[ProviderGroup]] = {}
         self._model_entries: dict[str, ModelEntry] = {}
         self._settings = config.router_settings
+        self._model_failures: dict[str, int] = {}  # model_name -> consecutive failures
+        self._model_cooldown: dict[str, float] = {}  # model_name -> cooldown expiry timestamp
         self._build_index(config)
 
     def _build_index(self, config: Config) -> None:
@@ -112,36 +139,65 @@ class Router:
     def get_model_names(self) -> list[str]:
         return list(self._model_map.keys())
 
-    def resolve(self, model_name: str) -> tuple[ProviderGroup, KeyState, ModelEntry] | None:
+    def _record_model_failure(self, model_name: str) -> None:
+        """Track consecutive failures per model. After 2 failures, cooldown for 60s."""
+        self._model_failures[model_name] = self._model_failures.get(model_name, 0) + 1
+        if self._model_failures[model_name] >= 2:
+            self._model_cooldown[model_name] = time.time() + 60
+            _log.warning("model %s cooled down for 60s after %d failures", model_name, self._model_failures[model_name])
+
+    def _is_model_cooling_down(self, model_name: str) -> bool:
+        """Check if a model is in cooldown period."""
+        expiry = self._model_cooldown.get(model_name, 0)
+        if expiry and time.time() < expiry:
+            return True
+        if expiry and time.time() >= expiry:
+            # Cooldown expired — reset failure count
+            self._model_failures.pop(model_name, None)
+            self._model_cooldown.pop(model_name, None)
+        return False
+
+    def resolve(self, model_name: str, max_cost: float | None = None) -> tuple[ProviderGroup, KeyState, ModelEntry] | None:
         groups = self._model_map.get(model_name)
         if not groups:
             return None
 
+        # Skip models in cooldown (failed 2x, pushed out for 60s)
+        if self._is_model_cooling_down(model_name):
+            return None
+
         now = time.monotonic()
-        last_group = None
         earliest_recovery = float("inf")
 
+        # ponytail: true round-robin per group, pick best group by health
+        group_picks: list[tuple[ProviderGroup, KeyState]] = []
         for group in groups:
             if not group.circuit_breaker.is_request_allowed():
                 continue
+            if max_cost is not None and group.cost_per_1k > max_cost:
+                continue
+            eligible = [k for k in group.keys if k.cooldown_until < now]
+            if not eligible:
+                # Track earliest recovery for 429 response
+                for k in group.keys:
+                    earliest_recovery = min(earliest_recovery, k.cooldown_until)
+                continue
+            # Round-robin within this group's keys
+            pick = eligible[group.next_key_index % len(eligible)]
+            group.next_key_index = (group.next_key_index + 1) % len(eligible)
+            group_picks.append((group, pick))
 
-            last_group = group
-
-            # Round-robin: try each key in order, skip cooled-down ones
-            for _ in range(len(group.keys)):
-                idx = group.next_key_index % len(group.keys)
-                group.next_key_index += 1
-                key = group.keys[idx]
-                if key.cooldown_until < now:
-                    entry = self._model_entries.get(model_name)
-                    if entry is None:
-                        return None
-                    return group, key, entry
-                # Track earliest recovery for Retry-After
-                earliest_recovery = min(earliest_recovery, key.cooldown_until)
+        if group_picks:
+            # Weighted random pick proportional to health_score
+            weights = [max(0.01, g.health_score) for g, _ in group_picks]
+            chosen_group, chosen_key = random.choices(group_picks, weights=weights, k=1)[0]
+            entry = self._model_entries.get(model_name)
+            if entry is None:
+                return None
+            return chosen_group, chosen_key, entry
 
         # All keys exhausted — raise 429 with Retry-After
-        if last_group and earliest_recovery < float("inf"):
+        if groups and earliest_recovery < float("inf"):
             retry_after = max(1, int(earliest_recovery - now))
             from fastapi import HTTPException
             raise HTTPException(
@@ -160,6 +216,8 @@ class Router:
 
     def record_failure(self, provider_group: ProviderGroup, key_state: KeyState, status_code: int) -> None:
         now = time.monotonic()
+        provider_group.total_requests += 1
+        provider_group.error_count += 1
 
         if status_code == 429:
             # Progressive cooldown: 10s for first 3 fails, then 30s
@@ -176,7 +234,57 @@ class Router:
         elif 500 <= status_code < 600:
             provider_group.circuit_breaker.record_failure()
 
+        provider_group.update_health()
+
+    async def resolve_with_fallbacks(self, model_name: str) -> tuple[ProviderGroup, KeyState, ModelEntry, str] | None:
+        """Try resolve, then fallbacks, then failover_model, then alias resolution."""
+        result = self.resolve(model_name)
+        if result:
+            return (*result, model_name)
+
+        entry = self._model_entries.get(model_name)
+
+        # Try configured fallback chain
+        if entry:
+            fallbacks = entry.fallbacks or []
+            # Also include legacy failover_model as lowest-priority fallback
+            if entry.failover_model:
+                fallbacks = fallbacks + [{"model": entry.failover_model, "priority": 99}]
+            for fb in sorted(fallbacks, key=lambda f: f.get("priority", 0)):
+                fb_model = fb.get("model", "")
+                result = self.resolve(fb_model)
+                if result:
+                    _log.info("fallback %s → %s", model_name, fb_model)
+                    return (*result, fb_model)
+
+        # Try alias resolution
+        from core.aliases import resolve_alias
+        resolved = await resolve_alias(model_name, self.get_model_names())
+        if resolved and resolved != model_name:
+            result = self.resolve(resolved)
+            if result:
+                _log.info("alias %s → %s", model_name, resolved)
+                return (*result, resolved)
+
+        return None
+
+    def resolve_chain(self, model_chain: list[str]) -> tuple[ProviderGroup, KeyState, ModelEntry, str, int, list[str]] | None:
+        """Walk an ordered model chain, return first success.
+
+        Returns: (group, key, entry, resolved_model_name, hops, models_tried) or None
+        """
+        tried: list[str] = []
+        for model_name in model_chain:
+            tried.append(model_name)
+            result = self.resolve(model_name)
+            if result is not None:
+                group, key, entry = result
+                return group, key, entry, model_name, len(tried) - 1, tried
+        return None
+
     def record_success(self, provider_group: ProviderGroup) -> None:
+        provider_group.total_requests += 1
+        provider_group.update_health()
         provider_group.circuit_breaker.record_success()
         for key in provider_group.keys:
             key.fails = 0

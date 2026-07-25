@@ -378,12 +378,11 @@ async def test_usage_without_auth(client):
 
 @pytest.mark.asyncio
 async def test_config_reload(client):
-    with patch("api.server._is_draining", False), \
-         patch("api.server._wait_for_drain", new_callable=AsyncMock, return_value=True), \
-         patch("os.execve") as mock_exec:
-        resp = await client.post("/admin/config/reload", headers=_auth())
-        assert resp.status_code == 200
-        mock_exec.assert_called_once()
+    resp = await client.post("/admin/config/reload", headers=_auth())
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["reloaded"] is True
+    assert "models" in data
 
 
 # ---------------------------------------------------------------------------
@@ -433,3 +432,25 @@ async def test_set_key_models(client):
     list_resp = await client.get("/admin/keys", headers=_auth())
     key = [k for k in list_resp.json()["keys"] if k["key_prefix"] == prefix][0]
     assert key["model_allowlist"] == ["gpt-4", "claude-3"]
+
+
+@pytest.mark.asyncio
+async def test_logs_stream_token_auth(client):
+    # 1. Try to fetch stream-token without auth
+    resp = await client.post("/admin/logs/stream-token", headers=_no_auth())
+    assert resp.status_code == 401
+
+    # 2. Fetch stream-token with correct master key
+    resp = await client.post("/admin/logs/stream-token", headers=_auth())
+    assert resp.status_code == 200
+    token = resp.json()["stream_token"]
+    assert token is not None
+
+    # 3. Request stream logs without token -> fails with 401
+    resp = await client.get("/admin/logs/stream")
+    assert resp.status_code == 401
+
+    # 4. Request stream logs with correct token
+    async with client.stream("GET", f"/admin/logs/stream?token={token}") as response:
+        assert response.status_code == 200
+

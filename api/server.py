@@ -4,17 +4,18 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 
-from providers import get_adapter
+from fastapi.responses import RedirectResponse
+
+from providers import get_adapter, load_custom_providers
 from providers.base import BaseAdapter, close_all_clients
 from providers.openai import OpenAIAdapter
 from api.admin import router as admin_router
@@ -22,9 +23,8 @@ from core.auth import (
     check_model_access,
     hash_key,
     prefix_from_key,
-    require_api_key,
-    seed_users,
 )
+from api.dependencies import require_api_key
 from core.cache import get_cached, set_cached
 from core.config import Config
 from core.db import close_db, init_db, prune_logs
@@ -33,7 +33,10 @@ from core.placeholder import router as placeholder_router
 from core.ratelimit import get_limiter
 from core.router import Router
 from core.teams import check_user_budget
-from core.usage import compute_cost, log_usage
+from core.streaming import parse_stream_usage
+from core.usage import check_key_budget, classify_error, compute_cost, log_usage
+from core.profiler import _latency_tracker
+from core.sampling import maybe_sample
 from website.routes import router as website_router
 
 _log = logging.getLogger("llm-pico.server")
@@ -95,16 +98,46 @@ async def _wait_for_drain(timeout: float = 120.0):
     return False
 
 
+
+async def _auto_probe_models(config: Config) -> None:
+    """Probe model capabilities on startup (best-effort, non-blocking)."""
+    from core.db import get_capabilities, save_capabilities
+    from datetime import datetime, timezone
+
+    await asyncio.sleep(2)  # let server finish startup
+    probed = 0
+    for entry in config.model_list:
+        try:
+            existing = await get_capabilities(entry.model_id)
+            if existing and existing.get("probed_at"):
+                continue  # already probed
+            adapter_cls = get_adapter(entry.model_params.provider)
+            if not adapter_cls:
+                continue
+            adapter = adapter_cls(entry.model_params)
+            caps = await adapter.probe_capabilities(entry.model_params.model)
+            caps["probed_at"] = datetime.now(timezone.utc).isoformat()
+            await save_capabilities(entry.model_id, caps)
+            probed += 1
+        except Exception:
+            _log.debug("auto-probe skipped %s", entry.model_name)
+    if probed:
+        _log.info("auto-probed %d model capabilities", probed)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     s = app.state
     config: Config = s.config
     db_path: str = s.db_path
-    users: list[dict] = getattr(s, "users", [])
     verbose: bool = getattr(s, "verbose", False)
 
     await init_db(db_path)
-    await seed_users(users)
+
+    from core.auth import init_audit_log
+    init_audit_log(db_path)
+
+    load_custom_providers()
 
     router = Router(config)
     s.router = router
@@ -112,6 +145,10 @@ async def lifespan(app: FastAPI):
     limiter = get_limiter()
     limiter.start()
     s.limiter = limiter
+
+    from core.degradation import DegradationManager, DegradationMode
+    degradation = DegradationManager(DegradationMode.NORMAL)
+    s.degradation = degradation
 
     _log.info("llm-pico ready: %d models, %d adapters", len(config.model_list), len(router.get_model_names()))
 
@@ -129,9 +166,15 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(3600)
 
     pruner_task = asyncio.create_task(_log_pruner(config))
+    probe_task = asyncio.create_task(_auto_probe_models(config))
 
     yield
 
+    probe_task.cancel()
+    try:
+        await probe_task
+    except asyncio.CancelledError:
+        pass
     pruner_task.cancel()
     try:
         await pruner_task
@@ -173,6 +216,18 @@ async def _proxy_request(
     request_id = os.urandom(8).hex()
     await _track_request(request_id)
 
+    trace_spans: list[dict[str, Any]] = []
+    trace_t0 = time.monotonic_ns()
+
+    def _add_trace(label: str, model: str | None = None, provider: str | None = None,
+                   status: str = "ok", detail: str | None = None, end_ns: int | None = None):
+        now = end_ns or time.monotonic_ns()
+        trace_spans.append({
+            "label": label, "start_ms": trace_t0 // 1_000_000,
+            "end_ms": now // 1_000_000, "model_name": model, "provider": provider,
+            "status": status, "detail": detail,
+        })
+
     try:
         config: Config = getattr(app_state, "config")
         router: Router = getattr(app_state, "router")
@@ -211,6 +266,7 @@ async def _proxy_request(
             provider_group, key_state, model_entry = result
             slug = provider_group.provider_slug
             adapter_cls = get_adapter(slug) or OpenAIAdapter
+            _add_trace(f"resolve:{model_name}", model=model_name, provider=slug)
 
             # ---- capability checks (same outcome every attempt, but need model_entry) ----
             if route_type == "embeddings" and not model_entry.embeddings:
@@ -264,6 +320,22 @@ async def _proxy_request(
                     raise HTTPException(status_code=429, detail={
                         "error": {
                             "message": budget_err,
+                            "type": "budget_exceeded",
+                            "code": 429,
+                        }
+                    })
+
+            # ---- Per-key budget check (only on first attempt) ----
+            if attempt == 0 and user_key:
+                est_cost = compute_cost(
+                    prompt_tokens, max_tokens,
+                    model_entry.cost_per_1m_input, model_entry.cost_per_1m_output,
+                )
+                key_err = await check_key_budget(user_key["key_hash"], est_cost)
+                if key_err:
+                    raise HTTPException(status_code=429, detail={
+                        "error": {
+                            "message": key_err,
                             "type": "budget_exceeded",
                             "code": 429,
                         }
@@ -351,6 +423,7 @@ async def _proxy_request(
                     )
 
                 router.record_success(provider_group)
+                _add_trace(f"proxy:{model_name}", model=model_name, provider=slug, end_ns=time.monotonic_ns())
 
                 if model_entry.can_cache and not stream:
                     resp_body = response.body if hasattr(response, 'body') else None
@@ -363,28 +436,100 @@ async def _proxy_request(
                 if e.status_code in (400, 401, 403, 404, 501):
                     raise
                 router.record_failure(provider_group, key_state, e.status_code)
+                _add_trace(f"error:{model_name}", model=model_name, provider=slug, status="fail",
+                          detail=str(e.status_code), end_ns=time.monotonic_ns())
                 last_error = e
             except httpx.HTTPError as e:
                 router.record_failure(provider_group, key_state, 502)
+                _add_trace(f"error:{model_name}", model=model_name, provider=slug, status="fail",
+                          detail=str(e)[:200], end_ns=time.monotonic_ns())
                 last_error = HTTPException(status_code=502, detail={
                     "error": {"message": f"Upstream request failed: {e}", "type": "upstream_error", "code": 502}
                 })
             finally:
                 await adapter.close()
 
-        # All retries exhausted — try failover model (one level, no chain)
-        if not _is_failover and model_entry and model_entry.failover_model:
-            return await _proxy_request(
-                body_bytes=body_bytes,
-                model_name=model_entry.failover_model,
-                stream=stream,
-                max_tokens=max_tokens,
-                user_key=user_key,
-                master_key=master_key,
-                app_state=app_state,
-                route_type=route_type,
-                _is_failover=True,
-            )
+        # Model failed all retries — record failure for cooldown tracking
+        if last_error and hasattr(router, '_record_model_failure'):
+            router._record_model_failure(model_name)
+
+        # All retries exhausted — try team model chain, then legacy single failover
+        if not _is_failover:
+            # Try team model chain first
+            chain_model_name = None
+            chain_tried: list[str] = []
+            if user_key and user_key.get("user_id"):
+                try:
+                    from core.teams import get_user, get_model_chain
+                    user = await get_user(user_key["user_id"])
+                    if user and user.get("team_id"):
+                        chain = await get_model_chain(user["team_id"])
+                        if chain and model_name in chain:
+                            idx = chain.index(model_name)
+                            remaining = chain[idx + 1:]
+                        elif chain:
+                            remaining = chain
+                        else:
+                            remaining = []
+                        for m in remaining:
+                            chain_tried.append(m)
+                            try:
+                                chain_result = router.resolve(m)
+                                if chain_result:
+                                    chain_model_name = m
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+
+            if chain_model_name:
+                if reservation and limiter and user_key:
+                    await limiter.reconcile(
+                        key_hash=user_key["key_hash"],
+                        model_name=model_name,
+                        limits=limits,
+                        actual_tokens=0,
+                        reserved_tokens=reservation,
+                    )
+                resp = await _proxy_request(
+                    body_bytes=body_bytes,
+                    model_name=chain_model_name,
+                    stream=stream,
+                    max_tokens=max_tokens,
+                    user_key=user_key,
+                    master_key=master_key,
+                    app_state=app_state,
+                    route_type=route_type,
+                    _is_failover=True,
+                )
+                if hasattr(resp, "headers"):
+                    resp.headers["X-Actual-Model"] = chain_model_name
+                    resp.headers["X-Chain-Hops"] = str(len(chain_tried))
+                    resp.headers["X-Chain-Tried"] = ",".join(chain_tried)
+                return resp
+
+            # Legacy single failover
+            if model_entry and model_entry.failover_model:
+                if reservation and limiter and user_key:
+                    await limiter.reconcile(
+                        key_hash=user_key["key_hash"],
+                        model_name=model_name,
+                        limits=limits,
+                        actual_tokens=0,
+                        reserved_tokens=reservation,
+                    )
+                return await _proxy_request(
+                    body_bytes=body_bytes,
+                    model_name=model_entry.failover_model,
+                    stream=stream,
+                    max_tokens=max_tokens,
+                    user_key=user_key,
+                    master_key=master_key,
+                    app_state=app_state,
+                    route_type=route_type,
+                    _is_failover=True,
+                )
         if last_error:
             raise last_error
         raise HTTPException(status_code=502, detail={
@@ -392,6 +537,16 @@ async def _proxy_request(
         })
 
     finally:
+        # Persist trace spans
+        if trace_spans:
+            try:
+                from core.db import log_trace
+                for i, span in enumerate(trace_spans):
+                    await log_trace(request_id, i, span["label"], span["start_ms"], span["end_ms"],
+                                   span.get("model_name"), span.get("provider"), span.get("status", "ok"),
+                                   span.get("detail"))
+            except Exception:
+                pass
         await _untrack_request(request_id)
 
 
@@ -436,49 +591,24 @@ async def _handle_streaming(
     actual_prompt_tokens = 0
     actual_completion_tokens = 0
 
-    has_custom_stream = type(adapter).proxy_stream is not BaseAdapter.proxy_stream
-
-    if has_custom_stream:
-        stream_chunks, stream_usage = await adapter.proxy_stream(upstream)
-
-        async def generate():
-            nonlocal actual_tokens, actual_prompt_tokens, actual_completion_tokens
-            for chunk in stream_chunks:
-                if b"data: " in chunk and b"usage" in chunk:
-                    try:
-                        text = chunk.decode("utf-8", errors="replace")
-                        for line in text.split("\n"):
-                            if line.startswith("data: ") and "[DONE]" not in line:
-                                data = json.loads(line[6:])
-                                if "usage" in data:
-                                    actual_tokens = data["usage"].get("total_tokens", 0)
-                                    actual_prompt_tokens = data["usage"].get("prompt_tokens", 0)
-                                    actual_completion_tokens = data["usage"].get("completion_tokens", 0)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass
+    async def generate():
+        nonlocal actual_tokens, actual_prompt_tokens, actual_completion_tokens
+        try:
+            async for chunk in adapter.proxy_stream(upstream):
+                usage = await parse_stream_usage(chunk)
+                if usage:
+                    actual_tokens = usage.get("total_tokens", 0)
+                    actual_prompt_tokens = usage.get("prompt_tokens", 0)
+                    actual_completion_tokens = usage.get("completion_tokens", 0)
                 yield chunk
-
-        if stream_usage:
-            actual_tokens = stream_usage.get("total_tokens", 0)
-            actual_prompt_tokens = stream_usage.get("prompt_tokens", 0)
-            actual_completion_tokens = stream_usage.get("completion_tokens", 0)
-    else:
-        async def generate():
-            nonlocal actual_tokens, actual_prompt_tokens, actual_completion_tokens
-            async for chunk in upstream.aiter_bytes():
-                if b"data: " in chunk and b"usage" in chunk:
-                    try:
-                        text = chunk.decode("utf-8", errors="replace")
-                        for line in text.split("\n"):
-                            if line.startswith("data: ") and "[DONE]" not in line:
-                                data = json.loads(line[6:])
-                                if "usage" in data:
-                                    actual_tokens = data["usage"].get("total_tokens", 0)
-                                    actual_prompt_tokens = data["usage"].get("prompt_tokens", 0)
-                                    actual_completion_tokens = data["usage"].get("completion_tokens", 0)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass
-                yield chunk
+            # proxy_stream sets _last_usage after iteration; use it as fallback
+            if actual_tokens == 0 and hasattr(adapter, "_last_usage") and adapter._last_usage:
+                actual_tokens = adapter._last_usage.get("total_tokens", 0)
+                actual_prompt_tokens = adapter._last_usage.get("prompt_tokens", 0)
+                actual_completion_tokens = adapter._last_usage.get("completion_tokens", 0)
+        except (GeneratorExit, asyncio.CancelledError):
+            await upstream.aclose()
+            raise
 
     response = StreamingResponse(generate(), media_type="text/event-stream")
     response.headers["X-Request-Id"] = request_id
@@ -508,6 +638,8 @@ async def _handle_streaming(
             cost = compute_cost(pt, ct, cost_in, cost_out)
             if not cost and actual_tokens:
                 cost = compute_cost(actual_tokens, 0, cost_in, cost_out)
+
+            _latency_tracker.record(model_name, provider_slug, latency)
 
             await log_usage(
                 key_hash=user_key["key_hash"] if user_key else master_key,
@@ -605,6 +737,12 @@ async def _handle_buffered(
 
     cost = compute_cost(pt, ct, cost_in, cost_out)
 
+    _latency_tracker.record(model_name, provider_slug, latency)
+
+    prompt_str = body_bytes.decode(errors="replace")[:200] if route_type == "chat" else ""
+    response_str = body.decode(errors="replace")[:200] if upstream.status_code == 200 else ""
+    asyncio.create_task(maybe_sample(request_id, model_name, prompt_str, response_str))
+
     await log_usage(
         key_hash=user_key["key_hash"] if user_key else master_key,
         key_prefix=user_key["key_prefix"] if user_key else "master",
@@ -686,6 +824,18 @@ async def _route_chat_completions(request: Request, user_key: dict = Depends(req
             raise HTTPException(status_code=403, detail={
                 "error": {"message": f"Model '{model_name}' not allowed for this key", "type": "forbidden", "code": 403}
             })
+
+    degradation = getattr(app_state, "degradation", None)
+    if degradation and degradation.mode.value != "normal":
+        return await degradation.handle(model_name, lambda: _proxy_request(
+            body_bytes=body_bytes,
+            model_name=model_name,
+            stream=stream,
+            max_tokens=max_tokens,
+            user_key=user_key if user_key.get("role") == "user" else None,
+            master_key=master_key,
+            app_state=app_state,
+        ))
 
     return await _proxy_request(
         body_bytes=body_bytes,
@@ -926,14 +1076,33 @@ async def _proxy_audio_request(
                 "cost_usd": cost,
             })
 
+            if user_key:
+                await limiter.reconcile(
+                    key_hash=user_key["key_hash"],
+                    model_name=model_name,
+                    limits=limits,
+                    actual_tokens=1,
+                    reserved_tokens=1,
+                )
+
             resp = Response(content=body, media_type="application/json")
             resp.headers["X-Request-Id"] = request_id
             for k, v in rl_headers.items():
                 resp.headers[k] = v
             return resp
 
-        # All retries exhausted — try failover model (one level, no chain)
+        # All retries exhausted — record failure, release reservation then try failover
+        if hasattr(router, '_record_model_failure'):
+            router._record_model_failure(model_name)
         if not _is_failover and model_entry and model_entry.failover_model:
+            if user_key and limiter:
+                await limiter.reconcile(
+                    key_hash=user_key["key_hash"],
+                    model_name=model_name,
+                    limits=limits,
+                    actual_tokens=0,
+                    reserved_tokens=1,
+                )
             return await _proxy_audio_request(
                 audio_bytes=audio_bytes,
                 filename=filename,
@@ -1192,7 +1361,17 @@ async def _proxy_audio_speech(
                 resp.headers[k] = v
             return resp
 
+        if hasattr(router, '_record_model_failure'):
+            router._record_model_failure(model_name)
         if not _is_failover and model_entry and model_entry.failover_model:
+            if user_key and limiter:
+                await limiter.reconcile(
+                    key_hash=user_key["key_hash"],
+                    model_name=model_name,
+                    limits=limits,
+                    actual_tokens=0,
+                    reserved_tokens=1,
+                )
             return await _proxy_audio_speech(
                 body_bytes=body_bytes,
                 model_name=model_entry.failover_model,
@@ -1316,6 +1495,10 @@ def create_app(app_state: dict[str, Any]) -> FastAPI:
     app.include_router(admin_router, prefix="/admin")
     app.include_router(website_router, prefix="/admin")
     app.include_router(placeholder_router)
+
+    @app.get("/")
+    async def root():
+        return RedirectResponse("/admin/dashboard")
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(request: Request, exc: HTTPException):

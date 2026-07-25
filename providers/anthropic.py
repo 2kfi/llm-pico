@@ -98,7 +98,7 @@ class AnthropicAdapter(BaseAdapter):
         return {
             "id": data.get("id", f"msg_{uuid.uuid4().hex}"),
             "object": "chat.completion",
-            "created": int(uuid.uuid4().time),
+            "created": int(time.time()),
             "model": model,
             "choices": [{
                 "index": 0,
@@ -211,7 +211,7 @@ class AnthropicAdapter(BaseAdapter):
                     sse_data = {
                         "id": data.get("id", ""),
                         "object": "chat.completion.chunk",
-                        "created": int(uuid.uuid4().time),
+                        "created": int(time.time()),
                         "model": data.get("model", ""),
                         "choices": [{
                             "index": data.get("index", 0),

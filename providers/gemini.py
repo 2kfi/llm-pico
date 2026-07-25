@@ -129,7 +129,7 @@ class GeminiAdapter(BaseAdapter):
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
-            "created": int(uuid.uuid4().time),
+            "created": int(time.time()),
             "model": model,
             "choices": choices,
             "usage": {
@@ -260,7 +260,7 @@ class GeminiAdapter(BaseAdapter):
                 sse_data = {
                     "id": f"chatcmpl-{uuid.uuid4().hex}",
                     "object": "chat.completion.chunk",
-                    "created": int(uuid.uuid4().time),
+                    "created": int(time.time()),
                     "model": cand.get("model", ""),
                     "choices": [{
                         "index": cand.get("index", 0),
