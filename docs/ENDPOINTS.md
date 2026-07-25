@@ -82,6 +82,7 @@ OpenAI-compatible chat completions. Supports streaming and buffered responses.
 | 500 | Internal server error |
 | 501 | Adapter capability not implemented |
 | 502 | Upstream provider error |
+| 503 | Service degraded (degradation mode active) |
 | 504 | Upstream timeout |
 
 ### POST /v1/completions
@@ -270,19 +271,41 @@ All errors follow OpenAI's format:
 ## Request Flow
 
 ```
-Client → Auth → Rate Limit Check → Router → Adapter → Upstream API
-                         ↓
-                  Budget Check (if user has budget)
-                         ↓
-                  Cache Check (if can_cache=true)
+Client → Auth → IP Check → Rate Limit → Degradation → Router → Adapter → Upstream API
+                    ↓               ↓              ↓
+             Budget Check    Token Reserve    Model Chain
 ```
 
-1. **Auth** — Validate Bearer token
-2. **Rate limit** — Check all windows atomically (user + model level)
-3. **Budget** — Check monthly spend against user budget
-4. **Cache** — Return cached response if available (non-streaming only)
-5. **Router** — Pick provider key via round-robin
-6. **Adapter** — Translate request format if needed
-7. **Forward** — Send to upstream API
-8. **Retry** — On 429/5xx, rotate key and retry (up to `num_retries`)
-9. **Failover** — If all retries exhausted, try `failover_model` if configured
+1. **Auth** — Validate Bearer token (master key or user key)
+2. **IP check** — Reject if client IP not in key's `ip_allowlist`
+3. **Rate limit** — Check all windows atomically (user + model level)
+4. **Budget** — Check monthly spend against user budget
+5. **Degradation** — If mode is `reject`, return 503; if `queue`, wait; if `normal`, continue
+6. **Cache** — Return cached response if available (non-streaming only)
+7. **Router** — Pick provider key via weighted round-robin (health-score weighted)
+8. **Adapter** — Translate request format if needed
+9. **Forward** — Send to upstream API
+10. **Retry** — On 429/5xx, rotate key and retry (up to `num_retries`)
+11. **Failover** — If all retries exhausted, try `failover_model` if configured
+12. **Chain** — If `model_chain` is set, process additional models in sequence
+
+### Request Traces
+
+Every request records spans in the `request_traces` table (auth → rate limit → router → upstream). Use `GET /admin/traces/{request_id}` to view the waterfall for debugging latency.
+
+### Degradation Modes
+
+| Mode | Behavior |
+|------|----------|
+| `normal` | All requests processed |
+| `reject` | All requests return 503 immediately |
+| `queue` | Requests queued, processed when mode returns to normal |
+| `fallback_only` | Only failover models are used |
+
+### Weighted Round-Robin
+
+Keys are selected with probability proportional to their `health_score`. Healthier keys (fewer recent failures) are chosen more often. Cooldown keys are skipped.
+
+### Chain-of-LLMs
+
+When `model_chain` is configured on a team, requests pass through multiple models in sequence. Each model processes the output of the previous one. An optional `chain_rewrites_response` instruction rewrites the user prompt before the first model call.

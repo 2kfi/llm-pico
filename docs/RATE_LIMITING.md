@@ -106,6 +106,16 @@ For streaming responses:
 
 This ensures accurate token counting even when the actual usage differs from the estimate.
 
+## Token Budget Reservation
+
+For streaming responses, the proxy reserves tokens before the request is forwarded:
+
+1. **Reserve** `prompt_tokens + max_tokens` in `tpm`/`tpd` windows
+2. **Forward** the request to the upstream provider
+3. **Reconcile** after streaming completes — adjust `tpm`/`tpd` by the delta between estimated and actual tokens
+
+This prevents over-committing tokens while ensuring accurate billing. If `max_tokens` is not set, a default reservation of 4096 is used.
+
 ## Budget Tracking
 
 Per-user monthly budgets in USD:

@@ -19,15 +19,17 @@ llm-pico init
 
 The wizard walks you through:
 
-1. **Select providers** — checkbox from 10 built-in providers
+1. **Select providers** — checkbox from 10 built-in providers (OpenAI, Gemini, Anthropic, OpenRouter, OpenCode Zen, Groq, NVIDIA NIM, Cloudflare, Cohere, ZAI)
 2. **Enter API keys** — one per selected provider
 3. **Fetch models** — live from each provider's API (with retry on failure)
 4. **Select models** — fuzzy search across all providers
 5. **Test models** (optional) — send a test request to verify keys work
-6. **Assign capabilities** — embeddings, images, STT, TTS (auto-detected from model names)
+6. **Assign capabilities** — embeddings, images, STT, TTS (auto-detected from model names + live probing)
 7. **Create first user** — with rate limits and model allowlist
 8. **Docker option** — generate `docker-compose.yml`
 9. **Generate files** — writes `config.yaml`, `users.yaml`, `keys.yaml`, `.env`
+
+The dashboard at `http://localhost:4000/admin/logs` shows a live log stream and routing graph.
 
 ## 3. Add Backup Keys (Optional)
 
@@ -101,4 +103,5 @@ After `llm-pico init`, you'll have:
 - [Configuration](CONFIG.md) — understand every config option
 - [Key Management](KEYS.md) — add backup keys, understand rotation
 - [API Endpoints](ENDPOINTS.md) — full endpoint reference
-- [Deployment](DEPLOYMENT.md) — Docker and production setup
+- [Deployment](DEPLOYMENT.md) — Docker, multi-process, and production setup
+- [Providers](PROVIDERS.md) — custom provider SDK, model capabilities

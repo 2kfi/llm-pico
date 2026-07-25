@@ -143,6 +143,61 @@ GEMINI_API_KEY:
 - Lists can have any length (1 = no rotation, 2+ = rotation)
 - The proxy reads `keys.yaml` at startup (not hot-reloaded)
 
+## Team & User Hierarchy
+
+Keys can be assigned to users, who belong to teams. Limits and allowlists merge across all three levels:
+
+```
+Team → User → Key → Effective
+```
+
+**Limits:** `min()` across all non-null values (most restrictive wins)
+
+```
+Team:  rpm=200
+User:  rpm=100
+Key:   rpm=50
+Final: rpm=50
+```
+
+**Allowlists:** `intersection()` of all non-null lists
+
+```
+Team:  [gpt-4, claude-3, gemini]
+User:  [gpt-4, gemini]
+Key:   [gpt-4, claude-3]
+Final: [gpt-4]
+```
+
+Set any level to `null` to mean "unrestricted" (doesn't constrain).
+
+## Budget Tracking
+
+Per-user and per-team monthly budgets in USD:
+
+```yaml
+# Via admin API
+PUT /admin/users/{user_id}/budget
+{"monthly_budget_usd": 100.00}
+
+PUT /admin/teams/{team_id}/limits
+{"monthly_budget_usd": 500.00}
+```
+
+When `current_spend + estimated_cost > budget`, the request is rejected with 429.
+
+## IP Allowlist
+
+Keys can be restricted to specific IPs or CIDR ranges:
+
+```json
+{
+  "ip_allowlist": ["192.168.1.0/24", "10.0.0.1"]
+}
+```
+
+Requests from IPs not in the list are rejected with 403. Set to `null` or `[]` to allow all.
+
 ## Migration from `${VAR}` Syntax
 
 Old configs using `${OPENAI_API_KEY}` still work (resolved from `.env`).

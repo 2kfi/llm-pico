@@ -65,6 +65,26 @@ model_list:
       api_base: "https://my-provider.com/v1"
 ```
 
+## Custom Provider SDK
+
+Drop Python files into `providers/custom/` to register new adapters at startup. Each file should call `register("provider_slug")` to attach its adapter class.
+
+```python
+# providers/custom/my_provider.py
+from providers.base import BaseAdapter
+from providers import register
+
+@register("my_provider")
+class MyProvider(BaseAdapter):
+    def build_headers(self, api_key: str) -> dict:
+        return {"Authorization": f"Bearer {api_key}"}
+    def build_url(self, model: str, stream: bool) -> str:
+        return f"https://api.myprovider.com/v1/chat/completions"
+    # ... translate_request, translate_response, etc.
+```
+
+Any model in `config.yaml` with `model: my_provider/...` will route to this adapter. The proxy scans `providers/custom/` automatically at startup — no registration or restart needed.
+
 ## Provider-Specific Quirks
 
 ### OpenAI
@@ -100,7 +120,7 @@ model_list:
 
 ## Unsupported Provider Fallback
 
-Any unrecognized provider slug falls back to `OpenAIAdapter`. This means any OpenAI-compatible provider works out of the box:
+Any unrecognized provider slug falls back to the OpenAI-compatible passthrough adapter. This means any OpenAI-compatible provider works out of the box:
 
 ```yaml
 model_list:
@@ -111,7 +131,7 @@ model_list:
       api_base: "https://api.deepseek.com/v1"
 ```
 
-The request is forwarded as-is to the upstream API.
+The request is forwarded as-is to the upstream API. No adapter translation is applied.
 
 ## Model String Format
 
@@ -140,5 +160,21 @@ During `llm-pico init`, models are fetched live from each provider's `/v1/models
 3. If 404 → provider doesn't support model listing, skip
 4. If other error → retry once with fresh key
 5. If success → parse model list and present for selection
+6. On startup, providers are auto-probed in the background to warm health scores
 
 This ensures you only see models your keys actually have access to.
+
+## Model Capabilities
+
+During init and via `POST /admin/providers/probe`, the proxy probes each model for:
+
+| Capability | Check |
+|------------|-------|
+| `supports_tools` | Sends a tools-enabled request, checks if response includes tool calls |
+| `supports_vision` | Sends an image URL, checks for valid response |
+| `supports_json` | Sends `response_format: {type: "json_object"}` |
+| `supports_stream` | Sends a streaming request, checks for SSE chunks |
+| `max_context` | Extracted from provider's model metadata |
+| `max_output` | Extracted from provider's model metadata |
+
+Results are stored in `model_capabilities` and used to skip incompatible models at runtime.

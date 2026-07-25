@@ -70,6 +70,25 @@
 3. Check network connectivity
 4. Increase timeout in provider adapter (if custom)
 
+### "Service degraded" (503)
+
+**Cause:** The proxy is in `reject` degradation mode.
+
+**Fix:**
+1. Check current mode: `GET /admin/degradation`
+2. Reset to normal: `POST /admin/degradation {"mode": "normal"}`
+3. If queue mode, requests will process once mode returns to normal
+
+### "Chain model failed"
+
+**Cause:** A model in the `model_chain` returned an error.
+
+**Fix:**
+1. Check each model in the chain is available: `GET /admin/config/models`
+2. Verify each model has valid keys
+3. Check the trace for which model failed: `GET /admin/traces/{request_id}`
+4. Remove or replace the failing model from the chain
+
 ### "UNSET placeholder in api_base"
 
 **Cause:** Cloudflare provider is missing `CLOUDFLARE_ACCOUNT_ID`.
@@ -133,6 +152,18 @@ Or open the HTML dashboard:
 ```bash
 open http://localhost:4000/admin/logs
 ```
+
+## Request Traces
+
+Debug request latency with waterfall traces:
+
+```bash
+# After making a request, get the request ID from the X-Request-ID header
+curl http://localhost:4000/admin/traces/{request_id} \
+  -H "Authorization: Bearer sk-pico-master-..."
+```
+
+Each trace shows timing for auth → rate limit → router → upstream spans.
 
 ## Database Issues
 

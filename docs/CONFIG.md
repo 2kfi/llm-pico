@@ -18,12 +18,14 @@ model_list:           # Array of model definitions (required, >=1)
 | `db_path` | string \| null | `null` | Override SQLite database path. Default: `llm-pico.db` next to config. |
 | `usage_log_retention_days` | int | `30` | Auto-prune `usage_log` entries older than N days. |
 | `admin_log_retention_days` | int | `90` | Auto-prune `admin_log` entries older than N days. |
+| `degradation_mode` | string | `normal` | Global degradation mode: `normal`, `reject`, `queue`, `fallback_only`. Overridden per-request via admin API. |
 
 ```yaml
 general_settings:
   master_key: "sk-pico-master-abc123..."
   usage_log_retention_days: 30
   admin_log_retention_days: 90
+  degradation_mode: normal
 ```
 
 ## router_settings
@@ -76,6 +78,8 @@ Array of model definitions. **At least one entry required.**
 | `can_cache` | bool | `false` | Enable in-memory LRU response caching. |
 | `cost_per_1m_input` | float \| null | `null` | Cost per 1M input tokens (USD). Used for budget tracking. |
 | `cost_per_1m_output` | float \| null | `null` | Cost per 1M output tokens (USD). Used for budget tracking. |
+| `chain_budget_usd` | float \| null | `null` | Budget cap for chain-of-LLMs requests on this model. |
+| `chain_rewrites_response` | string \| null | `null` | Team-level instruction for rewriting the user prompt when `model_chain` is active. |
 
 ### model_params
 

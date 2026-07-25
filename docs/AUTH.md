@@ -193,3 +193,29 @@ Effective:    rpm=50 (most restrictive)
 - CORS allows all origins (configure reverse proxy for production)
 - Admin API requires master key (not user keys)
 - Config reload drains in-flight requests before restart
+
+## IP Allowlist
+
+Keys can be restricted to specific IPs or CIDR ranges via the `ip_allowlist` field:
+
+```bash
+# Set via admin API on a key
+PUT /admin/keys/{prefix}/limits
+{"ip_allowlist": ["192.168.1.0/24", "10.0.0.1"]}
+```
+
+Requests from IPs not in the list are rejected with 403. The check uses Python's `ipaddress` module for CIDR matching.
+
+Set to `null` or `[]` to allow all IPs (default).
+
+## HMAC Request Signing
+
+For webhook and callback endpoints, the proxy supports HMAC-SHA256 request signing:
+
+```python
+import hmac, hashlib
+signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+# Send as: X-Signature: sha256={signature}
+```
+
+The `verify_hmac_signature` function in `core/auth.py` validates signatures using constant-time comparison.

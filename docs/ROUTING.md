@@ -48,6 +48,22 @@ key = group.keys[idx]
 
 If the selected key is on cooldown, the next key is tried (up to all keys).
 
+## Weighted Round-Robin
+
+Keys are selected with probability proportional to their `health_score` (0.0–1.0). Healthier keys are chosen more often:
+
+```python
+weights = [ks.health_score for ks in group.keys if not ks.on_cooldown]
+key = random.choices(pool, weights=weights, k=1)[0]
+```
+
+The `health_score` is updated on each request:
+- Success → score trends toward 1.0
+- Failure → score drops (penalized more for 5xx than 429)
+- Cooldown keys are excluded entirely from the pool
+
+This gives better distribution than pure round-robin when keys have unequal reliability.
+
 ## Rate Limit Handling
 
 ### Progressive Cooldown
@@ -175,6 +191,44 @@ The proxy will:
 2. If all fail, try `claude-3` (single level, no chain)
 
 **Only one level of failover** — no recursive failover chains.
+
+## Chain-of-LLMs
+
+When `model_chain` is configured on a team, the proxy processes multiple models in sequence:
+
+```yaml
+# Via admin API: PUT /admin/teams/{id}/chain
+# {"model_chain": ["gpt-4", "claude-3"]}
+```
+
+**How it works:**
+
+1. If `chain_rewrites_response` is set, the user prompt is rewritten first
+2. The rewritten (or original) prompt is sent to the first model in the chain
+3. The first model's output becomes the input for the second model
+4. The final model's output is returned to the client
+
+This is useful for:
+- **Quality chains**: Use a fast model to draft, then a powerful model to refine
+- **Cost optimization**: Route simple queries to cheap models, complex ones to expensive ones
+- **Specialization**: Chain a code model with a reasoning model
+
+Chain budgets can be set per-model with `chain_budget_usd` in `model_list`.
+
+## Degradation Modes
+
+The proxy supports four degradation modes, configurable via `POST /admin/degradation`:
+
+| Mode | Behavior |
+|------|----------|
+| `normal` | All requests processed normally |
+| `reject` | All requests immediately return 503 |
+| `queue` | Requests are queued (FIFO) and processed when mode returns to `normal` |
+| `fallback_only` | Only failover models are used; primary models are skipped |
+
+Use `reject` during maintenance, `queue` for load shedding, and `fallback_only` when primary providers are degraded.
+
+The current mode is returned by `GET /admin/degradation`.
 
 ## Retry Logic
 

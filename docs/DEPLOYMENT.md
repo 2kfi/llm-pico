@@ -33,6 +33,24 @@ services:
     restart: unless-stopped
 ```
 
+### Multi-Process Workers
+
+For high concurrency, run multiple workers:
+
+```bash
+llm-pico --workers 4
+```
+
+Each worker runs its own uvicorn process. SQLite WAL mode handles concurrent writes across workers. Rate limit counters are per-process (daily windows are flushed to SQLite periodically).
+
+For Docker Compose with workers:
+
+```yaml
+services:
+  llm-pico:
+    command: ["--workers", "4"]
+```
+
 ```bash
 docker compose up -d
 ```
@@ -141,10 +159,17 @@ curl -X POST http://localhost:4000/admin/config/reload \
 |-------|---------|
 | `teams` | Team definitions |
 | `users` | User definitions |
-| `user_keys` | API key hashes and metadata |
+| `user_keys` | API key hashes, metadata, IP allowlists |
+| `api_key_scopes` | Per-key scope tags |
 | `usage_log` | Request usage tracking |
 | `rate_counters` | Daily rate limit counters |
 | `admin_log` | Admin audit log |
+| `settings` | Key-value config overrides |
+| `models` | Model registry (DB-backed config) |
+| `provider_keys` | Per-model provider keys |
+| `model_capabilities` | Probed model capabilities (tools, vision, etc.) |
+| `model_aliases` | Model name aliases |
+| `request_traces` | Per-request waterfall trace spans |
 
 ### Log Pruning
 

@@ -194,6 +194,40 @@ POST /admin/teams/{team_id}/users
 GET /admin/teams/{team_id}/users
 ```
 
+### Chain-of-LLMs
+
+```
+PUT /admin/teams/{team_id}/chain
+GET /admin/teams/{team_id}/chain
+```
+
+**Request:**
+
+```json
+{
+  "model_chain": ["gpt-4", "claude-3"]
+}
+```
+
+The `model_chain` is a list of model names tried in order during the request lifecycle (not failover — both models contribute to the response).
+
+### Chain Rewrites Response
+
+```
+PUT /admin/teams/{team_id}/chain/rewrites
+GET /admin/teams/{team_id}/chain/rewrites
+```
+
+**Request:**
+
+```json
+{
+  "text": "Rewrite the user's question into a better prompt for the first model in the chain."
+}
+```
+
+Set the team-level rewrite instruction for chain-of-LLMs. When a `model_chain` is active, the proxy rewrites the user prompt using this instruction before the first model call.
+
 ## User Management
 
 ### Get User
@@ -323,6 +357,151 @@ Gracefully drains in-flight requests, then restarts the process with `os.execve`
 2. New requests return 503 with `Retry-After: 30`
 3. Waits for in-flight requests to complete (up to 120s)
 4. Restarts process with same arguments
+
+## Request Traces
+
+### Get Trace by Request ID
+
+```
+GET /admin/traces/{request_id}
+```
+
+Returns ordered spans for a request, useful for waterfall debugging.
+
+```bash
+curl http://localhost:4000/admin/traces/abc123 \
+  -H "Authorization: Bearer $MASTER_KEY"
+```
+
+**Response:**
+
+```json
+[
+  {
+    "request_id": "abc123",
+    "span_index": 0,
+    "label": "auth",
+    "start_ms": 0,
+    "end_ms": 5,
+    "model_name": null,
+    "provider": null,
+    "status": "ok",
+    "detail": null
+  },
+  {
+    "request_id": "abc123",
+    "span_index": 1,
+    "label": "router",
+    "start_ms": 5,
+    "end_ms": 12,
+    "model_name": "gpt-4",
+    "provider": "openai",
+    "status": "ok"
+  },
+  {
+    "request_id": "abc123",
+    "span_index": 2,
+    "label": "upstream",
+    "start_ms": 12,
+    "end_ms": 2050,
+    "model_name": "gpt-4",
+    "provider": "openai",
+    "status": "ok"
+  }
+]
+```
+
+## Degradation Mode
+
+### Set Degradation Mode
+
+```
+POST /admin/degradation
+```
+
+**Request:**
+
+```json
+{
+  "mode": "reject"
+}
+```
+
+| Mode | Behavior |
+|------|----------|
+| `normal` | All requests processed normally |
+| `reject` | All requests immediately return 503 |
+| `queue` | Requests are queued and processed when mode returns to normal |
+| `fallback_only` | Only failover models are used |
+
+### Get Degradation Mode
+
+```
+GET /admin/degradation
+```
+
+## Provider Model Sync
+
+### Sync Provider Models
+
+```
+POST /admin/providers/sync
+```
+
+Fetches models from all configured providers and syncs them into the database. Useful after adding new provider keys.
+
+```bash
+curl -X POST http://localhost:4000/admin/providers/sync \
+  -H "Authorization: Bearer $MASTER_KEY"
+```
+
+### Probe Provider
+
+```
+POST /admin/providers/probe
+```
+
+Tests a specific provider's API key and returns available models.
+
+**Request:**
+
+```json
+{
+  "provider": "openai",
+  "api_key": "sk-..."
+}
+```
+
+## Config Management
+
+### Get Config
+
+```
+GET /admin/config
+```
+
+Returns the current loaded config (keys redacted).
+
+### Update Settings
+
+```
+PUT /admin/config/settings
+```
+
+Update `router_settings` fields without full restart.
+
+### Model CRUD
+
+```
+GET    /admin/config/models
+POST   /admin/config/models
+PUT    /admin/config/models/{model_id}
+DELETE /admin/config/models/{model_id}
+POST   /admin/config/models/{model_id}/keys
+DELETE /admin/config/keys/{key_id}
+```
+
+Full CRUD for model entries and their provider keys, all persisted to the database.
 
 ## Example: Full Admin Workflow
 

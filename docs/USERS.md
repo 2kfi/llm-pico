@@ -99,9 +99,48 @@ Users can be managed via the admin API:
 | Deactivate key | `DELETE /admin/keys/{prefix}` |
 | Set model allowlist | `PUT /admin/keys/{prefix}/models` |
 | Set rate limits | `PUT /admin/keys/{prefix}/limits` |
+| Set IP allowlist | `PUT /admin/keys/{prefix}/limits` (include `ip_allowlist`) |
 | Assign to user | `PUT /admin/keys/{prefix}/user` |
 
 See [Admin API](ADMIN.md) for details.
+
+## Team Hierarchy
+
+Users belong to teams. Keys can be assigned to users. Limits and allowlists merge across all three levels:
+
+```
+Team → User → Key → Effective
+```
+
+- **Limits:** `min()` across all non-null values
+- **Allowlists:** `intersection()` of all non-null lists
+- `null` = unrestricted (doesn't constrain)
+
+Set team and user budgets via the admin API:
+
+```bash
+PUT /admin/teams/{team_id}/limits
+{"monthly_budget_usd": 500.00}
+
+PUT /admin/users/{user_id}/budget
+{"monthly_budget_usd": 100.00}
+```
+
+## Chain-of-LLMs
+
+Teams can configure a `model_chain` — a list of models processed in sequence:
+
+```bash
+PUT /admin/teams/{team_id}/chain
+{"model_chain": ["gpt-4", "claude-3"]}
+```
+
+Optionally set a rewrite instruction:
+
+```bash
+PUT /admin/teams/{team_id}/chain/rewrites
+{"text": "Rewrite the user's question into a clearer prompt."}
+```
 
 ## Example: Minimal users.yaml
 
