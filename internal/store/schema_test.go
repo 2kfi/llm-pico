@@ -73,10 +73,7 @@ func TestMigrationsCoverLegacyColumns(t *testing.T) {
 	}
 	defer s.Close()
 
-	if _, err := s.Migrate(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
+	// Open applies migrations itself, so the columns must already be present.
 	for _, ref := range legacy {
 		table, col, _ := strings.Cut(ref, ".")
 		var n int
@@ -94,6 +91,7 @@ func TestMigrationsCoverLegacyColumns(t *testing.T) {
 
 // TestMigrateIsIdempotent verifies Migrate can be called repeatedly, matching
 // the behaviour tests/test_migrations.py asserted for the Python version.
+// Open already migrates, so an explicit call afterwards must be a no-op.
 func TestMigrateIsIdempotent(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
@@ -106,8 +104,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != len(migrations) {
-		t.Errorf("first Migrate applied %d, want %d", first, len(migrations))
+	if first != 0 {
+		t.Errorf("Migrate after Open applied %d, want 0; Open should have migrated already", first)
 	}
 
 	second, err := s.Migrate(ctx)
@@ -127,6 +125,25 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestOpenAppliesMigrations is the regression guard for the Python startup bug:
+// run_migrations() was defined but never invoked, so live databases never gained
+// model_chain and Chain-of-LLMs failed at runtime. Opening must be sufficient.
+func TestOpenAppliesMigrations(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	v, err := s.SchemaVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != len(migrations) {
+		t.Errorf("schema version after Open = %d, want %d", v, len(migrations))
+	}
+}
+
 // TestOpenExistingDatabase covers the upgrade path: a database created by an
 // older version (or by Python) must open cleanly and reach the current version.
 func TestOpenExistingDatabase(t *testing.T) {
@@ -134,12 +151,15 @@ func TestOpenExistingDatabase(t *testing.T) {
 	path := filepath.Join(dir, "legacy.db")
 
 	// Simulate a Python-created database: the base schema only, with none of
-	// the columns that migrations v2-v4 add.
+	// the columns that migrations add, and an empty schema_version table.
 	old, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := old.Exec(schemaSQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`DELETE FROM schema_version`); err != nil {
 		t.Fatal(err)
 	}
 	old.Close()
@@ -150,8 +170,12 @@ func TestOpenExistingDatabase(t *testing.T) {
 	}
 	defer s.Close()
 
-	if _, err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("migrate legacy database: %v", err)
+	v, err := s.SchemaVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != len(migrations) {
+		t.Errorf("schema version = %d, want %d", v, len(migrations))
 	}
 
 	var n int
@@ -159,7 +183,7 @@ func TestOpenExistingDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n != 1 {
-		t.Error("model_chain missing after migrating a legacy database")
+		t.Error("model_chain missing after opening a legacy database")
 	}
 }
 

@@ -76,6 +76,17 @@ func Open(path string) (*Store, error) {
 
 	s.conns = []*sql.DB{db}
 	s.set = true
+
+	// Migrations run here rather than at a separate call site. The Python
+	// implementation defined run_migrations() but never invoked it, so columns
+	// added by later versions never materialised and Chain-of-LLMs failed at
+	// runtime. Opening a database is the only moment at which "the schema is
+	// current" can be guaranteed.
+	if _, err := s.Migrate(context.Background()); err != nil {
+		s.Close()
+		return nil, err
+	}
+
 	return s, nil
 }
 

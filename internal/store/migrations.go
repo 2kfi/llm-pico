@@ -82,10 +82,8 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 // Migrate applies every migration newer than the current schema version and
 // records the new version. It is idempotent.
 //
-// Unlike the Python version, this is called unconditionally during startup.
-// The Python code defined run_migrations() but never invoked it, which left
-// model_chain and friends absent from live databases and broke Chain-of-LLMs
-// at runtime.
+// Open calls this automatically; it is exported so tests and tooling can
+// force a migration pass.
 func (s *Store) Migrate(ctx context.Context) (int, error) {
 	current, err := s.SchemaVersion(ctx)
 	if err != nil {
