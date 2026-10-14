@@ -144,8 +144,12 @@ func (s *Store) QueryRow(ctx context.Context, query string, args ...any) (*sql.R
 	return db.QueryRowContext(ctx, query, args...), nil
 }
 
-// Get is a convenience wrapper that scans a single row into dest, reporting
-// sql.ErrNoRows when nothing matched.
+// Get scans a single-column result into dest, reporting sql.ErrNoRows when
+// nothing matched.
+//
+// dest must match the query's column count: database/sql requires one
+// destination per column and cannot scan into a struct. For multi-column
+// results use QueryRow with an explicit destination list.
 func (s *Store) Get(ctx context.Context, dest any, query string, args ...any) error {
 	row, err := s.QueryRow(ctx, query, args...)
 	if err != nil {

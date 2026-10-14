@@ -195,14 +195,20 @@ func Stats(ctx context.Context, db *store.Store, q Query) (Summary, []KeyModelUs
 	}
 
 	var summary Summary
-	sumQuery := `SELECT
+	// The summary row has five columns, which database/sql requires as five
+	// explicit destinations; a struct cannot be scanned into directly.
+	sumRow, err := db.QueryRow(ctx, `SELECT
 	    COUNT(*) AS total_requests,
 	    COALESCE(SUM(ul.prompt_tokens), 0) AS total_prompt_tokens,
 	    COALESCE(SUM(ul.completion_tokens), 0) AS total_completion_tokens,
 	    COALESCE(SUM(ul.total_tokens), 0) AS total_tokens,
 	    COALESCE(SUM(ul.cost_usd), 0) AS total_cost_usd
-	  FROM usage_log ul` + joins + where
-	if err := db.Get(ctx, &summary, sumQuery, args...); err != nil {
+	  FROM usage_log ul`+joins+where, args...)
+	if err != nil {
+		return summary, nil, err
+	}
+	if err := sumRow.Scan(&summary.TotalRequests, &summary.TotalPromptTokens,
+		&summary.TotalCompletionTokens, &summary.TotalTokens, &summary.TotalCostUSD); err != nil {
 		return summary, nil, err
 	}
 

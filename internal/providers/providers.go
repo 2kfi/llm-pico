@@ -130,6 +130,9 @@ type ModelCapability struct {
 	SupportsStream bool `json:"supports_stream"`
 	MaxContext     int  `json:"max_context,omitempty"`
 	MaxOutput      int  `json:"max_output,omitempty"`
+	// ProbedAt records when detection last ran, so a stale result is visible
+	// rather than being indistinguishable from a fresh one.
+	ProbedAt string `json:"probed_at,omitempty"`
 }
 
 // EndpointError reports a non-success upstream response.

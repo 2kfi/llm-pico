@@ -335,6 +335,11 @@ func ClientIP(r *http.Request, trustProxy bool) string {
 	return host
 }
 
+// SecureEqual compares two strings without leaking length or content by
+// timing. It is exported so the admin API can compare master-key credentials
+// the same way the auth path does.
+func SecureEqual(a, b string) bool { return secureEqual(a, b) }
+
 // secureEqual compares two strings without leaking length or content by timing.
 func secureEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1

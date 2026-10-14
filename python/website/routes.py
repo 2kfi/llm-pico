@@ -3,9 +3,9 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pathlib import Path
 
 router = APIRouter()
-# Static assets live at the repo root in web/ so the Go binary can embed the
-# same tree via //go:embed. This resolves <repo>/python/website -> <repo>/web.
-STATIC_DIR = Path(__file__).resolve().parents[2] / "web"
+# Static assets live in internal/server/web so the Go binary can embed the same
+# tree via //go:embed. This resolves <repo>/python/website -> <repo>/internal.
+STATIC_DIR = Path(__file__).resolve().parents[2] / "internal" / "server" / "web"
 
 _MIME = {
     ".css": "text/css",

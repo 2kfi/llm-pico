@@ -204,3 +204,12 @@ func deref(s *string) string {
 	}
 	return *s
 }
+
+// ID returns the request identifier this tracer writes spans under. It is also
+// echoed to clients as X-Request-Id so a report can be traced back to spans.
+func (t *Tracer) ID() string {
+	if t == nil {
+		return ""
+	}
+	return t.requestID
+}

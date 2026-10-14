@@ -531,3 +531,16 @@ func (r *Router) Status(modelName string) []GroupStatus {
 	}
 	return out
 }
+
+// Has reports whether a model is configured. It distinguishes "unknown model"
+// from "model exists but every provider is currently unavailable".
+func (r *Router) Has(modelName string) bool {
+	_, ok := r.entries[modelName]
+	return ok
+}
+
+// Entry returns the configured model entry.
+func (r *Router) Entry(modelName string) (config.ModelEntry, bool) {
+	e, ok := r.entries[modelName]
+	return e, ok
+}
