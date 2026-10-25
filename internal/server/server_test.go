@@ -97,6 +97,19 @@ func TestOversizedBodyRejectedWithHMAC(t *testing.T) {
 	}
 }
 
+// An unauthenticated caller must be rejected without the body being read:
+// an oversized body with an invalid key gets 401, not the size rejection,
+// so auth cannot be made to buffer untrusted input.
+func TestUnauthenticatedBodyNotBuffered(t *testing.T) {
+	r := requestTo("POST", "/v1/chat/completions", bytes.Repeat([]byte("x"), 8<<20))
+	r.Header.Set("Authorization", "Bearer sk-wrong")
+	w := httptest.NewRecorder()
+	newTestServer(t, false).ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s, want 401 before any body read", w.Code, w.Body.String())
+	}
+}
+
 // A valid HMAC signature over a body exactly at the limit is accepted: the
 // reader must allow len == limit and fail only when it is exceeded.
 func TestHMACBodyAtLimitAccepted(t *testing.T) {

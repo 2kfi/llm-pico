@@ -93,12 +93,21 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Audio uploads are the largest legitimate payload, so they get
 		// their own ceiling; every other route shares the general bound.
-		// The limit is installed before anything reads the body, so auth
-		// cannot consume an unbounded stream.
+		// The limit is installed before anything reads the body.
 		limit := s.opts.MaxBodyBytes
 		if route == proxy.RouteSTT {
 			limit = maxAudioBytes
 		}
+
+		// The bearer check needs no body, so it runs before the read: an
+		// unauthenticated caller never forces the server to buffer
+		// anything.
+		identity, authErr := s.resolveIdentity(r)
+		if authErr != nil {
+			authErr.Write(w)
+			return
+		}
+
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		body, err := readBody(r)
 		if err != nil {
@@ -111,8 +120,7 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 			return
 		}
 
-		identity, authErr := s.authenticate(w, r, body)
-		if authErr != nil {
+		if authErr := s.verifyHMAC(r, body); authErr != nil {
 			authErr.Write(w)
 			return
 		}
@@ -197,10 +205,10 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 	}
 }
 
-// authenticate resolves the caller against the static proxy key set and
-// enforces optional HMAC request signing. The body arrives already read and
-// size-bounded by the handler, so no request reads its own stream twice.
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, body []byte) (*auth.Identity, *httpx.Error) {
+// resolveIdentity resolves the caller against the static proxy key set. It
+// needs only headers, so the handler can run it before reading the body and
+// reject an unauthenticated caller without buffering anything.
+func (s *Server) resolveIdentity(r *http.Request) (*auth.Identity, *httpx.Error) {
 	raw := auth.ExtractBearer(r.Header.Get("Authorization"))
 	if raw == "" {
 		return nil, httpx.Unauthorized("missing or invalid Authorization header")
@@ -227,18 +235,24 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, body []byt
 		KeyHash:   hash,
 		KeyPrefix: auth.PrefixFromKey(raw),
 	}
-
-	if cfg.GeneralSettings.HMACEnabled {
-		signature := r.Header.Get("X-Signature")
-		if signature == "" {
-			return nil, httpx.Unauthorized("missing X-Signature header")
-		}
-		if !auth.VerifyHMAC(cfg.GeneralSettings.HMACSecret, body, signature) {
-			return nil, httpx.Unauthorized("invalid HMAC signature")
-		}
-	}
-
 	return identity, nil
+}
+
+// verifyHMAC enforces optional HMAC request signing over the caller's body,
+// which the handler has already read and size-bounded.
+func (s *Server) verifyHMAC(r *http.Request, body []byte) *httpx.Error {
+	cfg := s.proxy.Config()
+	if !cfg.GeneralSettings.HMACEnabled {
+		return nil
+	}
+	signature := r.Header.Get("X-Signature")
+	if signature == "" {
+		return httpx.Unauthorized("missing X-Signature header")
+	}
+	if !auth.VerifyHMAC(cfg.GeneralSettings.HMACSecret, body, signature) {
+		return httpx.Unauthorized("invalid HMAC signature")
+	}
+	return nil
 }
 
 // checkDims validates an embeddings request's "dimensions" against the
@@ -269,7 +283,7 @@ func (s *Server) checkDims(body []byte, canonical string) *httpx.Error {
 
 // listModels serves GET /v1/models.
 func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.authenticate(w, r, nil); err != nil {
+	if _, err := s.resolveIdentity(r); err != nil {
 		err.Write(w)
 		return
 	}
@@ -278,7 +292,7 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 
 // getModel serves GET /v1/models/{id}.
 func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.authenticate(w, r, nil); err != nil {
+	if _, err := s.resolveIdentity(r); err != nil {
 		err.Write(w)
 		return
 	}
