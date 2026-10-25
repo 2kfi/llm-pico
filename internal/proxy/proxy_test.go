@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -185,5 +186,37 @@ func TestQuotaErrorIsTerminalAndClientRejection(t *testing.T) {
 	}
 	if err.Unwrap() == nil {
 		t.Error("quota rejection must unwrap to its httpx error")
+	}
+}
+
+// The terminating data: [DONE] sentinel adapters emit must reach the client
+// — SSE clients rely on it to close cleanly.
+func TestStreamingForwardsDoneSentinel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+	svc := newService(t, chatConfig(upstream, "m", "alpha"), nil)
+
+	resp, err := svc.Dispatch(context.Background(), DispatchInput{
+		Model: "m", RouteType: RouteChat, Body: []byte(`{"model":"m","stream":true}`),
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	all, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	if !strings.HasSuffix(string(all), "data: [DONE]\n\n") {
+		t.Fatalf("stream = %q, want trailing data: [DONE]\\n\\n", all)
+	}
+	for _, want := range []string{"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n", "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n"} {
+		if !strings.Contains(string(all), want) {
+			t.Errorf("stream missing chunk frame %q", want)
+		}
 	}
 }

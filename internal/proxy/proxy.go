@@ -663,7 +663,15 @@ func (s *Service) callStreaming(
 			if chunk.Usage != nil {
 				last = chunk.Usage
 			}
-			if chunk.Done || len(chunk.Data) == 0 {
+			// The sentinel terminates the stream: forward it so clients
+			// see their expected closing frame, then stop reading.
+			if len(chunk.Data) == 0 {
+				if chunk.Done {
+					if _, err := pw.Write([]byte("data: [DONE]\n\n")); err != nil {
+						break
+					}
+					break
+				}
 				continue
 			}
 			frame := make([]byte, 0, len(chunk.Data)+8)
