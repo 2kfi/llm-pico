@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          
+      - name: Build
+        id: build
+        run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags="-s -w" -o llm-pico-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/llm-pico
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            mv llm-pico-${{ matrix.goos }}-${{ matrix.goarch }} llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}.exe
+          fi
+          
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}
+            llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}.exe
+            
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Create release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref }}
+          name: Release ${{ github.ref }}
+          generate_release_notes: true
+      
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref }}
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,64 @@
+package server
+
+import (
+	"io"
+	"net/http"
+
+	"github.com/arkan/llm-pico/internal/httpx"
+	"github.com/arkan/llm-pico/internal/providers"
+)
+
+// maxAudioBytes bounds an uploaded transcription request. The payload is
+// buffered in memory and forwarded in flight, so anything much larger than a
+// long recording would exhaust memory under concurrency. JSON routes use the
+// smaller MaxBodyBytes bound instead.
+const maxAudioBytes = 100 << 20 // 100 MiB
+
+// audioFields are the multipart form values forwarded to a transcription
+// provider beyond the file itself.
+var audioFields = []string{"response_format", "language", "temperature", "timestamp_granularities", "prompt"}
+
+// parseAudio extracts the uploaded file and model name from a multipart
+// transcription request. The caller has already bounded and read the body.
+func (s *Server) parseAudio(r *http.Request) (*providers.AudioFile, map[string]string, *httpx.Error) {
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		return nil, nil, httpx.BadRequest("expected a multipart/form-data upload with a 'file' field")
+	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		return nil, nil, httpx.BadRequest("field 'file' is required")
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, nil, httpx.BadRequest("could not read the uploaded file")
+	}
+
+	contentType := header.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	fields := map[string]string{}
+	for _, name := range audioFields {
+		if v := r.FormValue(name); v != "" {
+			fields[name] = v
+		}
+	}
+	if v := r.FormValue("model"); v != "" {
+		fields["model"] = v
+	}
+
+	return &providers.AudioFile{
+		Filename:    header.Filename,
+		ContentType: contentType,
+		Data:        data,
+	}, fields, nil
+}
