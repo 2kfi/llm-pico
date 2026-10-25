@@ -329,8 +329,7 @@ func (a *OpenAIAdapter) endpoint(req Request) string {
 var thinkBlock = regexp.MustCompile(`(?s)<think>.*?</think>`)
 
 // stripReasoningBlocks removes inline reasoning spans from a completion's
-// message content. The Python implementation applied this with re.sub on every
-// 200 response.
+// message content.
 func stripReasoningBlocks(body []byte) []byte {
 	var envelope struct {
 		Choices []struct {

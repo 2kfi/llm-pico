@@ -1,15 +1,10 @@
 // Package providers adapts upstream LLM services to the OpenAI wire format.
 //
 // Adapters are resolved at compile time from a registry keyed by provider slug.
-// Adding a provider that speaks the OpenAI protocol needs no code change at
-// all: configure its base URL in the dashboard and it is served by the
-// OpenAI-compatible adapter. Only a genuinely different wire protocol requires
-// a new adapter and a rebuild.
-//
-// The Python version additionally scanned providers/custom/*.py at startup. Go
-// cannot load code at runtime without cgo or a subprocess RPC protocol, and the
-// Python loader never actually registered the modules it loaded, so the feature
-// did not work in practice.
+// Adding a provider that speaks the OpenAI protocol needs no code change: its
+// base URL and key go in provider.yaml and the OpenAI-compatible adapter
+// serves it. Only a genuinely different wire protocol requires a new adapter
+// and a rebuild.
 package providers
 
 import (
@@ -158,11 +153,8 @@ var (
 	ErrInvalidRequest = errors.New("providers: invalid request")
 )
 
-// --- shared HTTP plumbing ---
-
-// Client is the HTTP client used for all upstream calls. A single client with
-// tuned transport pools connections across requests; the Python version kept a
-// separate httpx.AsyncClient per provider slug.
+// Client is the shared HTTP client for all upstream calls; one connection
+// pool serves every provider.
 type Client struct {
 	http *http.Client
 }

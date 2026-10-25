@@ -8,9 +8,9 @@ import (
 	"github.com/arkan/llm-pico/internal/providers"
 )
 
-// maxAudioBytes bounds an uploaded audio file. The database has no blob
-// storage, so the payload is buffered in memory and forwarded; anything much
-// larger than a long recording would exhaust memory under concurrency.
+// maxAudioBytes bounds an uploaded audio file. The payload is buffered in
+// memory and forwarded in flight, so anything much larger than a long
+// recording would exhaust memory under concurrency.
 const maxAudioBytes = 100 << 20 // 100 MiB
 
 // audioFields are the multipart form values forwarded to a transcription

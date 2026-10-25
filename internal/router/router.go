@@ -155,11 +155,13 @@ func (w *latencyWindow) percentiles() (p50, p95 time.Duration) {
 	return p50, sorted[idx]
 }
 
-// group is one provider (identified by slug + api_base) serving a model,
-// along with every credential configured against it.
+// group is one provider slot serving a model, along with every credential
+// configured against it.
 type group struct {
-	slug    string
+	slot    string // provider.yaml slot name
+	slug    string // adapter selector for the registry
 	apiBase string
+	entry   config.ModelEntry
 	keys    []*keyState
 	breaker breaker
 	latency latencyWindow
@@ -269,6 +271,7 @@ type Router struct {
 	modelNames []string
 	entries    map[string]config.ModelEntry
 	groups     map[string][]*group
+	modelAdded map[string]bool
 
 	// Per-model consecutive-failure tracking with a cooldown, so a model whose
 	// upstream is gone stops absorbing traffic.
@@ -283,6 +286,7 @@ func New(cfg *config.Config) *Router {
 	r := &Router{
 		entries:        make(map[string]config.ModelEntry, len(cfg.ModelList)),
 		groups:         make(map[string][]*group, len(cfg.ModelList)),
+		modelAdded:     map[string]bool{},
 		modelFailures:  map[string]int{},
 		modelCooldown:  map[string]time.Time{},
 		cooldownWindow: time.Duration(cfg.RouterSettings.CooldownTime) * time.Second,
@@ -295,31 +299,31 @@ func New(cfg *config.Config) *Router {
 		r.entries[entry.ModelName] = entry
 
 		slug := entry.ProviderSlug()
-		var target *group
-		for _, g := range r.groups[entry.ModelName] {
-			if g.slug == slug && g.apiBase == entry.ModelParams.APIBase {
-				target = g
-				break
-			}
+		target := &group{
+			slot:    entry.Provider,
+			slug:    slug,
+			apiBase: entry.ModelParams.APIBase,
+			entry:   entry,
+			health:  1.0,
+			latency: latencyWindow{max: 100},
+			breaker: breaker{
+				failureThreshold: cfg.RouterSettings.CircuitBreaker.FailureThreshold,
+				recoveryTimeout:  time.Duration(cfg.RouterSettings.CircuitBreaker.RecoveryTimeout) * time.Second,
+			},
 		}
-		if target == nil {
-			target = &group{
-				slug:    slug,
-				apiBase: entry.ModelParams.APIBase,
-				health:  1.0,
-				latency: latencyWindow{max: 100},
-				breaker: breaker{
-					failureThreshold: cfg.RouterSettings.CircuitBreaker.FailureThreshold,
-					recoveryTimeout:  time.Duration(cfg.RouterSettings.CircuitBreaker.RecoveryTimeout) * time.Second,
-				},
-			}
-			r.groups[entry.ModelName] = append(r.groups[entry.ModelName], target)
+		if target.slot == "" {
+			// Legacy entries derived the slot from the provider prefix.
+			target.slot = slug
 		}
+		r.groups[entry.ModelName] = append(r.groups[entry.ModelName], target)
 
 		for _, k := range entry.Keys() {
 			target.keys = append(target.keys, &keyState{apiKey: k})
 		}
-		r.modelNames = append(r.modelNames, entry.ModelName)
+		if !r.modelAdded[entry.ModelName] {
+			r.modelAdded[entry.ModelName] = true
+			r.modelNames = append(r.modelNames, entry.ModelName)
+		}
 	}
 	return r
 }
@@ -329,6 +333,7 @@ func (r *Router) ModelNames() []string { return r.modelNames }
 
 // Target is the outcome of a successful resolution.
 type Target struct {
+	Slot         string
 	ProviderSlug string
 	APIBase      string
 	APIKey       string
@@ -344,8 +349,7 @@ type groupRef = *group
 // proportionally less traffic. Returns ErrAllKeysCoolingDown when every
 // credential is in cooldown.
 func (r *Router) Resolve(modelName string) (*Target, error) {
-	entry, ok := r.entries[modelName]
-	if !ok {
+	if _, ok := r.entries[modelName]; !ok {
 		return nil, ErrModelNotFound
 	}
 
@@ -385,11 +389,45 @@ func (r *Router) Resolve(modelName string) (*Target, error) {
 	}
 
 	return &Target{
+		Slot:         pickedGroup.slot,
 		ProviderSlug: pickedGroup.slug,
 		APIBase:      pickedGroup.apiBase,
 		APIKey:       pickedKey.apiKey,
-		Model:        entry,
+		Model:        pickedGroup.entry,
 	}, nil
+}
+
+// ResolveSlot resolves a single provider slot for modelName, bypassing the
+// health-weighted draw across slots. The proxy walks slots in declared
+// priority order, so it targets one at a time.
+func (r *Router) ResolveSlot(modelName, slot string) (*Target, error) {
+	if r.isCoolingDown(modelName) {
+		return nil, ErrModelNotFound
+	}
+	now := time.Now()
+	for _, g := range r.groups[modelName] {
+		if g.slot != slot && g.slug != slot {
+			continue
+		}
+		if !g.breaker.allows() {
+			return nil, ErrModelNotFound
+		}
+		k, earliest, ok := g.pickKey(now)
+		if !ok {
+			if earliest.IsZero() {
+				return nil, ErrModelNotFound
+			}
+			return nil, &CooldownError{RetryAfter: max(time.Second, earliest.Sub(now))}
+		}
+		return &Target{
+			Slot:         g.slot,
+			ProviderSlug: g.slug,
+			APIBase:      g.apiBase,
+			APIKey:       k.apiKey,
+			Model:        g.entry,
+		}, nil
+	}
+	return nil, ErrModelNotFound
 }
 
 // ErrModelNotFound reports that no provider currently serves the model.
@@ -473,6 +511,12 @@ func (r *Router) find(t *Target) groupRef {
 		return nil
 	}
 	for _, g := range r.groups[t.Model.ModelName] {
+		if g.slot == t.Slot && g.slug == t.ProviderSlug {
+			return g
+		}
+	}
+	// Legacy callers build Targets without a slot.
+	for _, g := range r.groups[t.Model.ModelName] {
 		if g.slug == t.ProviderSlug && g.apiBase == t.APIBase {
 			return g
 		}
@@ -480,8 +524,7 @@ func (r *Router) find(t *Target) groupRef {
 	return nil
 }
 
-// GroupStatus is a point-in-time health snapshot for the admin API and routing
-// graph in the dashboard.
+// GroupStatus is a point-in-time health snapshot of one routing group.
 type GroupStatus struct {
 	ProviderSlug string  `json:"provider"`
 	APIBase      string  `json:"api_base,omitempty"`
@@ -530,13 +573,6 @@ func (r *Router) Status(modelName string) []GroupStatus {
 		})
 	}
 	return out
-}
-
-// Has reports whether a model is configured. It distinguishes "unknown model"
-// from "model exists but every provider is currently unavailable".
-func (r *Router) Has(modelName string) bool {
-	_, ok := r.entries[modelName]
-	return ok
 }
 
 // Entry returns the configured model entry.

@@ -1,29 +1,23 @@
-// Package observability provides request tracing, latency percentiles,
-// a live event stream for the dashboard, and Prometheus metrics.
+// Package observability provides in-memory request tracing and latency
+// percentiles.
 package observability
 
 import (
-	"context"
 	"sort"
 	"sync"
 	"time"
-
-	"github.com/arkan/llm-pico/internal/store"
 )
 
 // Span is one timed stage of a request.
 type Span struct {
-	Label     string `json:"label"`
-	StartMS   int64  `json:"start_ms"`
-	EndMS     int64  `json:"end_ms"`
-	ModelName string `json:"model_name"`
-	Provider  string `json:"provider"`
-	Status    string `json:"status"`
-	Detail    string `json:"detail"`
+	Label     string
+	ModelName string
+	Provider  string
+	Status    string
+	Detail    string
 }
 
-// Tracer accumulates the spans of a single in-flight request and persists them
-// when the request finishes.
+// Tracer accumulates the spans of a single in-flight request.
 type Tracer struct {
 	requestID string
 	origin    time.Time
@@ -32,8 +26,7 @@ type Tracer struct {
 	spans []Span
 }
 
-// NewTracer starts tracing a request. Spans are timed relative to origin, so
-// they line up with the dashboard waterfall view.
+// NewTracer starts tracing a request.
 func NewTracer(requestID string) *Tracer {
 	return &Tracer{requestID: requestID, origin: time.Now()}
 }
@@ -48,8 +41,6 @@ func (t *Tracer) Add(label, model, provider, status, detail string, end time.Tim
 	}
 	span := Span{
 		Label:     label,
-		StartMS:   t.origin.UnixMilli(),
-		EndMS:     end.UnixMilli(),
 		ModelName: model,
 		Provider:  provider,
 		Status:    status,
@@ -72,58 +63,17 @@ func (t *Tracer) Spans() []Span {
 	return out
 }
 
-// Save writes the accumulated spans to the database. Tracing is best-effort:
-// a failure here must never fail the request being traced.
-func (t *Tracer) Save(ctx context.Context, db *store.Store) {
-	if t == nil || db == nil {
-		return
+// ID returns the request identifier this tracer writes spans under. It is
+// echoed to clients as X-Request-Id so a report can be traced back to spans.
+func (t *Tracer) ID() string {
+	if t == nil {
+		return ""
 	}
-	spans := t.Spans()
-	if len(spans) == 0 {
-		return
-	}
-	for i, s := range spans {
-		_, err := db.Exec(ctx, `
-			INSERT INTO request_traces
-			  (request_id, span_index, label, start_ms, end_ms, model_name, provider, status, detail)
-			VALUES (?,?,?,?,?,?,?,?,?)`,
-			t.requestID, i, s.Label, s.StartMS, s.EndMS, s.ModelName, s.Provider, s.Status, s.Detail)
-		if err != nil {
-			return
-		}
-	}
+	return t.requestID
 }
-
-// Traces returns the spans of a completed request, ordered as recorded.
-func Traces(ctx context.Context, db *store.Store, requestID string) ([]Span, error) {
-	rows, err := db.Query(ctx, `
-		SELECT label, start_ms, end_ms, model_name, provider, status, detail
-		FROM request_traces WHERE request_id = ? ORDER BY span_index`, requestID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := []Span{}
-	for rows.Next() {
-		var s Span
-		var model, provider, detail *string
-		if err := rows.Scan(&s.Label, &s.StartMS, &s.EndMS, &model, &provider, &s.Status, &detail); err != nil {
-			return nil, err
-		}
-		s.ModelName = deref(model)
-		s.Provider = deref(provider)
-		s.Detail = deref(detail)
-		out = append(out, s)
-	}
-	return out, rows.Err()
-}
-
-// --- latency profiling ---
 
 // LatencyTracker keeps a bounded rolling window of latencies per model and
-// provider, and reports percentiles for the dashboard and for slow-request
-// detection.
+// provider.
 type LatencyTracker struct {
 	windowSize int
 
@@ -179,37 +129,9 @@ func (t *LatencyTracker) P50(model, provider string) int { return t.Percentile(m
 // P99 returns the 99th percentile latency.
 func (t *LatencyTracker) P99(model, provider string) int { return t.Percentile(model, provider, 99) }
 
-// IsSlow reports whether latencyMS is materially slower than this pair's own
-// recent history. Comparing against the pair's baseline rather than a fixed
-// threshold keeps the signal meaningful across providers with very different
-// typical latencies.
-func (t *LatencyTracker) IsSlow(model, provider string, latencyMS int) bool {
-	p99 := t.P99(model, provider)
-	if p99 == 0 {
-		return false
-	}
-	return latencyMS > p99*3/2
-}
-
 // Clear discards all samples.
 func (t *LatencyTracker) Clear() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.samples = map[string][]int{}
-}
-
-func deref(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
-
-// ID returns the request identifier this tracer writes spans under. It is also
-// echoed to clients as X-Request-Id so a report can be traced back to spans.
-func (t *Tracer) ID() string {
-	if t == nil {
-		return ""
-	}
-	return t.requestID
 }

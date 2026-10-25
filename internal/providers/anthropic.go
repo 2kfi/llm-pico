@@ -21,11 +21,6 @@ const AnthropicBaseURL = "https://api.anthropic.com/v1"
 // rather than OpenAI's delta chunks. The adapter converts events into
 // chat.completion.chunk frames as they arrive, so the proxy's streaming path
 // is identical for every provider.
-//
-// The Python implementation overrode proxy_stream to return a
-// (chunks, usage) tuple rather than an async generator, so the generic
-// streaming loop raised TypeError for Anthropic. The Stream interface here
-// makes that mismatch unrepresentable.
 type AnthropicAdapter struct {
 	BaseURL    string
 	APIVersion string
@@ -76,8 +71,6 @@ func (a *AnthropicAdapter) headers(apiKey string) map[string]string {
 	}
 	return h
 }
-
-// --- request translation ---
 
 // contentPart is one element of a multi-part message content array. It models
 // both the OpenAI input shape and the Anthropic output shape, so a single type
@@ -272,8 +265,6 @@ func splitDataURI(uri string) (mediaType, data string, ok bool) {
 	return mediaType, payload, true
 }
 
-// --- response translation ---
-
 type anthropicUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
@@ -347,8 +338,6 @@ func mapStopReason(reason string) string {
 		return "stop"
 	}
 }
-
-// --- Adapter implementation ---
 
 func (a *AnthropicAdapter) Complete(ctx context.Context, req Request) (*Response, error) {
 	payload, err := toAnthropic(req.Body, req.Model)

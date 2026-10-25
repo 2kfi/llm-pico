@@ -19,11 +19,9 @@ import (
 	"github.com/arkan/llm-pico/internal/config"
 	"github.com/arkan/llm-pico/internal/httpx"
 	"github.com/arkan/llm-pico/internal/observability"
-	"github.com/arkan/llm-pico/internal/org"
 	"github.com/arkan/llm-pico/internal/providers"
 	"github.com/arkan/llm-pico/internal/ratelimit"
 	"github.com/arkan/llm-pico/internal/router"
-	"github.com/arkan/llm-pico/internal/store"
 	"github.com/arkan/llm-pico/internal/usage"
 )
 
@@ -57,11 +55,9 @@ const (
 // hot reload swaps them without blocking in-flight requests and without any
 // request observing a half-applied configuration.
 type Service struct {
-	DB        *store.Store
 	limiter   *ratelimit.Limiter
 	Providers *providers.Registry
 	Latency   *observability.LatencyTracker
-	Events    *observability.Bus
 	Audit     *auth.AuditLog
 	Log       *slog.Logger
 
@@ -77,12 +73,10 @@ type Service struct {
 }
 
 // NewService builds a Service from a configuration snapshot.
-func NewService(db *store.Store, cfg *config.Config, providers *providers.Registry, logger *slog.Logger) *Service {
+func NewService(cfg *config.Config, providers *providers.Registry, logger *slog.Logger) *Service {
 	s := &Service{
-		DB:        db,
 		Providers: providers,
 		Latency:   observability.NewLatencyTracker(1000),
-		Events:    observability.NewBus(256),
 		Log:       logger,
 		sem:       make(chan struct{}, 512),
 	}
@@ -92,37 +86,27 @@ func NewService(db *store.Store, cfg *config.Config, providers *providers.Regist
 	return s
 }
 
-// SetLimiter attaches the rate limiter once the database is open.
+// SetLimiter attaches the rate limiter built from the loaded configuration.
 func (s *Service) SetLimiter(l *ratelimit.Limiter) { s.limiter = l }
 
 // SetAudit attaches the audit log.
 func (s *Service) SetAudit(a *auth.AuditLog) { s.Audit = a }
+
+// Reload swaps the configuration and routing table without touching in-flight
+// requests; a new request sees either the old or the new snapshot in full.
+func (s *Service) Reload(cfg *config.Config, reg *providers.Registry) {
+	if reg != nil {
+		s.Providers = reg
+	}
+	s.config.Store(cfg)
+	s.routes.Store(router.New(cfg))
+}
 
 // Config returns the current configuration snapshot.
 func (s *Service) Config() *config.Config { return s.config.Load() }
 
 // Router returns the current routing table.
 func (s *Service) Router() *router.Router { return s.routes.Load() }
-
-// Reload rebuilds the configuration and routing table from the database and
-// swaps them in atomically.
-//
-// This replaces the Python implementation's approach, which assigned to
-// app_state.router while other requests were reading it, and which restarted
-// the whole process with os.execve if the reload failed. Here a failed reload
-// leaves the previous configuration serving traffic and reports the error.
-func (s *Service) Reload(ctx context.Context) error {
-	cfg, err := config.Load(ctx, s.DB)
-	if err != nil {
-		return err
-	}
-	// Build the new routing table before publishing either value, so a
-	// failure here cannot leave config and router inconsistent.
-	routes := router.New(cfg)
-	s.config.Store(cfg)
-	s.routes.Store(routes)
-	return nil
-}
 
 // Mode returns the current degradation mode.
 func (s *Service) Mode() DegradationMode {
@@ -135,9 +119,6 @@ func (s *Service) SetMode(m DegradationMode) { s.mode.Store(m) }
 
 // BeginDrain stops admitting new requests and waits for in-flight ones to
 // finish, up to a deadline.
-//
-// This replaces the Python implementation's 0.5-second polling loop over a
-// shared set, which could not observe requests that had not yet registered.
 func (s *Service) BeginDrain(timeout time.Duration) bool {
 	s.draining.Store(true)
 	done := make(chan struct{})
@@ -164,15 +145,28 @@ type DispatchInput struct {
 	Identity  *auth.Identity
 	RouteType RouteType
 	Audio     *providers.AudioFile
-	// MasterKey attributes usage for admin-initiated calls, which have no key.
-	MasterKey string
+	// Chars and AudioSeconds pre-carries the request-sized estimates the
+	// character and audio windows charge; the server computes these from the
+	// request payload before dispatch.
+	Chars        int
+	AudioSeconds int
 }
+
+// quotaError wraps a rejection by this proxy's own limiter, which unlike an
+// upstream 429 is terminal: switching slots cannot create quota.
+type quotaError struct {
+	err *httpx.Error
+}
+
+func (e *quotaError) Error() string { return e.err.Error() }
+
+func (e *quotaError) Unwrap() error { return e.err }
 
 // Dispatch resolves a model, enforces limits, calls upstream, and accounts.
 //
-// Retries walk outward through credentials for the model, then the team's
-// model chain, then the model's configured failover target. Every retry is
-// bounded by RouterSettings.NumRetries.
+// Slots are walked in declared priority order. A slot's own quota exhaustion
+// or upstream failure moves to the next slot; a caller-side rejection is
+// terminal.
 func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Response, error) {
 	if s.Draining() {
 		return nil, httpx.Draining()
@@ -185,49 +179,51 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 	r := s.Router()
 
 	tracer := observability.NewTracer(newRequestID())
-	// Tracing is diagnostic; a failure to persist must not affect the client.
-	defer tracer.Save(context.WithoutCancel(ctx), s.DB)
 
 	if err := s.admit(ctx, in, cfg); err != nil {
 		return nil, err
 	}
 
-	candidates := s.candidates(ctx, in, r)
+	model := cfg.Canonical(in.Model)
+	allSlots := kindSlots(cfg, model, in.RouteType)
+	if len(allSlots) == 0 {
+		return nil, httpx.BadRequest(
+			fmt.Sprintf("model '%s' does not support this endpoint", in.Model))
+	}
+
+	slots := slotsWithinContext(allSlots, in)
+	if len(slots) == 0 {
+		return nil, contextTooLongError(allSlots, in)
+	}
+
+	ac := attemptCtx{tracer: tracer, cfg: cfg, router: r}
+
 	var (
 		lastErr error
 		tried   []string
 	)
-
-	for i, candidate := range candidates {
-		tried = append(tried, candidate)
-		resp, err := s.attempt(ctx, attemptCtx{
-			tracer: tracer,
-			cfg:    cfg,
-			router: r,
-		}, in, candidate)
+	for i, slot := range slots {
+		tried = append(tried, slot.Provider)
+		resp, err := s.attemptSlot(ctx, ac, in, model, slot)
 		if err == nil {
 			if i > 0 && resp != nil {
-				httpx.ApplyHeader(resp.Header, httpx.ChainHeaders(candidate, tried, i))
+				httpx.ApplyHeader(resp.Header, httpx.ChainHeaders(slot.Provider, tried, i))
 			}
 			return resp, nil
 		}
 		lastErr = err
 
-		// Budget and rate-limit rejections are conditions of the caller, not
-		// the upstream: trying another model would spend more of the same
-		// budget to reach the same outcome.
-		if isTerminal(err) {
+		// A slot's own quota is its latitude: move to the next slot, which
+		// may still have room. Caller-fault and terminal errors stop the walk.
+		var qe *quotaError
+		if errors.As(err, &qe) {
+			continue
+		}
+		if isTerminal(err) || isClientRejection(err) {
 			break
 		}
-		// A model is only cooled down when its upstream actually failed. One
-		// key exhausting its rate limit says nothing about the model's health,
-		// and cooling it down would make a healthy model unavailable to every
-		// other caller.
-		if isClientRejection(err) {
-			break
-		}
-		if i == len(candidates)-1 {
-			r.RecordModelFailure(candidate)
+		if i == len(slots)-1 {
+			r.RecordModelFailure(slot.Provider)
 		}
 	}
 
@@ -235,6 +231,80 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 		lastErr = httpx.Upstream(http.StatusBadGateway, "all upstream providers failed")
 	}
 	return nil, httpx.FromError(lastErr)
+}
+
+// kindSlots returns the model's slots that serve the route's operation kind,
+// in configuration order.
+func kindSlots(cfg *config.Config, modelName string, rt RouteType) []config.ModelEntry {
+	var out []config.ModelEntry
+	for _, entry := range cfg.Slots(modelName) {
+		if kindOf(rt) == entry.Kind {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func kindOf(rt RouteType) config.Kind {
+	switch rt {
+	case RouteEmbeddings:
+		return config.KindEmbeddings
+	case RouteSTT:
+		return config.KindSTT
+	case RouteTTS:
+		return config.KindTTS
+	default:
+		return config.KindChat
+	}
+}
+
+// slotsWithinContext drops slots whose context budget cannot hold the
+// estimated request. It returns the surviving slots; an empty result means no
+// slot can serve the request within its context window.
+func slotsWithinContext(slots []config.ModelEntry, in DispatchInput) []config.ModelEntry {
+	var out []config.ModelEntry
+	for _, entry := range slots {
+		ctx := entry.EffectiveCtx()
+		if ctx == nil {
+			out = append(out, entry)
+			continue
+		}
+		if estimateTokens(in) > int64(*ctx) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// contextTooLongError renders the OpenAI-style rejection for a request that
+// no slot could accommodate.
+func contextTooLongError(slots []config.ModelEntry, in DispatchInput) error {
+	maxCtx := 0
+	for _, entry := range slots {
+		if ctx := entry.EffectiveCtx(); ctx != nil && *ctx > maxCtx {
+			maxCtx = *ctx
+		}
+	}
+	requested := estimateTokens(in)
+	return &httpx.Error{
+		Status: http.StatusBadRequest,
+		Type:   httpx.TypeBadRequest,
+		Message: fmt.Sprintf(
+			"This model's maximum context length is %d tokens, however you requested %d tokens. "+
+				"Please reduce the length of the messages or the max_tokens value.",
+			maxCtx, requested),
+	}
+}
+
+// estimateTokens is the preflight body-size approximation used for context and
+// token-window accounting: four bytes per token plus completion budget.
+func estimateTokens(in DispatchInput) int64 {
+	total := int64(len(in.Body)/4) + int64(in.MaxTokens)
+	if total <= 0 {
+		return 1
+	}
+	return total
 }
 
 // attemptCtx is the immutable context of one dispatched request.
@@ -275,47 +345,30 @@ func (s *Service) release() {
 	}
 }
 
-// candidates builds the ordered list of model names to try.
-func (s *Service) candidates(ctx context.Context, in DispatchInput, r *router.Router) []string {
-	out := []string{in.Model}
-
-	// The team chain lets one client-facing model name stand in for an ordered
-	// set of alternatives, each with its own fallbacks.
-	if in.Identity != nil && in.Identity.UserID != nil {
-		user, team, err := org.Resolve(ctx, s.DB, *in.Identity.UserID)
-		if err == nil && team != nil && len(team.ModelChain) > 0 {
-			rest := team.ModelChain
-			if idx := indexOf(team.ModelChain, in.Model); idx >= 0 {
-				rest = team.ModelChain[idx+1:]
-			}
-			for _, m := range rest {
-				if m != "" && !contains(out, m) {
-					out = append(out, m)
-				}
-			}
-		}
-		_ = user
-	}
-
-	// The legacy single failover target is the lowest-priority alternative.
-	if target, err := r.Resolve(in.Model); err == nil && target.Model.FailoverModel != "" {
-		if !contains(out, target.Model.FailoverModel) {
-			out = append(out, target.Model.FailoverModel)
-		}
-	}
-	return out
-}
-
 // reservation is the per-request rate-limit accounting, threaded through the
 // attempt so a retry loop cannot double-reserve.
 type reservation struct {
-	headers    http.Header
+	slot       string
+	model      string
+	hash       string
+	limits     ratelimit.Limits
+	costs      ratelimit.Costs
 	tokens     int64
+	headers    http.Header
 	reconciled bool
 }
 
-// attempt makes the configured number of tries against a single model.
-func (s *Service) attempt(ctx context.Context, ac attemptCtx, in DispatchInput, model string) (*http.Response, error) {
+// keyHash returns the attribution hash for the caller.
+func keyHash(in DispatchInput) string {
+	if in.Identity == nil {
+		return ""
+	}
+	return in.Identity.KeyHash
+}
+
+// attemptSlot makes the configured number of tries against one provider slot
+// of the model.
+func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInput, modelName string, slot config.ModelEntry) (*http.Response, error) {
 	maxTries := max(1, ac.cfg.RouterSettings.NumRetries+1)
 	var (
 		res       *reservation
@@ -324,40 +377,40 @@ func (s *Service) attempt(ctx context.Context, ac attemptCtx, in DispatchInput, 
 	)
 
 	for try := 0; try < maxTries; try++ {
-		target, err := ac.router.Resolve(model)
+		target, err := ac.router.ResolveSlot(modelName, slot.Provider)
 		if err != nil {
 			var cooldown *router.CooldownError
 			if errors.As(err, &cooldown) {
 				return nil, httpx.RateLimited(
-					fmt.Sprintf("all keys for model '%s' are rate-limited", model),
+					fmt.Sprintf("all keys for provider '%s' are rate-limited", slot.Provider),
 					int(cooldown.RetryAfter.Seconds())+1,
 				)
 			}
 			if lastErr != nil {
 				return nil, lastErr
 			}
-			return nil, httpx.NotFound(fmt.Sprintf("model '%s' not available", model))
+			return nil, httpx.NotFound(fmt.Sprintf("model '%s' not available", modelName))
 		}
 
 		if !tracedOne {
-			ac.tracer.Add("resolve:"+model, model, target.ProviderSlug, "ok", "", time.Time{})
+			ac.tracer.Add("resolve:"+modelName, modelName, target.ProviderSlug, "ok", "", time.Time{})
 			tracedOne = true
 		}
 
-		if err := checkCapability(in, target); err != nil {
-			return nil, err
+		// Chat requests carrying image parts need a vision-capable entry;
+		// kind filtering has already handled every other route mismatch.
+		if in.RouteType == RouteChat && providers.HasImageInput(in.Body) && !target.Model.Images {
+			return nil, httpx.BadRequest(fmt.Sprintf("model '%s' does not support image inputs", in.Model))
 		}
 
-		// Limits are evaluated once per request, not once per retry, so a
-		// retry loop cannot re-reserve the same tokens.
+		// Limits are charged per slot, plus once at model level; a retry loop
+		// cannot re-reserve what is already held.
 		if res == nil {
-			if err := s.checkBudgets(ctx, in, target); err != nil {
-				return nil, err
+			quota, err := s.reserve(in, modelName, slot)
+			if quota == nil {
+				return nil, &quotaError{err: err}
 			}
-			res, err = s.reserve(ctx, in, target)
-			if err != nil {
-				return nil, err
-			}
+			res = quota
 		}
 
 		adapter := s.Providers.AdapterFor(target.ProviderSlug, target.APIBase)
@@ -365,8 +418,8 @@ func (s *Service) attempt(ctx context.Context, ac attemptCtx, in DispatchInput, 
 
 		if err == nil {
 			ac.router.RecordSuccess(target)
-			ac.tracer.Add("proxy:"+model, model, target.ProviderSlug, "ok", "", time.Time{})
-			if resp != nil && res != nil {
+			ac.tracer.Add("proxy:"+modelName, modelName, target.ProviderSlug, "ok", "", time.Time{})
+			if resp != nil {
 				httpx.ApplyHeader(resp.Header, res.headers)
 				resp.Header.Set("X-Request-Id", ac.tracer.ID())
 			}
@@ -379,155 +432,97 @@ func (s *Service) attempt(ctx context.Context, ac attemptCtx, in DispatchInput, 
 		var apiErr *httpx.Error
 		if errors.As(err, &apiErr) && isTerminal(err) {
 			ac.router.RecordFailure(target, apiErr.Status)
-			ac.tracer.Add("error:"+model, model, target.ProviderSlug, "fail",
+			ac.tracer.Add("error:"+modelName, modelName, target.ProviderSlug, "fail",
 				fmt.Sprint(apiErr.Status), time.Time{})
-			refund(ctx, s, in, res)
+			s.refund(res)
 			return nil, err
 		}
 
 		status := statusOf(err)
 		ac.router.RecordFailure(target, status)
-		ac.tracer.Add("error:"+model, model, target.ProviderSlug, "fail",
+		ac.tracer.Add("error:"+modelName, modelName, target.ProviderSlug, "fail",
 			fmt.Sprint(status), time.Time{})
 		lastErr = err
 	}
 
 	// Every attempt failed: release the reservation so the caller is not
 	// charged for work that never happened.
-	refund(ctx, s, in, res)
+	s.refund(res)
 	return nil, lastErr
 }
 
-// checkCapability rejects a request the target model cannot serve, before
-// spending an upstream call.
-func checkCapability(in DispatchInput, target *router.Target) error {
-	entry := target.Model
-	switch in.RouteType {
-	case RouteEmbeddings:
-		if !entry.Embeddings {
-			return httpx.BadRequest(fmt.Sprintf("model '%s' does not support embeddings", in.Model))
-		}
-	case RouteSTT:
-		if !entry.STT {
-			return httpx.BadRequest(fmt.Sprintf("model '%s' does not support speech-to-text", in.Model))
-		}
-	case RouteTTS:
-		if !entry.TTS {
-			return httpx.BadRequest(fmt.Sprintf("model '%s' does not support text-to-speech", in.Model))
-		}
-	}
-	if in.RouteType == RouteChat && providers.HasImageInput(in.Body) && !entry.Images {
-		return httpx.BadRequest(fmt.Sprintf("model '%s' does not support image inputs", in.Model))
-	}
-	return nil
-}
-
-// checkBudgets enforces key, user and team monthly budgets before dispatch.
-func (s *Service) checkBudgets(ctx context.Context, in DispatchInput, target *router.Target) error {
-	if in.Identity == nil || in.Identity.Role != auth.RoleUser {
-		return nil
-	}
-	entry := target.Model
-	// Project against the reservation, not zero, so a large max_tokens cannot
-	// overshoot the budget within the same month.
-	estimate := usage.Cost(len(in.Body)/4, in.MaxTokens, entry.CostPer1MIn, entry.CostPer1MOut)
-	if estimate == nil {
-		return nil
-	}
-
-	if msg, err := usage.CheckKeyBudget(ctx, s.DB, in.Identity.KeyHash, *estimate); err != nil {
-		return err
-	} else if msg != "" {
-		return httpx.BudgetExceeded(msg)
-	}
-
-	if in.Identity.UserID == nil {
-		return nil
-	}
-	if msg, err := org.CheckUserBudget(ctx, s.DB, *in.Identity.UserID, *estimate); err != nil {
-		return err
-	} else if msg != "" {
-		return httpx.BudgetExceeded(msg)
-	}
-
-	_, team, err := org.Resolve(ctx, s.DB, *in.Identity.UserID)
-	if err != nil {
-		return err
-	}
-	if team != nil {
-		if msg, err := org.CheckTeamBudget(ctx, s.DB, team.ID, *estimate); err != nil {
-			return err
-		} else if msg != "" {
-			return httpx.BudgetExceeded(msg)
-		}
-	}
-	return nil
-}
-
-// reserve consumes capacity from both the user-level and model-level limit
-// sets and returns the headers to report back.
-func (s *Service) reserve(ctx context.Context, in DispatchInput, target *router.Target) (*reservation, error) {
+// reserve consumes capacity from the slot's and the model's limit sets. On
+// exhaustion it returns a nil reservation plus an error carrying the
+// X-RateLimit headers of the window that rejected.
+func (s *Service) reserve(in DispatchInput, modelName string, slot config.ModelEntry) (*reservation, *httpx.Error) {
 	if s.limiter == nil {
 		return &reservation{}, nil
 	}
-	keyHash, _ := in.Identity.Ledger(in.MasterKey)
-	entry := target.Model
 
-	// Four characters per token is the usual English approximation; the real
-	// figure is reconciled against provider-reported usage afterwards.
-	tokens := int64(max(1, len(in.Body)/4) + in.MaxTokens)
-
-	userLimits := in.Identity.LimiterLimits()
-	modelLimits := ratelimit.Limits{
-		ratelimit.RPM: intPtr(entry.RPM),
-		ratelimit.RPD: intPtr(entry.RPD),
-		ratelimit.TPM: intPtr(entry.TPM),
-		ratelimit.TPD: intPtr(entry.TPD),
-		ratelimit.ASH: intPtr(entry.ASH),
-		ratelimit.ASD: intPtr(entry.ASD),
+	costs := ratelimit.Costs{
+		Tokens:   estimateTokens(in),
+		Chars:    int64(in.Chars),
+		AudioSec: int64(in.AudioSeconds),
+	}
+	limits := ratelimit.Limits{
+		ratelimit.RPM:  intPtr(slot.RPM),
+		ratelimit.RPD:  intPtr(slot.RPD),
+		ratelimit.TPM:  intPtr(slot.TPM),
+		ratelimit.TPD:  intPtr(slot.TPD),
+		ratelimit.CPM:  intPtr(slot.CPM),
+		ratelimit.CPD:  intPtr(slot.CPD),
+		ratelimit.ASEC: intPtr(slot.AudioSecPerDay),
+		ratelimit.AMIN: intPtr(slot.AudioMin),
 	}
 
-	levels := []struct {
-		level  ratelimit.Level
-		limits ratelimit.Limits
-	}{
-		{ratelimit.LevelUser, userLimits},
-		{ratelimit.LevelModel, modelLimits},
+	hash := keyHash(in)
+	m := ratelimit.LevelModel
+
+	// LevelModel cells are keyed by slot and model, so each provider slot is
+	// charged the model's limits independently: one slot running dry must not
+	// drain the quota of another.
+	if rejection := s.limiter.CheckAndReserve(hash, modelName, slot.Provider, m, limits, costs); rejection != nil {
+		return nil, s.quotaRejection(rejection, hash, modelName, slot.Provider, limits)
 	}
 
-	for _, l := range levels {
-		if !l.limits.HasAny() {
-			continue
-		}
-		if rejection := s.limiter.CheckAndReserve(keyHash, in.Model, l.level, l.limits, tokens); rejection != nil {
-			return nil, httpx.RateLimited(
-				fmt.Sprintf("rate limit exceeded: %s", rejection.Window),
-				int(rejection.RetryAfter.Seconds())+1,
-			)
-		}
-	}
-
-	headers := httpx.RateLimitHeaders(s.limiter, keyHash, in.Model, ratelimit.LevelUser, userLimits)
-	httpx.ApplyHeader(headers, httpx.RateLimitHeaders(s.limiter, keyHash, in.Model, ratelimit.LevelModel, modelLimits))
-	return &reservation{headers: headers, tokens: tokens}, nil
+	headers := httpx.RateLimitHeaders(s.limiter, hash, modelName, slot.Provider, m, limits)
+	return &reservation{
+		slot:    slot.Provider,
+		model:   modelName,
+		hash:    hash,
+		limits:  limits,
+		costs:   costs,
+		tokens:  costs.Tokens,
+		headers: headers,
+	}, nil
 }
 
-// settle returns unused reservation to the limiter. It runs at most once, since
-// a second call would refund capacity that was never taken.
-func (s *Service) settle(ctx context.Context, in DispatchInput, res *reservation, actual int64) {
-	if s.limiter == nil || res == nil || res.reconciled {
+// quotaRejection renders a limiter rejection as a headered 429.
+func (s *Service) quotaRejection(r *ratelimit.Rejection, keyHash, modelName, slot string, limits ratelimit.Limits) *httpx.Error {
+	e := httpx.RateLimited(
+		fmt.Sprintf("rate limit exceeded: %s", r.Window),
+		int(r.RetryAfter.Seconds())+1,
+	)
+	e.Headers = httpx.RateLimitHeaders(s.limiter, keyHash, modelName, slot, ratelimit.LevelModel, limits)
+	return e
+}
+
+// settle reconciles the token estimate against what the provider reported. It
+// runs at most once, since a second call would refund capacity never taken.
+func (s *Service) settle(res *reservation, actual int64) {
+	if s.limiter == nil || res == nil || res.model == "" || res.reconciled {
 		return
 	}
 	res.reconciled = true
-	keyHash, _ := in.Identity.Ledger(in.MasterKey)
-	s.limiter.Reconcile(keyHash, in.Model, ratelimit.LevelUser, actual, res.tokens)
+	s.limiter.Reconcile(res.hash, res.model, res.slot, ratelimit.LevelModel, actual, res.tokens)
 }
 
-func refund(ctx context.Context, s *Service, in DispatchInput, res *reservation) {
-	if res == nil {
+// refund releases a reservation that never reached a successful upstream call.
+func (s *Service) refund(res *reservation) {
+	if res == nil || res.model == "" {
 		return
 	}
-	s.settle(ctx, in, res, 0)
+	s.limiter.Refund(res.hash, res.model, res.slot, ratelimit.LevelModel, res.limits, res.costs)
 }
 
 // callUsage is what a completed upstream call cost.
@@ -544,10 +539,6 @@ func finalizeFn(s *Service, in DispatchInput, res *reservation, u *callUsage, ta
 	return func(finalTarget *router.Target, err error) {
 		defer onDone()
 
-		keyHash, keyPrefix := in.Identity.Ledger(in.MasterKey)
-		entry := finalTarget.Model
-		cost := usage.Cost(u.PromptTokens, u.CompletionTokens, entry.CostPer1MIn, entry.CostPer1MOut)
-
 		total := u.TotalTokens
 		if total == 0 && res != nil {
 			// A provider reporting no usage is assumed to have consumed
@@ -556,42 +547,10 @@ func finalizeFn(s *Service, in DispatchInput, res *reservation, u *callUsage, ta
 			total = int(res.tokens)
 		}
 
-		status := http.StatusOK
-		errorText := ""
-		errorType := ""
-		if err != nil {
-			status = statusOf(err)
-			errorText = truncate(err.Error(), 500)
-			errorType = usage.Classify(status, errorText)
-		}
-
-		_, _ = usage.Log(context.WithoutCancel(context.Background()), s.DB, usage.Record{
-			KeyHash:          keyHash,
-			KeyPrefix:        keyPrefix,
-			ModelName:        in.Model,
-			Provider:         finalTarget.ProviderSlug,
-			PromptTokens:     u.PromptTokens,
-			CompletionTokens: u.CompletionTokens,
-			TotalTokens:      total,
-			LatencyMS:        int(u.Latency.Milliseconds()),
-			StatusCode:       status,
-			Error:            errorText,
-			ErrorType:        errorType,
-			CostUSD:          cost,
-		})
-
-		costValue := 0.0
-		if cost != nil {
-			costValue = *cost
-		}
-		s.Events.Publish(observability.NewEvent(keyPrefix, in.Model, finalTarget.ProviderSlug,
-			u.PromptTokens, u.CompletionTokens, total,
-			int(u.Latency.Milliseconds()), status, costValue))
-
 		if err == nil {
-			s.settle(context.Background(), in, res, int64(total))
+			s.settle(res, int64(total))
 		} else {
-			refund(context.Background(), s, in, res)
+			s.refund(res)
 		}
 	}
 }
@@ -801,9 +760,6 @@ func isTerminal(err error) bool {
 	if apiErr.Status == 429 || apiErr.Status == http.StatusTooManyRequests {
 		return false
 	}
-	if apiErr.Type == httpx.TypeBudgetExceeded {
-		return true
-	}
 	return apiErr.Status >= 400 && apiErr.Status < 500
 }
 
@@ -815,7 +771,7 @@ func isClientRejection(err error) bool {
 	if !errors.As(err, &apiErr) {
 		return false
 	}
-	return apiErr.Type == httpx.TypeRateLimited || apiErr.Type == httpx.TypeBudgetExceeded
+	return apiErr.Type == httpx.TypeRateLimited
 }
 
 func statusOf(err error) int {
@@ -840,17 +796,6 @@ func wantsStream(body []byte) bool {
 	return peek.Stream
 }
 
-func indexOf(list []string, v string) int {
-	for i, s := range list {
-		if s == v {
-			return i
-		}
-	}
-	return -1
-}
-
-func contains(list []string, v string) bool { return indexOf(list, v) >= 0 }
-
 func intPtr(v *int) *int64 {
 	if v == nil {
 		return nil
@@ -868,69 +813,3 @@ func truncate(s string, n int) string {
 
 // Limiter returns the rate limiter, or nil before one is attached.
 func (s *Service) Limiter() *ratelimit.Limiter { return s.limiter }
-
-// ProbeCapabilities detects and stores what a model supports. Failures are
-// returned for logging but are not fatal: a model that cannot be probed is
-// still usable.
-func (s *Service) ProbeCapabilities(ctx context.Context, entry config.ModelEntry) error {
-	slug := entry.ProviderSlug()
-	adapter := s.Providers.AdapterFor(slug, entry.ModelParams.APIBase)
-
-	apiKey := ""
-	if keys := entry.Keys(); len(keys) > 0 {
-		apiKey = keys[0]
-	}
-
-	caps, err := adapter.Probe(ctx, providers.Request{
-		Model:   entry.ModelParams.Model,
-		APIKey:  apiKey,
-		BaseURL: entry.ModelParams.APIBase,
-	})
-	if err != nil {
-		return err
-	}
-
-	caps.ProbedAt = store.NowISO()
-	_, err = s.DB.Exec(ctx, `
-		INSERT OR REPLACE INTO model_capabilities
-		  (model_id, supports_tools, supports_vision, supports_json, supports_stream,
-		   max_context, max_output, probed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		entry.DBModelID, boolToInt(caps.SupportsTools), boolToInt(caps.SupportsVision),
-		boolToInt(caps.SupportsJSON), boolToInt(caps.SupportsStream),
-		caps.MaxContext, caps.MaxOutput, caps.ProbedAt)
-	return err
-}
-
-// PruneLogs deletes usage and admin rows older than their retention windows,
-// returning how many rows of each were removed.
-func (s *Service) PruneLogs() (usageRows, adminRows int, err error) {
-	ctx := context.Background()
-	cfg := s.Config()
-	now := time.Now().UTC()
-
-	usageCutoff := now.AddDate(0, 0, -cfg.GeneralSettings.UsageLogRetentionDays)
-	adminCutoff := now.AddDate(0, 0, -cfg.GeneralSettings.AdminLogRetentionDays)
-
-	if res, err := s.DB.Exec(ctx, `DELETE FROM usage_log WHERE created_at < ?`,
-		usageCutoff.Format("2006-01-02T15:04:05")); err != nil {
-		return 0, 0, err
-	} else if n, _ := res.RowsAffected(); n > 0 {
-		usageRows = int(n)
-	}
-
-	if res, err := s.DB.Exec(ctx, `DELETE FROM admin_log WHERE created_at < ?`,
-		adminCutoff.Format("2006-01-02T15:04:05")); err != nil {
-		return usageRows, 0, err
-	} else if n, _ := res.RowsAffected(); n > 0 {
-		adminRows = int(n)
-	}
-	return usageRows, adminRows, nil
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}

@@ -1,0 +1,49 @@
+# kind: chat | embeddings | tts | stt
+# providers: order = priority, implicit fallback
+# limits per kind:
+#   chat, embeddings:  rpm, rpd, tpm, tpd
+#   tts:               rpm, rpd, cpm, cpd, daily-audio-sec
+#   stt:               rpm, rpd, daily-audio-sec, audio-min
+gemini-3.5-flash:
+  kind: chat
+  providers: google-ai-studio-1, proxy-1-google-ai-studio
+  ctx: 1000000
+  rpm: 60
+  rpd: 1500
+  tpm: 200000
+  tpd: 2000000
+
+gpt-4o-mini:
+  kind: chat
+  providers: openai-1
+  ctx: 128000
+  rpm: 300
+  rpd: 10000
+  tpm: 500000
+  tpd: 10000000
+
+text-embedding-3-small:
+  kind: embeddings
+  providers: openai-1, google-ai-studio-1
+  dims: 1536
+  rpm: 2000
+  rpd: 50000
+  tpm: 1000000
+  tpd: 20000000
+
+tts-1:
+  kind: tts
+  providers: openai-1
+  rpm: 30
+  rpd: 1000
+  cpm: 12000
+  cpd: 500000
+  daily-audio-sec: 7200
+
+whisper-1:
+  kind: stt
+  providers: openai-1, local-whisper
+  rpm: 20
+  rpd: 500
+  audio-min: 60
+  daily-audio-sec: 14400

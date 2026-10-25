@@ -1,5 +1,4 @@
-// Package server exposes the proxy over HTTP: the OpenAI-compatible endpoints,
-// the admin API, and the dashboard assets.
+// Package server exposes the proxy over the OpenAI-compatible endpoints.
 package server
 
 import (
@@ -16,34 +15,26 @@ import (
 	"github.com/arkan/llm-pico/internal/httpx"
 	"github.com/arkan/llm-pico/internal/proxy"
 	"github.com/arkan/llm-pico/internal/ratelimit"
-	"github.com/arkan/llm-pico/internal/store"
 )
 
 // Options configures a Server.
 type Options struct {
-	DB     *store.Store
 	Proxy  *proxy.Service
 	Logger *slog.Logger
 	// MaxBodyBytes bounds request bodies. Audio uploads are the largest
 	// legitimate payload, so the default leaves generous headroom.
 	MaxBodyBytes int64
-	// TrustProxyHeaders honours X-Forwarded-For for IP allowlists. It must
-	// only be enabled behind a proxy that overwrites the header.
-	TrustProxyHeaders bool
 	// DrainTimeout bounds how long shutdown waits for in-flight requests.
 	DrainTimeout time.Duration
 }
 
 // Server owns the HTTP surface.
 type Server struct {
-	db       *store.Store
-	proxy    *proxy.Service
-	log      *slog.Logger
-	verifier *auth.Verifier
-	limiter  *ratelimit.Limiter
-	admin    *adminAPI
-	mux      *http.ServeMux
-	opts     Options
+	proxy   *proxy.Service
+	log     *slog.Logger
+	limiter *ratelimit.Limiter
+	mux     *http.ServeMux
+	opts    Options
 }
 
 // New builds a Server with all routes registered.
@@ -55,14 +46,11 @@ func New(opts Options) *Server {
 		opts.DrainTimeout = 30 * time.Second
 	}
 	s := &Server{
-		db:       opts.DB,
-		proxy:    opts.Proxy,
-		log:      opts.Logger,
-		verifier: auth.NewVerifier(opts.DB),
-		limiter:  opts.Proxy.Limiter(),
-		opts:     opts,
+		proxy:   opts.Proxy,
+		log:     opts.Logger,
+		limiter: opts.Proxy.Limiter(),
+		opts:    opts,
 	}
-	s.admin = &adminAPI{server: s}
 	s.mux = s.routes()
 	return s
 }
@@ -91,9 +79,6 @@ func (s *Server) routes() *http.ServeMux {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": Version})
 	})
 
-	s.admin.register(mux)
-
-	mux.HandleFunc("/", s.static)
 	return mux
 }
 
@@ -122,7 +107,6 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 			Body:      body,
 			Identity:  identity,
 			RouteType: route,
-			MasterKey: s.proxy.Config().GeneralSettings.MasterKey,
 		}
 
 		switch route {
@@ -134,6 +118,9 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 			}
 			input.Audio = audio
 			input.Model = fields["model"]
+			// ~32 kB of compressed audio per second is the usual bitrate
+			// band; the estimate only feeds the audio-seconds limits.
+			input.AudioSeconds = max(1, len(audio.Data)/32000)
 			input.MaxTokens = 0
 		case proxy.RouteTTS:
 			if !json.Valid(body) {
@@ -141,6 +128,9 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 				return
 			}
 			input.Model = peekString(body, "model")
+			input.Chars = len(peekString(body, "input"))
+			// Spoken cadence is roughly fifteen characters per second.
+			input.AudioSeconds = (input.Chars + 14) / 15
 			input.MaxTokens = 0
 		default:
 			// A body that is not a JSON object cannot be dispatched, and
@@ -159,14 +149,18 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 			return
 		}
 
-		if !identity.CanAccessModel(input.Model) {
-			httpx.Forbidden(fmt.Sprintf("model '%s' not allowed for this key", input.Model)).Write(w)
+		cfg := s.proxy.Config()
+		canonical := cfg.Canonical(input.Model)
+		if len(cfg.Slots(canonical)) == 0 {
+			httpx.NotFound(fmt.Sprintf("model '%s' not available", input.Model)).Write(w)
 			return
 		}
 
-		if !s.proxy.Router().Has(input.Model) {
-			httpx.NotFound(fmt.Sprintf("model '%s' not available", input.Model)).Write(w)
-			return
+		if route == proxy.RouteEmbeddings {
+			if apiErr := s.checkDims(body, canonical); apiErr != nil {
+				apiErr.Write(w)
+				return
+			}
 		}
 
 		resp, dispatchErr := s.proxy.Dispatch(r.Context(), input)
@@ -186,8 +180,8 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 	}
 }
 
-// authenticate resolves the caller, enforcing the IP allowlist and optional
-// HMAC request signing.
+// authenticate resolves the caller against the static proxy key set and
+// enforces optional HMAC request signing.
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*auth.Identity, *httpx.Error) {
 	raw := auth.ExtractBearer(r.Header.Get("Authorization"))
 	if raw == "" {
@@ -195,17 +189,25 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*auth.Ide
 	}
 
 	cfg := s.proxy.Config()
-	identity, err := s.verifier.Verify(r.Context(), raw, cfg.GeneralSettings.MasterKey)
-	if err != nil {
+
+	// Each request builds the hash set; the key list is small and reload
+	// replaces cfg wholesale, so there is nothing to invalidate.
+	hash := auth.HashKey(raw)
+	known := false
+	for _, k := range cfg.ProxyKeys {
+		if auth.HashKey(k) == hash {
+			known = true
+			break
+		}
+	}
+	if !known {
 		return nil, httpx.Unauthorized("invalid API key")
 	}
 
-	// The master key is not subject to key-level restrictions.
-	if identity.Role == auth.RoleUser {
-		clientIP := auth.ClientIP(r, s.opts.TrustProxyHeaders)
-		if !auth.CheckIP(clientIP, identity.IPAllowlist) {
-			return nil, httpx.Forbidden("IP not allowed")
-		}
+	identity := &auth.Identity{
+		Role:      auth.RoleUser,
+		KeyHash:   hash,
+		KeyPrefix: auth.PrefixFromKey(raw),
 	}
 
 	if cfg.GeneralSettings.HMACEnabled {
@@ -227,65 +229,62 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*auth.Ide
 	return identity, nil
 }
 
+// checkDims validates an embeddings request's "dimensions" against the
+// model's configured ceiling. The parameter still passes upstream untouched.
+func (s *Server) checkDims(body []byte, canonical string) *httpx.Error {
+	req := peekInt(body, "dimensions", 0)
+	if req == 0 {
+		return nil
+	}
+	var dims int
+	for _, entry := range s.proxy.Config().Slots(canonical) {
+		if entry.Dims == nil {
+			return nil
+		}
+		dims = *entry.Dims
+		break
+	}
+	if dims == 0 || req == dims {
+		return nil
+	}
+	return httpx.BadRequest(
+		fmt.Sprintf("model '%s' supports a fixed output size of %d dimensions, however %d was requested", canonical, dims, req))
+}
+
 // listModels serves GET /v1/models.
 func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
-	identity, err := s.authenticate(w, r)
-	if err != nil {
+	if _, err := s.authenticate(w, r); err != nil {
 		err.Write(w)
 		return
 	}
-	names := s.proxy.Router().ModelNames()
-	if identity.Role == auth.RoleUser && identity.Allowlist != nil {
-		allowed := map[string]bool{}
-		for _, m := range identity.Allowlist {
-			allowed[m] = true
-		}
-		filtered := make([]string, 0, len(names))
-		for _, n := range names {
-			if allowed[n] {
-				filtered = append(filtered, n)
-			}
-		}
-		names = filtered
-	}
-	httpx.WriteJSON(w, http.StatusOK, httpx.ModelListResponse(names))
+	httpx.WriteJSON(w, http.StatusOK, httpx.ModelListResponse(s.proxy.Router().ModelNames()))
 }
 
 // getModel serves GET /v1/models/{id}.
 func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
-	identity, err := s.authenticate(w, r)
-	if err != nil {
+	if _, err := s.authenticate(w, r); err != nil {
 		err.Write(w)
 		return
 	}
 	id := r.PathValue("id")
-	known := false
-	for _, n := range s.proxy.Router().ModelNames() {
-		if n == id {
-			known = true
-			break
-		}
-	}
-	if !known {
+	cfg := s.proxy.Config()
+	canonical := cfg.Canonical(id)
+	if len(cfg.Slots(canonical)) == 0 {
 		httpx.NotFound(fmt.Sprintf("model '%s' not found", id)).Write(w)
 		return
 	}
-	if identity.Role == auth.RoleUser && !identity.CanAccessModel(id) {
-		httpx.Forbidden(fmt.Sprintf("model '%s' not allowed", id)).Write(w)
-		return
-	}
-	listing := httpx.ModelListResponse([]string{id})
+	listing := httpx.ModelListResponse([]string{canonical})
 	httpx.WriteJSON(w, http.StatusOK, listing["data"].([]map[string]any)[0])
 }
 
 // Version is reported by /health.
-const Version = "2.0.0"
+const Version = "2.1.0"
 
 // Shutdown drains in-flight requests and waits for them to finish.
 func (s *Server) Shutdown(ctx context.Context) bool {
 	s.proxy.BeginDrain(s.opts.DrainTimeout)
 	if s.limiter != nil {
-		s.limiter.Stop(ctx)
+		s.limiter.Stop()
 	}
 	return true
 }

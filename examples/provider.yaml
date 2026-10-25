@@ -1,0 +1,23 @@
+providers:
+  openai-1:
+    adapter: openai
+    # base_url optional for native adapters (openai/anthropic/gemini); they
+    # default to their official endpoints when omitted.
+    keys: OPENAI_1_KEY, OPENAI_TEMP3_KEY   # first = primary, rest = failover within provider
+  anthropic-1:
+    adapter: anthropic
+    keys: ANTHROPIC_1_KEY
+  google-ai-studio-1:
+    adapter: gemini
+    base_url: https://generativelanguage.googleapis.com
+    keys: GOOGLE_AI_STUDIO_1_KEY
+  # Any OpenAI-compatible endpoint (relay, self-hosted vLLM, whisper.cpp).
+  proxy-1-google-ai-studio:
+    adapter: openai-compat
+    base_url: https://relay.example.net/v1
+    keys: GOOGLE_AI_STUDIO_TEMP2_KEY
+  local-whisper:
+    adapter: openai-compat
+    base_url: http://127.0.0.1:8080/v1
+    keys: WHISPER_PROX_1_KEY
+    ctx: 8192   # optional per-slot context override; beats models.yaml's ctx

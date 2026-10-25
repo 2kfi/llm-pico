@@ -13,7 +13,6 @@ import (
 
 func baseConfig() *config.Config {
 	return &config.Config{
-		GeneralSettings: config.GeneralSettings{MasterKey: "sk-pico-master-test"},
 		RouterSettings: config.RouterSettings{
 			NumRetries:   2,
 			CooldownTime: 45,
@@ -38,11 +37,7 @@ func multiKeyConfig() *config.Config {
 	c.ModelList = []config.ModelEntry{
 		{
 			ModelName:   "test-model",
-			ModelParams: config.ModelParams{Model: "openai/gpt-4", APIKey: "sk-test-key-1", APIBase: "https://api.openai.com/v1"},
-		},
-		{
-			ModelName:   "test-model",
-			ModelParams: config.ModelParams{Model: "openai/gpt-4", APIKey: "sk-test-key-2", APIBase: "https://api.openai.com/v1"},
+			ModelParams: config.ModelParams{Model: "openai/gpt-4", APIKey: "sk-test-key-1", APIKeys: []string{"sk-test-key-1", "sk-test-key-2"}, APIBase: "https://api.openai.com/v1"},
 		},
 	}
 	return c

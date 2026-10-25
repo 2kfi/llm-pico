@@ -1,4 +1,4 @@
-// Package ratelimit enforces the six rate-limit windows llm-pico supports
+// Package ratelimit enforces the rate-limit windows llm-pico supports
 // against per-key and per-model budgets.
 //
 // A request reserves capacity before dispatch and reconciles against actual
@@ -8,29 +8,26 @@
 package ratelimit
 
 import (
-	"context"
-	"database/sql"
-	"sort"
 	"sync"
 	"time"
-
-	"github.com/arkan/llm-pico/internal/store"
 )
 
 // Window identifies one rate-limit dimension.
 type Window string
 
 const (
-	RPM Window = "rpm" // requests per minute
-	RPD Window = "rpd" // requests per day
-	TPM Window = "tpm" // tokens per minute
-	TPD Window = "tpd" // tokens per day
-	ASH Window = "ash" // requests per hour
-	ASD Window = "asd" // requests per day (aggregate)
+	RPM  Window = "rpm"  // requests per minute
+	RPD  Window = "rpd"  // requests per day
+	TPM  Window = "tpm"  // tokens per minute
+	TPD  Window = "tpd"  // tokens per day
+	CPM  Window = "cpm"  // characters per minute (TTS)
+	CPD  Window = "cpd"  // characters per day (TTS)
+	ASEC Window = "asec" // audio seconds per day (TTS/STT)
+	AMIN Window = "amin" // audio minutes per day (STT)
 )
 
 // Windows lists every supported window in check order.
-var Windows = []Window{RPM, TPM, ASH, RPD, TPD, ASD}
+var Windows = []Window{RPM, TPM, RPD, TPD, CPM, CPD, ASEC, AMIN}
 
 // Level distinguishes a per-key limit from a per-model limit. Both are
 // enforced independently and a request must pass both.
@@ -77,17 +74,44 @@ func (r *Rejection) Error() string {
 	return "ratelimit: exceeded " + string(r.Window)
 }
 
-// counter is one window's state for one (key, model, level) cell.
+// Costs carries the per-domain estimates a reservation may charge. Only the
+// windows a limit set constrains are read.
+type Costs struct {
+	Tokens   int64
+	Chars    int64
+	AudioSec int64
+}
+
+// AmountOf is how much one request consumes of w.
+func AmountOf(w Window, c Costs) int64 {
+	switch w {
+	case RPM, RPD:
+		return 1
+	case TPM, TPD:
+		return c.Tokens
+	case CPM, CPD:
+		return c.Chars
+	case ASEC:
+		return c.AudioSec
+	case AMIN:
+		return (c.AudioSec + 59) / 60
+	default:
+		return 1
+	}
+}
+
+// counter is one window's state for one cell.
 type counter struct {
 	windowStart string
 	count       int64
-	dirty       bool
 }
 
-// cellKey identifies a counter.
+// cellKey identifies a counter. slot distinguishes the per-provider-slot cell
+// from the per-model aggregate cell at the same level.
 type cellKey struct {
 	keyHash   string
 	modelName string
+	slot      string
 	level     Level
 	window    Window
 }
@@ -99,15 +123,12 @@ type shard struct {
 	m  map[cellKey]*counter
 }
 
-// Limiter enforces rate limits, holding counters in memory and checkpointing
-// the long-running windows (daily) to SQLite so limits survive a restart.
+// Limiter enforces rate limits, holding counters in memory.
 type Limiter struct {
 	shards []shard
 	mask   uint64
 
-	db            *store.Store
-	flushInterval time.Duration
-	purgeEvery    time.Duration
+	purgeEvery time.Duration
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -120,16 +141,14 @@ type Limiter struct {
 // shardCount must be a power of two.
 const shardCount = 64
 
-// New creates a limiter that checkpoints daily counters to db.
-func New(db *store.Store) *Limiter {
+// New creates an in-memory limiter.
+func New() *Limiter {
 	l := &Limiter{
-		shards:        make([]shard, shardCount),
-		mask:          shardCount - 1,
-		db:            db,
-		flushInterval: time.Minute,
-		purgeEvery:    10 * time.Minute,
-		stopCh:        make(chan struct{}),
-		now:           time.Now,
+		shards:     make([]shard, shardCount),
+		mask:       shardCount - 1,
+		purgeEvery: 10 * time.Minute,
+		stopCh:     make(chan struct{}),
+		now:        time.Now,
 	}
 	for i := range l.shards {
 		l.shards[i].m = make(map[cellKey]*counter)
@@ -137,21 +156,17 @@ func New(db *store.Store) *Limiter {
 	return l
 }
 
-// Start launches the background flush and purge loops.
+// Start launches the background purge loop.
 func (l *Limiter) Start() {
 	l.wg.Add(1)
 	go func() {
 		defer l.wg.Done()
-		flush := time.NewTicker(l.flushInterval)
-		defer flush.Stop()
 		purge := time.NewTicker(l.purgeEvery)
 		defer purge.Stop()
 		for {
 			select {
 			case <-l.stopCh:
 				return
-			case <-flush.C:
-				_ = l.Flush(context.Background())
 			case <-purge.C:
 				l.purgeStale()
 			}
@@ -159,22 +174,20 @@ func (l *Limiter) Start() {
 	}()
 }
 
-// Stop flushes remaining counters and halts the background loop.
-func (l *Limiter) Stop(ctx context.Context) {
+// Stop halts the background loop.
+func (l *Limiter) Stop() {
 	l.stopOnce.Do(func() { close(l.stopCh) })
 	l.wg.Wait()
-	_ = l.Flush(ctx)
 }
 
 // shardFor maps a request onto its counter shard.
 //
-// The window is deliberately excluded from the hash: all six windows for a
-// given key/model/level must land in the same shard so CheckAndReserve can
-// hold one lock across both its validation and commit phases. Splitting them
-// would let two concurrent requests both pass validation and then both commit,
-// overshooting the limit.
-func (l *Limiter) shardFor(keyHash, modelName string, level Level) *shard {
-	h := fnv64(keyHash) ^ fnv64(modelName) ^ uint64(len(level))<<32
+// The window is deliberately excluded from the hash: all windows for a given
+// cell must land in the same shard so CheckAndReserve can hold one lock across
+// its validation and commit phases. Splitting them would let two concurrent
+// requests both pass validation and then both commit, overshooting the limit.
+func (l *Limiter) shardFor(k cellKey) *shard {
+	h := fnv64(k.keyHash) ^ fnv64(k.modelName) ^ fnv64(k.slot) ^ uint64(len(k.level))<<32
 	return &l.shards[h&l.mask]
 }
 
@@ -191,17 +204,13 @@ func fnv64(s string) uint64 {
 	return h
 }
 
-// windowStart returns the canonical bucket label for a window at time t. Every
-// counter in a bucket shares one label, which doubles as the SQLite key, so
-// comparisons are plain string comparisons.
+// windowStart returns the canonical bucket label for a window at time t.
 func windowStart(w Window, t time.Time) string {
 	utc := t.UTC()
 	switch w {
-	case RPM, TPM:
+	case RPM, TPM, CPM:
 		return utc.Format("2006-01-02T15:04:00")
-	case ASH:
-		return utc.Format("2006-01-02T15:00:00")
-	default: // RPD, TPD, ASD
+	default: // RPD, TPD, CPD, ASEC, AMIN
 		return utc.Format("2006-01-02")
 	}
 }
@@ -210,240 +219,142 @@ func windowStart(w Window, t time.Time) string {
 func WindowEnd(w Window, t time.Time) time.Time {
 	utc := t.UTC()
 	switch w {
-	case RPM, TPM:
+	case RPM, TPM, CPM:
 		return utc.Truncate(time.Minute).Add(time.Minute)
-	case ASH:
-		return utc.Truncate(time.Hour).Add(time.Hour)
 	default:
 		return time.Date(utc.Year(), utc.Month(), utc.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
 	}
 }
 
-// reserveAmount is how much a single request consumes of a window.
-// Count-based windows consume one request; token-based windows consume the
-// reservation.
-func reserveAmount(w Window, reservation int64) int64 {
-	switch w {
-	case RPM, RPD, ASH, ASD:
-		return 1
-	default: // TPM, TPD
-		return reservation
+// counterFor returns the current bucket for a cell, creating it on rollover.
+// The caller must hold the cell's shard lock.
+func (l *Limiter) counterFor(sh *shard, k cellKey, w Window, now time.Time) *counter {
+	start := windowStart(w, now)
+	c := sh.m[k]
+	if c == nil || c.windowStart != start {
+		c = &counter{windowStart: start}
+		sh.m[k] = c
 	}
+	return c
 }
 
-// persistent reports whether a window is checkpointed to SQLite. Minute and
-// hour windows roll over faster than the flush interval, so persisting them
-// is wasted I/O.
-func persistent(w Window) bool {
-	switch w {
-	case RPD, TPD, ASD:
-		return true
-	default:
-		return false
-	}
+// stagedCharge is one committed window increment, kept so a later rejection
+// in the same limit set can roll it back.
+type stagedCharge struct {
+	window Window
+	amount int64
 }
 
 // CheckAndReserve tests every configured window and, only if all pass,
 // commits the increments.
 //
-// Validation and commit happen under a single shard lock. Releasing between
-// the two phases would let concurrent requests for the same key each pass
-// validation and then both commit, overshooting the limit.
-func (l *Limiter) CheckAndReserve(keyHash, modelName string, level Level, limits Limits, reservation int64) *Rejection {
+// Validation and commit run window by window under each cell's shard lock;
+// a rejection rolls back the already-committed increments of earlier windows.
+func (l *Limiter) CheckAndReserve(keyHash, modelName, slot string, level Level, limits Limits, c Costs) *Rejection {
 	now := l.now()
-	sh := l.shardFor(keyHash, modelName, level)
-
-	type staged struct {
-		window Window
-		amount int64
-	}
-	var pending []staged
-
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	var pending []stagedCharge
 
 	for _, w := range Windows {
 		limit, ok := limits.limit(w)
 		if !ok {
 			continue
 		}
-		start := windowStart(w, now)
-		key := cellKey{keyHash: keyHash, modelName: modelName, level: level, window: w}
+		key := cellKey{keyHash: keyHash, modelName: modelName, slot: slot, level: level, window: w}
+		sh := l.shardFor(key)
 
-		c := sh.m[key]
-		if c == nil || c.windowStart != start {
-			// The bucket rolled over since this counter was last touched.
-			sh.m[key] = l.restore(key, w, start)
-			c = sh.m[key]
-		}
-
-		amount := reserveAmount(w, reservation)
-		if c.count+amount > limit {
+		sh.mu.Lock()
+		counter := l.counterFor(sh, key, w, now)
+		amount := AmountOf(w, c)
+		if counter.count+amount > limit {
+			sh.mu.Unlock()
+			l.rollback(keyHash, modelName, slot, level, pending, now)
 			return &Rejection{
 				Window:     w,
 				Limit:      limit,
-				Count:      c.count,
+				Count:      counter.count,
 				RetryAfter: WindowEnd(w, now).Sub(now),
 			}
 		}
-		pending = append(pending, staged{window: w, amount: amount})
-	}
-
-	for _, s := range pending {
-		key := cellKey{keyHash: keyHash, modelName: modelName, level: level, window: s.window}
-		if c := sh.m[key]; c != nil {
-			c.count += s.amount
-			c.dirty = true
-		}
+		counter.count += amount
+		sh.mu.Unlock()
+		pending = append(pending, stagedCharge{window: w, amount: amount})
 	}
 	return nil
 }
 
-// restore loads a counter for a bucket that is not in memory. Daily windows
-// survive restarts in SQLite; shorter windows start empty because they have
-// already rolled over.
-func (l *Limiter) restore(key cellKey, w Window, start string) *counter {
-	c := &counter{windowStart: start}
-	if !persistent(w) || l.db == nil {
-		return c
+func (l *Limiter) rollback(keyHash, modelName, slot string, level Level, pending []stagedCharge, now time.Time) {
+	for _, s := range pending {
+		key := cellKey{keyHash: keyHash, modelName: modelName, slot: slot, level: level, window: s.window}
+		sh := l.shardFor(key)
+		sh.mu.Lock()
+		if c := sh.m[key]; c != nil && c.windowStart == windowStart(s.window, now) {
+			c.count = max(0, c.count-s.amount)
+		}
+		sh.mu.Unlock()
 	}
-	var n int64
-	if err := l.db.Get(context.Background(), &n,
-		`SELECT count FROM rate_counters
-		 WHERE key_hash=? AND model_name=? AND level=? AND window_type=? AND window_start=?`,
-		key.keyHash, key.modelName, string(key.level), string(w), start); err == nil {
-		c.count = n
+}
+
+// Refund credits back a full reservation, e.g. when a request never reached
+// an upstream. Windows outside the limit set are skipped.
+func (l *Limiter) Refund(keyHash, modelName, slot string, level Level, limits Limits, c Costs) {
+	now := l.now()
+	for _, w := range Windows {
+		if _, ok := limits.limit(w); !ok {
+			continue
+		}
+		key := cellKey{keyHash: keyHash, modelName: modelName, slot: slot, level: level, window: w}
+		sh := l.shardFor(key)
+		sh.mu.Lock()
+		if c2 := sh.m[key]; c2 != nil && c2.windowStart == windowStart(w, now) {
+			c2.count = max(0, c2.count-AmountOf(w, c))
+		}
+		sh.mu.Unlock()
 	}
-	return c
 }
 
 // Reconcile returns the difference between actual and reserved usage. It must
-// be called exactly once per successful CheckAndReserve, otherwise token
+// be called exactly once per successful reservation, otherwise token
 // reservations leak.
-func (l *Limiter) Reconcile(keyHash, modelName string, level Level, actual, reserved int64) {
+func (l *Limiter) Reconcile(keyHash, modelName, slot string, level Level, actual, reserved int64) {
 	delta := actual - reserved
 	if delta == 0 {
 		return
 	}
 	now := l.now()
-	sh := l.shardFor(keyHash, modelName, level)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-
 	for _, w := range []Window{TPM, TPD} {
-		key := cellKey{keyHash: keyHash, modelName: modelName, level: level, window: w}
-		start := windowStart(w, now)
-		c := sh.m[key]
-		if c == nil || c.windowStart != start {
-			c = l.restore(key, w, start)
-			sh.m[key] = c
-		}
+		key := cellKey{keyHash: keyHash, modelName: modelName, slot: slot, level: level, window: w}
+		sh := l.shardFor(key)
+		sh.mu.Lock()
+		c := l.counterFor(sh, key, w, now)
 		// A negative delta must not drive the counter below zero.
 		c.count = max(0, c.count+delta)
-		c.dirty = true
+		sh.mu.Unlock()
 	}
 }
 
 // Usage reports the current count for one window, for the X-RateLimit headers.
-func (l *Limiter) Usage(keyHash, modelName string, level Level, w Window) int64 {
-	sh := l.shardFor(keyHash, modelName, level)
+func (l *Limiter) Usage(keyHash, modelName, slot string, level Level, w Window) int64 {
+	key := cellKey{keyHash: keyHash, modelName: modelName, slot: slot, level: level, window: w}
+	sh := l.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	c := sh.m[cellKey{keyHash: keyHash, modelName: modelName, level: level, window: w}]
+	c := sh.m[key]
 	if c == nil || c.windowStart != windowStart(w, l.now()) {
 		return 0
 	}
 	return c.count
 }
 
-// Flush checkpoints dirty daily counters to SQLite.
-func (l *Limiter) Flush(ctx context.Context) error {
-	if l.db == nil {
-		return nil
-	}
-	now := l.now()
-
-	type pending struct {
-		key   cellKey
-		count int64
-		start string
-	}
-	var rows []pending
-
-	for i := range l.shards {
-		l.shards[i].mu.Lock()
-		for k, c := range l.shards[i].m {
-			if !c.dirty || !persistent(k.window) || c.windowStart != windowStart(k.window, now) {
-				continue
-			}
-			rows = append(rows, pending{key: k, count: c.count, start: c.windowStart})
-		}
-		l.shards[i].mu.Unlock()
-	}
-	if len(rows) == 0 {
-		return nil
-	}
-
-	// Deterministic order keeps the write pattern reproducible under test.
-	sort.Slice(rows, func(a, b int) bool {
-		x, y := rows[a].key, rows[b].key
-		if x.keyHash != y.keyHash {
-			return x.keyHash < y.keyHash
-		}
-		if x.modelName != y.modelName {
-			return x.modelName < y.modelName
-		}
-		return x.window < y.window
-	})
-
-	err := l.db.WithTx(ctx, func(tx *sql.Tx) error {
-		for _, r := range rows {
-			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO rate_counters (key_hash, model_name, level, window_type, window_start, count)
-				VALUES (?, ?, ?, ?, ?, ?)
-				ON CONFLICT(key_hash, model_name, level, window_type, window_start)
-				DO UPDATE SET count = excluded.count`,
-				r.key.keyHash, r.key.modelName, string(r.key.level),
-				string(r.key.window), r.start, r.count); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	for i := range l.shards {
-		l.shards[i].mu.Lock()
-		for _, r := range rows {
-			if c := l.shards[i].m[r.key]; c != nil && c.count == r.count {
-				c.dirty = false
-			}
-		}
-		l.shards[i].mu.Unlock()
-	}
-	return nil
-}
-
 // purgeStale drops counters whose bucket has rolled over, so memory does not
 // grow without bound as keys come and go.
-//
-// A stale counter for a non-persistent window is always dropped: those windows
-// are never written to SQLite, so nothing is lost. A stale persistent counter
-// is retained while dirty so its final value still reaches the database.
 func (l *Limiter) purgeStale() {
 	now := l.now()
 	for i := range l.shards {
 		l.shards[i].mu.Lock()
 		for k, c := range l.shards[i].m {
-			if c.windowStart == windowStart(k.window, now) {
-				continue
+			if c.windowStart != windowStart(k.window, now) {
+				delete(l.shards[i].m, k)
 			}
-			if persistent(k.window) && c.dirty {
-				continue
-			}
-			delete(l.shards[i].m, k)
 		}
 		l.shards[i].mu.Unlock()
 	}

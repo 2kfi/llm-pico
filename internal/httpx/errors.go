@@ -16,7 +16,6 @@ const (
 	TypeForbidden       = "forbidden"
 	TypeNotFound        = "not_found"
 	TypeRateLimited     = "rate_limit_exceeded"
-	TypeBudgetExceeded  = "budget_exceeded"
 	TypeUpstream        = "upstream_error"
 	TypeUpstreamTimeout = "upstream_timeout"
 	TypeNotImplemented  = "not_implemented"
@@ -36,6 +35,9 @@ type Error struct {
 	Message    string
 	RetryAfter int            // seconds, emitted as a Retry-After header when set
 	Extra      map[string]any // additional fields merged into the envelope
+	// Headers are emitted alongside the error, e.g. quota 429s carry the
+	// X-RateLimit-* numbers that gate the rejection.
+	Headers http.Header
 }
 
 func (e *Error) Error() string { return e.Type + ": " + e.Message }
@@ -100,6 +102,11 @@ func (e *Error) Write(w http.ResponseWriter) {
 	if e.RetryAfter > 0 {
 		w.Header().Set("Retry-After", itoa(e.RetryAfter))
 	}
+	for k, vs := range e.Headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(e.Status)
 	_, _ = w.Write(e.Marshal())
@@ -109,8 +116,6 @@ func (e *Error) Write(w http.ResponseWriter) {
 func Errorf(status int, errType, message string) *Error {
 	return &Error{Status: status, Type: errType, Message: message}
 }
-
-// Common constructors.
 
 func BadRequest(msg string) *Error   { return Errorf(http.StatusBadRequest, TypeBadRequest, msg) }
 func Unauthorized(msg string) *Error { return Errorf(http.StatusUnauthorized, TypeUnauthorized, msg) }
@@ -130,11 +135,6 @@ func RateLimited(msg string, retryAfter int) *Error {
 	return &Error{Status: http.StatusTooManyRequests, Type: TypeRateLimited, Message: msg, RetryAfter: retryAfter}
 }
 
-// BudgetExceeded reports a hard budget block.
-func BudgetExceeded(msg string) *Error {
-	return Errorf(http.StatusTooManyRequests, TypeBudgetExceeded, msg)
-}
-
 // Upstream reports a failed upstream call, passing through its status when one
 // is meaningful to the client.
 func Upstream(status int, msg string) *Error {
@@ -148,8 +148,6 @@ func Upstream(status int, msg string) *Error {
 func UpstreamTimeout(msg string) *Error {
 	return Errorf(http.StatusGatewayTimeout, TypeUpstreamTimeout, msg)
 }
-
-// --- JSON helpers ---
 
 // WriteJSON sends a value as a JSON response.
 func WriteJSON(w http.ResponseWriter, status int, v any) {

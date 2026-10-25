@@ -30,7 +30,7 @@ const (
 type Spec struct {
 	// Slug is the provider name matched against a model's provider prefix.
 	Slug string
-	// DisplayName is shown in the dashboard.
+	// DisplayName is a human-readable label.
 	DisplayName string
 	// BaseURL is the default upstream.
 	BaseURL string
@@ -48,11 +48,11 @@ type Spec struct {
 	Probeable bool
 }
 
-// Definition is a runtime-configured provider, stored in the database.
+// Definition is a runtime-configured provider, loaded from provider.yaml.
 //
 // This is the mechanism that removes recompilation from the common case: a
-// provider that speaks one of the three known protocols is added by inserting
-// a row and entering its base URL in the dashboard. No code change, no build.
+// provider that speaks one of the three known protocols is configured with a
+// base URL. No code change, no build.
 type Definition struct {
 	Slug         string
 	DisplayName  string
@@ -75,7 +75,7 @@ var builtin = []Spec{
 		Auth: AuthQueryKey, QueryParam: "key", Capabilities: Capability{Images: true, Embeddings: true}, Probeable: true},
 }
 
-// catalog is the built-in provider list rendered in the dashboard.
+// catalog is the built-in provider list returned by Catalog.
 var catalog = []map[string]any{
 	{"id": "openai", "name": "OpenAI", "category": "cloud", "base_url": DefaultBaseURL,
 		"auth": "bearer", "fields": []string{"api_key"}, "capabilities": []string{"Text", "Vision", "Image", "Embeddings", "STT", "TTS"}},
@@ -85,7 +85,7 @@ var catalog = []map[string]any{
 		"auth": "query_key", "fields": []string{"api_key"}, "capabilities": []string{"Text", "Vision", "Embeddings"}},
 }
 
-// Catalog returns the built-in provider list for the dashboard.
+// Catalog returns the built-in provider list.
 func Catalog() []map[string]any { return catalog }
 
 // Registry resolves provider slugs to adapters.
@@ -116,9 +116,8 @@ func NewRegistry(client *Client) *Registry {
 	return r
 }
 
-// Define registers a runtime-configured provider. It takes effect immediately
-// for subsequent lookups and is what the admin API calls when an operator adds
-// a new provider.
+// Define registers a runtime-configured provider; it takes effect
+// immediately for subsequent lookups.
 func (r *Registry) Define(d Definition) error {
 	if d.Slug == "" {
 		return fmt.Errorf("providers: definition needs a slug")

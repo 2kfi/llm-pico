@@ -13,3 +13,4 @@ build/
 *.whl
 docker-compose.yml
 ui-ux.md
+keys.env

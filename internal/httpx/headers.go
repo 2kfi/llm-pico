@@ -15,7 +15,8 @@ import (
 // see a stable sequence.
 var rateLimitWindows = []ratelimit.Window{
 	ratelimit.RPM, ratelimit.RPD, ratelimit.TPM,
-	ratelimit.TPD, ratelimit.ASH, ratelimit.ASD,
+	ratelimit.TPD, ratelimit.CPM, ratelimit.CPD,
+	ratelimit.ASEC, ratelimit.AMIN,
 }
 
 // headerName renders a window as its X-RateLimit-* suffix, e.g. RPM.
@@ -29,7 +30,7 @@ func headerName(w ratelimit.Window) string {
 // client can pace itself without guessing. With no limiter or no configured
 // limits, the result is empty rather than an error: an admin key has no
 // per-key limits, and reporting none is the honest answer.
-func RateLimitHeaders(limiter *ratelimit.Limiter, keyHash, modelName string, level ratelimit.Level, limits ratelimit.Limits) http.Header {
+func RateLimitHeaders(limiter *ratelimit.Limiter, keyHash, modelName, slot string, level ratelimit.Level, limits ratelimit.Limits) http.Header {
 	h := http.Header{}
 	if limiter == nil || !limits.HasAny() {
 		return h
@@ -40,7 +41,7 @@ func RateLimitHeaders(limiter *ratelimit.Limiter, keyHash, modelName string, lev
 		if !ok || limit == nil {
 			continue
 		}
-		used := limiter.Usage(keyHash, modelName, level, w)
+		used := limiter.Usage(keyHash, modelName, slot, level, w)
 		remaining := *limit - used
 		if remaining < 0 {
 			remaining = 0
@@ -77,7 +78,9 @@ func ModelListResponse(names []string) map[string]any {
 	return map[string]any{"object": "list", "data": data}
 }
 
-// ChainHeaders describes which models a Chain-of-LLMs hop actually tried.
+// ChainHeaders reports the outcome of a fallback chain as response headers:
+// the model that actually served the request, how many hops the chain took,
+// and which models were tried.
 //
 // They are returned even on success, because a caller pinned to an expensive
 // model needs to know it silently landed on a cheaper one.
@@ -100,8 +103,8 @@ func LogRequest(method, path string, status int, latency time.Duration) string {
 	return fmt.Sprintf("%s %s %d %s", method, path, status, latency.Round(time.Millisecond))
 }
 
-// SortedKeys returns map keys in a stable order, so generated output such as
-// the Prometheus endpoint is reproducible.
+// SortedKeys returns map keys in a stable order, so output generated from a
+// map is reproducible.
 func SortedKeys[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
