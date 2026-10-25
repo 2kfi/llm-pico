@@ -65,7 +65,11 @@ type Service struct {
 	mode      atomic.Value // DegradationMode
 
 	draining atomic.Bool
+	// inFlight covers dispatches; streamWG covers the copy goroutines that
+	// finish streaming a response after Dispatch has returned. Drain waits
+	// for both so graceful shutdown does not cut a stream mid-flight.
 	inFlight sync.WaitGroup
+	streamWG sync.WaitGroup
 
 	// queue bounds concurrent requests in fallback_only mode.
 	sem chan struct{}
@@ -123,6 +127,7 @@ func (s *Service) BeginDrain(timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
 		s.inFlight.Wait()
+		s.streamWG.Wait()
 		close(done)
 	}()
 	select {
@@ -648,7 +653,12 @@ func (s *Service) callStreaming(
 		})
 	}
 
+	// The stream settles and closes after Dispatch has returned, which
+	// BeginDrain's dispatch counter no longer covers; drain therefore
+	// tracks this goroutine separately.
+	s.streamWG.Add(1)
 	go func() {
+		defer s.streamWG.Done()
 		var last *providers.Usage
 		for {
 			chunk, err := stream.Next()

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/arkan/llm-pico/internal/config"
 	"github.com/arkan/llm-pico/internal/httpx"
@@ -218,5 +219,54 @@ func TestStreamingForwardsDoneSentinel(t *testing.T) {
 		if !strings.Contains(string(all), want) {
 			t.Errorf("stream missing chunk frame %q", want)
 		}
+	}
+}
+
+// Drain must wait for the streaming copy goroutine, which outlives Dispatch:
+// BeginDrain finishes only after the upstream stream has been fully copied
+// to the client.
+func TestDrainWaitsForStreamingCopy(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"early\"}}]}\n\n"))
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+	svc := newService(t, chatConfig(upstream, "m", "alpha"), nil)
+
+	resp, err := svc.Dispatch(context.Background(), DispatchInput{
+		Model: "m", RouteType: RouteChat, Body: []byte(`{"model":"m","stream":true}`),
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	readDone := make(chan []byte, 1)
+	go func() {
+		all, _ := io.ReadAll(resp.Body)
+		readDone <- all
+	}()
+
+	drainDone := make(chan bool, 1)
+	go func() { drainDone <- svc.BeginDrain(time.Second) }()
+
+	// The upstream is still open, so drain must be blocked by the copy
+	// goroutine even though Dispatch itself has returned.
+	select {
+	case <-drainDone:
+		t.Fatal("BeginDrain returned while a streaming copy was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	all := <-readDone
+	if !strings.HasSuffix(string(all), "data: [DONE]\n\n") {
+		t.Fatalf("stream = %q, want trailing data: [DONE]\\n\\n", all)
+	}
+	if <-drainDone != true {
+		t.Error("BeginDrain timed out after the stream finished")
 	}
 }
