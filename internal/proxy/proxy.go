@@ -29,9 +29,8 @@ import (
 type RouteType string
 
 const (
-	RouteChat        RouteType = "chat"
-	RouteCompletions RouteType = "completions"
-	RouteEmbeddings  RouteType = "embeddings"
+	RouteChat       RouteType = "chat"
+	RouteEmbeddings RouteType = "embeddings"
 	RouteSTT         RouteType = "stt"
 	RouteTTS         RouteType = "tts"
 )

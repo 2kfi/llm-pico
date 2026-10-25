@@ -6,7 +6,7 @@ instance is defined by four files.
 
 Routes:
 
-- `POST /v1/chat/completions`, `POST /v1/completions` (streaming supported)
+- `POST /v1/chat/completions` (streaming supported)
 - `POST /v1/embeddings`
 - `POST /v1/audio/speech` (TTS), `POST /v1/audio/transcriptions` (STT)
 - `GET /v1/models`, `GET /v1/models/{id}` (canonical names only)

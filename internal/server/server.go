@@ -70,7 +70,11 @@ func (s *Server) routes() *http.ServeMux {
 
 	// OpenAI-compatible surface.
 	mux.HandleFunc("POST /v1/chat/completions", s.handle(proxy.RouteChat))
-	mux.HandleFunc("POST /v1/completions", s.handle(proxy.RouteCompletions))
+	// The legacy text-completions shape was never wired through; reject it
+	// with a clear message so old tooling does not guess at it.
+	mux.HandleFunc("POST /v1/completions", func(w http.ResponseWriter, r *http.Request) {
+		httpx.BadRequest("legacy completions endpoint is not supported; use /v1/chat/completions").Write(w)
+	})
 	mux.HandleFunc("POST /v1/embeddings", s.handle(proxy.RouteEmbeddings))
 	mux.HandleFunc("POST /v1/audio/transcriptions", s.handle(proxy.RouteSTT))
 	mux.HandleFunc("POST /v1/audio/speech", s.handle(proxy.RouteTTS))
