@@ -6,10 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
-	"os"
 	"strings"
-	"time"
 )
 
 // HashKey returns the SHA-256 hash of a raw key.
@@ -59,35 +56,4 @@ func VerifyHMAC(secret string, body []byte, signature string) bool {
 // secureEqual compares two strings without leaking length or content by timing.
 func secureEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
-}
-
-func nowISO() string { return time.Now().UTC().Format("2006-01-02T15:04:05") }
-
-// AuditLog appends structured JSONL records for administrative actions. It is
-// best-effort: failing to audit must never fail the action being audited.
-type AuditLog struct {
-	path string
-}
-
-// NewAuditLog creates an audit log writing to path.
-func NewAuditLog(path string) *AuditLog { return &AuditLog{path: path} }
-
-// Write appends one entry.
-func (a *AuditLog) Write(entry map[string]any) {
-	if a == nil || a.path == "" {
-		return
-	}
-	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	if _, ok := entry["ts"]; !ok {
-		entry["ts"] = nowISO()
-	}
-	// HTML escaping is disabled so URLs and model names survive intact.
-	enc := json.NewEncoder(f)
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(entry)
 }

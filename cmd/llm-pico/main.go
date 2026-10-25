@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/arkan/llm-pico/internal/auth"
 	"github.com/arkan/llm-pico/internal/config"
 	"github.com/arkan/llm-pico/internal/providers"
 	"github.com/arkan/llm-pico/internal/proxy"
@@ -17,7 +16,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -76,7 +74,6 @@ func run(opts runOptions) error {
 
 	svc := proxy.NewService(cfg, reg, opts.log)
 	svc.SetLimiter(limiter)
-	svc.SetAudit(auth.NewAuditLog(filepath.Join(opts.configDir, "audit.jsonl")))
 
 	httpServer := startHTTP(opts, svc)
 

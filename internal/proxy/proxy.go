@@ -56,7 +56,6 @@ const (
 // requests and without any request observing a half-applied configuration.
 type Service struct {
 	limiter *ratelimit.Limiter
-	Audit   *auth.AuditLog
 	Latency *observability.LatencyTracker
 	Log     *slog.Logger
 
@@ -88,9 +87,6 @@ func NewService(cfg *config.Config, providers *providers.Registry, logger *slog.
 
 // SetLimiter attaches the rate limiter built from the loaded configuration.
 func (s *Service) SetLimiter(l *ratelimit.Limiter) { s.limiter = l }
-
-// SetAudit attaches the audit log.
-func (s *Service) SetAudit(a *auth.AuditLog) { s.Audit = a }
 
 // Reload swaps the configuration and routing table without touching in-flight
 // requests; a new request sees either the old or the new snapshot in full.
@@ -426,9 +422,9 @@ func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInp
 				httpx.ApplyHeader(resp.Header, res.headers)
 				resp.Header.Set("X-Request-Id", ac.tracer.ID())
 			}
-			// For a buffered response this settles the accounting now; for a
-			// stream it settles when the copy goroutine finishes.
-			finalize(target, nil)
+			// For a buffered response the accounting already settled
+			// inline; for a stream nil finalize means nothing more to do.
+			finalize(nil)
 			return resp, nil
 		}
 
@@ -530,31 +526,31 @@ func (s *Service) refund(res *reservation) {
 
 // callUsage is what a completed upstream call cost.
 type callUsage struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	Latency          time.Duration
+	TotalTokens int
+	Latency     time.Duration
 }
 
-// finalize settles accounting for one call. For a buffered response it runs
-// inline; for a stream the copy goroutine runs it once the body is drained.
-func finalizeFn(s *Service, in DispatchInput, res *reservation, u *callUsage, target *router.Target, onDone func()) func(*router.Target, error) {
-	return func(finalTarget *router.Target, err error) {
-		defer onDone()
+// finalizeFn settles accounting for one call exactly once. For a buffered
+// response it runs inline; for a stream the copy goroutine runs it when the
+// body is drained.
+func finalizeFn(s *Service, res *reservation, u *callUsage, err error) {
+	if u == nil {
+		defer s.refund(res)
+		return
+	}
 
-		total := u.TotalTokens
-		if total == 0 && res != nil {
-			// A provider reporting no usage is assumed to have consumed
-			// exactly what was reserved, which keeps the limiter from drifting
-			// in either direction.
-			total = int(res.tokens)
-		}
+	total := u.TotalTokens
+	if total == 0 && res != nil {
+		// A provider reporting no usage is assumed to have consumed
+		// exactly what was reserved, which keeps the limiter from drifting
+		// in either direction.
+		total = int(res.tokens)
+	}
 
-		if err == nil {
-			s.settle(res, int64(total))
-		} else {
-			s.refund(res)
-		}
+	if err == nil {
+		s.settle(res, int64(total))
+	} else {
+		s.refund(res)
 	}
 }
 
@@ -566,7 +562,7 @@ func (s *Service) call(
 	target *router.Target,
 	adapter providers.Adapter,
 	res *reservation,
-) (*http.Response, func(*router.Target, error), error) {
+) (*http.Response, func(error), error) {
 	req := providers.Request{
 		Body:    in.Body,
 		Model:   target.Model.ModelParams.Model,
@@ -609,7 +605,7 @@ func (s *Service) call(
 		return nil, nil, upstreamError(err, target.ProviderSlug)
 	}
 
-	if in.RouteType == RouteChat || in.RouteType == RouteCompletions {
+	if in.RouteType == RouteChat {
 		u = bufferedUsage(resp.Body)
 	}
 	u.Latency = time.Since(start)
@@ -621,7 +617,8 @@ func (s *Service) call(
 		Body:          io.NopCloser(strings.NewReader(string(resp.Body))),
 		ContentLength: int64(len(resp.Body)),
 	}
-	return out, finalizeFn(s, in, res, u, target, func() {}), nil
+	finalizeFn(s, res, u, nil)
+	return out, func(error) {}, nil
 }
 
 // callStreaming pipes the upstream stream to the client and settles accounting
@@ -634,7 +631,7 @@ func (s *Service) callStreaming(
 	req providers.Request,
 	res *reservation,
 	start time.Time,
-) (*http.Response, func(*router.Target, error), error) {
+) (*http.Response, func(error), error) {
 	req.Stream = true
 	stream, err := adapter.Stream(ctx, req)
 	if err != nil {
@@ -645,9 +642,9 @@ func (s *Service) callStreaming(
 	info := &callUsage{Latency: time.Since(start)}
 	settle := sync.Once{}
 
-	finalize := func(finalTarget *router.Target, err error) {
+	finalize := func(err error) {
 		settle.Do(func() {
-			finalizeFn(s, in, res, info, target, func() {})(finalTarget, err)
+			finalizeFn(s, res, info, err)
 		})
 	}
 
@@ -658,7 +655,7 @@ func (s *Service) callStreaming(
 			if err != nil {
 				if err != io.EOF {
 					_ = pw.CloseWithError(err)
-					finalize(target, err)
+					finalize(err)
 					return
 				}
 				break
@@ -691,13 +688,11 @@ func (s *Service) callStreaming(
 		_ = pw.Close()
 
 		if last != nil {
-			info.PromptTokens = last.PromptTokens
-			info.CompletionTokens = last.CompletionTokens
 			info.TotalTokens = last.TotalTokens
 		}
 		info.Latency = time.Since(start)
 		s.Latency.Record(target.Model.ModelName, target.ProviderSlug, int(info.Latency.Milliseconds()))
-		finalize(target, nil)
+		finalize(nil)
 	}()
 
 	return &http.Response{
@@ -714,7 +709,6 @@ func (s *Service) callStreaming(
 
 // bufferedUsage extracts token counts from a non-streaming response body.
 func bufferedUsage(body []byte) *callUsage {
-	u := &callUsage{}
 	var payload struct {
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
@@ -723,15 +717,13 @@ func bufferedUsage(body []byte) *callUsage {
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return u
+		return &callUsage{}
 	}
-	u.PromptTokens = payload.Usage.PromptTokens
-	u.CompletionTokens = payload.Usage.CompletionTokens
-	u.TotalTokens = payload.Usage.TotalTokens
-	if u.TotalTokens == 0 {
-		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	total := payload.Usage.TotalTokens
+	if total == 0 {
+		total = payload.Usage.PromptTokens + payload.Usage.CompletionTokens
 	}
-	return u
+	return &callUsage{TotalTokens: total}
 }
 
 // upstreamError converts a provider failure into an API error, passing the
