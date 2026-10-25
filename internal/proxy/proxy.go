@@ -51,19 +51,19 @@ const (
 
 // Service is the request-handling core. One instance serves the process.
 //
-// Configuration and the routing table are held behind atomic pointers so a
-// hot reload swaps them without blocking in-flight requests and without any
-// request observing a half-applied configuration.
+// Configuration, the routing table and the provider registry are held behind
+// atomic pointers so a hot reload swaps them without blocking in-flight
+// requests and without any request observing a half-applied configuration.
 type Service struct {
-	limiter   *ratelimit.Limiter
-	Providers *providers.Registry
-	Latency   *observability.LatencyTracker
-	Audit     *auth.AuditLog
-	Log       *slog.Logger
+	limiter *ratelimit.Limiter
+	Audit   *auth.AuditLog
+	Latency *observability.LatencyTracker
+	Log     *slog.Logger
 
-	config atomic.Pointer[config.Config]
-	routes atomic.Pointer[router.Router]
-	mode   atomic.Value // DegradationMode
+	config    atomic.Pointer[config.Config]
+	routes    atomic.Pointer[router.Router]
+	providers atomic.Pointer[providers.Registry]
+	mode      atomic.Value // DegradationMode
 
 	draining atomic.Bool
 	inFlight sync.WaitGroup
@@ -75,13 +75,13 @@ type Service struct {
 // NewService builds a Service from a configuration snapshot.
 func NewService(cfg *config.Config, providers *providers.Registry, logger *slog.Logger) *Service {
 	s := &Service{
-		Providers: providers,
-		Latency:   observability.NewLatencyTracker(1000),
-		Log:       logger,
-		sem:       make(chan struct{}, 512),
+		Latency: observability.NewLatencyTracker(1000),
+		Log:     logger,
+		sem:     make(chan struct{}, 512),
 	}
 	s.config.Store(cfg)
 	s.routes.Store(router.New(cfg))
+	s.providers.Store(providers)
 	s.mode.Store(DegradationNormal)
 	return s
 }
@@ -96,7 +96,7 @@ func (s *Service) SetAudit(a *auth.AuditLog) { s.Audit = a }
 // requests; a new request sees either the old or the new snapshot in full.
 func (s *Service) Reload(cfg *config.Config, reg *providers.Registry) {
 	if reg != nil {
-		s.Providers = reg
+		s.providers.Store(reg)
 	}
 	s.config.Store(cfg)
 	s.routes.Store(router.New(cfg))
@@ -104,6 +104,9 @@ func (s *Service) Reload(cfg *config.Config, reg *providers.Registry) {
 
 // Config returns the current configuration snapshot.
 func (s *Service) Config() *config.Config { return s.config.Load() }
+
+// Registry returns the current provider registry snapshot.
+func (s *Service) Registry() *providers.Registry { return s.providers.Load() }
 
 // Router returns the current routing table.
 func (s *Service) Router() *router.Router { return s.routes.Load() }
@@ -413,7 +416,7 @@ func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInp
 			res = quota
 		}
 
-		adapter := s.Providers.AdapterFor(target.ProviderSlug, target.APIBase)
+		adapter := s.Registry().AdapterFor(target.ProviderSlug, target.APIBase)
 		resp, finalize, err := s.call(ctx, in, target, adapter, res)
 
 		if err == nil {

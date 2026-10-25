@@ -162,7 +162,7 @@ func probeUpstreams(svc *proxy.Service, log *slog.Logger) {
 	const maxBackoff = 5 * time.Minute
 	for {
 		cfg := svc.Config()
-		reg := svc.Providers
+		reg := svc.Registry()
 		var failed int
 		for _, p := range cfg.Providers() {
 			adapter := reg.AdapterFor(p.Adapter, p.BaseURL)
