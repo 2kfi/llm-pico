@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,8 +22,9 @@ import (
 type Options struct {
 	Proxy  *proxy.Service
 	Logger *slog.Logger
-	// MaxBodyBytes bounds request bodies. Audio uploads are the largest
-	// legitimate payload, so the default leaves generous headroom.
+	// MaxBodyBytes bounds request bodies on JSON routes. Audio uploads
+	// have their own, larger limit because a shared 64 MiB bound would
+	// refuse long recordings.
 	MaxBodyBytes int64
 	// DrainTimeout bounds how long shutdown waits for in-flight requests.
 	DrainTimeout time.Duration
@@ -85,13 +87,15 @@ func (s *Server) routes() *http.ServeMux {
 // handle builds a proxy handler for one route type.
 func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		identity, authErr := s.authenticate(w, r)
-		if authErr != nil {
-			authErr.Write(w)
-			return
+		// Audio uploads are the largest legitimate payload, so they get
+		// their own ceiling; every other route shares the general bound.
+		// The limit is installed before anything reads the body, so auth
+		// cannot consume an unbounded stream.
+		limit := s.opts.MaxBodyBytes
+		if route == proxy.RouteSTT {
+			limit = maxAudioBytes
 		}
-
-		r.Body = http.MaxBytesReader(w, r.Body, s.opts.MaxBodyBytes)
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		body, err := readBody(r)
 		if err != nil {
 			var maxErr *http.MaxBytesError
@@ -103,6 +107,12 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 			return
 		}
 
+		identity, authErr := s.authenticate(w, r, body)
+		if authErr != nil {
+			authErr.Write(w)
+			return
+		}
+
 		input := proxy.DispatchInput{
 			Body:      body,
 			Identity:  identity,
@@ -111,6 +121,9 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 
 		switch route {
 		case proxy.RouteSTT:
+			// The multipart parser needs a live reader; the body has
+			// already been bounded and read above.
+			r.Body = io.NopCloser(bytes.NewReader(body))
 			audio, fields, apiErr := s.parseAudio(r)
 			if apiErr != nil {
 				apiErr.Write(w)
@@ -181,8 +194,9 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 }
 
 // authenticate resolves the caller against the static proxy key set and
-// enforces optional HMAC request signing.
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*auth.Identity, *httpx.Error) {
+// enforces optional HMAC request signing. The body arrives already read and
+// size-bounded by the handler, so no request reads its own stream twice.
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, body []byte) (*auth.Identity, *httpx.Error) {
 	raw := auth.ExtractBearer(r.Header.Get("Authorization"))
 	if raw == "" {
 		return nil, httpx.Unauthorized("missing or invalid Authorization header")
@@ -215,15 +229,9 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*auth.Ide
 		if signature == "" {
 			return nil, httpx.Unauthorized("missing X-Signature header")
 		}
-		body, err := readBody(r)
-		if err != nil {
-			return nil, httpx.BadRequest("could not read request body")
-		}
 		if !auth.VerifyHMAC(cfg.GeneralSettings.HMACSecret, body, signature) {
 			return nil, httpx.Unauthorized("invalid HMAC signature")
 		}
-		// The body has been consumed; make it available to the handler.
-		r.Body = newBodyReader(body)
 	}
 
 	return identity, nil
@@ -253,7 +261,7 @@ func (s *Server) checkDims(body []byte, canonical string) *httpx.Error {
 
 // listModels serves GET /v1/models.
 func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.authenticate(w, r); err != nil {
+	if _, err := s.authenticate(w, r, nil); err != nil {
 		err.Write(w)
 		return
 	}
@@ -262,7 +270,7 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 
 // getModel serves GET /v1/models/{id}.
 func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.authenticate(w, r); err != nil {
+	if _, err := s.authenticate(w, r, nil); err != nil {
 		err.Write(w)
 		return
 	}

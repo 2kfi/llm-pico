@@ -8,9 +8,10 @@ import (
 	"github.com/arkan/llm-pico/internal/providers"
 )
 
-// maxAudioBytes bounds an uploaded audio file. The payload is buffered in
-// memory and forwarded in flight, so anything much larger than a long
-// recording would exhaust memory under concurrency.
+// maxAudioBytes bounds an uploaded transcription request. The payload is
+// buffered in memory and forwarded in flight, so anything much larger than a
+// long recording would exhaust memory under concurrency. JSON routes use the
+// smaller MaxBodyBytes bound instead.
 const maxAudioBytes = 100 << 20 // 100 MiB
 
 // audioFields are the multipart form values forwarded to a transcription
@@ -18,10 +19,8 @@ const maxAudioBytes = 100 << 20 // 100 MiB
 var audioFields = []string{"response_format", "language", "temperature", "timestamp_granularities", "prompt"}
 
 // parseAudio extracts the uploaded file and model name from a multipart
-// transcription request.
+// transcription request. The caller has already bounded and read the body.
 func (s *Server) parseAudio(r *http.Request) (*providers.AudioFile, map[string]string, *httpx.Error) {
-	r.Body = http.MaxBytesReader(nil, r.Body, maxAudioBytes)
-
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		return nil, nil, httpx.BadRequest("expected a multipart/form-data upload with a 'file' field")
 	}
