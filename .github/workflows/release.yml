@@ -28,7 +28,8 @@ jobs:
       - name: Build
         id: build
         run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags="-s -w" -o llm-pico-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/llm-pico
+          VERSION=$(git describe --tags --always --dirty)
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags="-s -w -X github.com/arkan/llm-pico/internal/version.pkgVersion=${VERSION}" -o llm-pico-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/llm-pico
           if [ "${{ matrix.goos }}" = "windows" ]; then
             mv llm-pico-${{ matrix.goos }}-${{ matrix.goarch }} llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}.exe
           fi

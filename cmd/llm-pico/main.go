@@ -10,6 +10,7 @@ import (
 	"github.com/arkan/llm-pico/internal/config"
 	"github.com/arkan/llm-pico/internal/providers"
 	"github.com/arkan/llm-pico/internal/proxy"
+	"github.com/arkan/llm-pico/internal/version"
 	"github.com/arkan/llm-pico/internal/ratelimit"
 	"github.com/arkan/llm-pico/internal/server"
 	"log/slog"
@@ -48,7 +49,7 @@ func main() {
 	}
 
 	if *showVer {
-		fmt.Printf("llm-pico %s (%s/%s)\n", server.Version, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("llm-pico %s (%s/%s)\n", version.String(), runtime.GOOS, runtime.GOARCH)
 		return
 	}
 

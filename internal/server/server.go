@@ -16,6 +16,7 @@ import (
 	"github.com/arkan/llm-pico/internal/httpx"
 	"github.com/arkan/llm-pico/internal/proxy"
 	"github.com/arkan/llm-pico/internal/ratelimit"
+	"github.com/arkan/llm-pico/internal/version"
 )
 
 // Options configures a Server.
@@ -82,7 +83,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /v1/models/{id}", s.getModel)
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": Version})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.String()})
 	})
 
 	return mux
@@ -306,9 +307,6 @@ func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
 	listing := httpx.ModelListResponse([]string{canonical})
 	httpx.WriteJSON(w, http.StatusOK, listing["data"].([]map[string]any)[0])
 }
-
-// Version is reported by /health.
-const Version = "2.1.0"
 
 // Shutdown drains in-flight requests and waits for them to finish.
 func (s *Server) Shutdown(ctx context.Context) bool {
