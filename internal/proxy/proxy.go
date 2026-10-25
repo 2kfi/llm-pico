@@ -538,11 +538,6 @@ type callUsage struct {
 // response it runs inline; for a stream the copy goroutine runs it when the
 // body is drained.
 func finalizeFn(s *Service, res *reservation, u *callUsage, err error) {
-	if u == nil {
-		defer s.refund(res)
-		return
-	}
-
 	total := u.TotalTokens
 	if total == 0 && res != nil {
 		// A provider reporting no usage is assumed to have consumed
