@@ -1,0 +1,9 @@
+# llm-pico starter providers. Created by 'llm-pico -init'.
+providers:
+  openai-1:
+    adapter: openai
+    # base_url is optional for native adapters; openai-1 defaults to the
+    # official OpenAI endpoint.
+    # Any other OpenAI-compatible endpoint (relay, vLLM, Ollama, whisper.cpp)
+    # is one line away: set a base_url and give this block a new name.
+    keys: OPENAI_MAIN_KEY

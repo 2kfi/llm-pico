@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -24,12 +25,27 @@ import (
 func main() {
 	var (
 		configDir = flag.String("config-dir", ".", "directory holding keys.env, provider.yaml, models.yaml, aliases.yaml")
+		initDir   = flag.String("init", "", "write a starter configuration into this directory and exit")
 		host      = flag.String("host", "0.0.0.0", "listen host")
 		port      = flag.Int("port", 4000, "listen port")
 		verbose   = flag.Bool("verbose", false, "enable debug logging")
 		showVer   = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
+
+	if *initDir != "" {
+		// First-run path for binaries installed from a release page, where
+		// there is no examples/ directory to copy.
+		proxyKey, err := config.Init(*initDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "init failed:", err)
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "wrote a starter configuration to", *initDir)
+		fmt.Fprintln(os.Stderr, "callers authenticate with PROXY_KEYS:", proxyKey)
+		fmt.Fprintln(os.Stderr, "put your OpenAI API key into:", filepath.Join(*initDir, "keys.env"))
+		return
+	}
 
 	if *showVer {
 		fmt.Printf("llm-pico %s (%s/%s)\n", server.Version, runtime.GOOS, runtime.GOARCH)
@@ -45,6 +61,12 @@ func main() {
 	if err := run(runOptions{
 		configDir: *configDir, host: *host, port: *port, log: log,
 	}); err != nil {
+		// A downloaded release binary has no examples/ to copy from, so a
+		// missing first file means the user needs the starter config, not a
+		// reread of the docs.
+		if config.NeedsInit(*configDir) {
+			log.Error("no configuration found in " + *configDir + "; run 'llm-pico -init " + *configDir + "' to create one")
+		}
 		log.Error("fatal", "error", err)
 		os.Exit(1)
 	}

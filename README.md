@@ -108,14 +108,26 @@ HMAC-SHA256 request signing is implemented but no file setting enables it yet.
 
 ## Run
 
+Download the binary from the [releases page](https://github.com/2kfi/llm-pico/releases)
+or build it:
+
 ```bash
 go build -o llm-pico ./cmd/llm-pico
-cp -r examples myconfig          # edit keys.env with real values
+```
+
+First run: the binary writes itself a starter configuration (embedded, so it
+needs no repository checkout). `-init` never overwrites existing files, prints
+the generated client key once, and leaves one placeholder upstream key to
+fill in:
+
+```bash
+./llm-pico -init myconfig       # starter config, fresh PROXY_KEYS
+# edit myconfig/keys.env: put your OpenAI API key in OPENAI_MAIN_KEY
 ./llm-pico -config-dir ./myconfig -port 4000
 ```
 
-Flags: `-config-dir` (default `.`), `-host`, `-port` (default 4000),
-`-verbose` (debug logs), `-version`.
+Flags: `-config-dir` (default `.`), `-init <dir>`, `-host`, `-port`
+(default 4000), `-verbose` (debug logs), `-version`.
 
 Startup validates and loads all files first, then probes each configured slot
 in the background: probe failures are logged, never fatal, and retried with
