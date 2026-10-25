@@ -1,5 +1,7 @@
 # llm-pico
 
+![llm-pico](./assets/banner.jpg)
+
 A lightweight LLM proxy that exposes an OpenAI-compatible API and routes each
 request to a configured upstream provider. No database, no dashboard: the whole
 instance is defined by four files.
