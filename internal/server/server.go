@@ -244,15 +244,19 @@ func (s *Server) checkDims(body []byte, canonical string) *httpx.Error {
 	if req == 0 {
 		return nil
 	}
-	var dims int
+	dims := 0
 	for _, entry := range s.proxy.Config().Slots(canonical) {
+		// Only slots that declare dims constrain the request: an
+		// unconstrained slot must not veto, but a later slot may.
 		if entry.Dims == nil {
-			return nil
+			continue
 		}
 		dims = *entry.Dims
-		break
+		if req == dims {
+			return nil
+		}
 	}
-	if dims == 0 || req == dims {
+	if dims == 0 {
 		return nil
 	}
 	return httpx.BadRequest(

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/arkan/llm-pico/internal/config"
@@ -68,7 +69,11 @@ func signedRequest(body []byte) *http.Request {
 }
 
 func plainRequest(body []byte) *http.Request {
-	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	return requestTo("POST", "/v1/chat/completions", body)
+}
+
+func requestTo(method, path string, body []byte) *http.Request {
+	r := httptest.NewRequest(method, path, bytes.NewReader(body))
 	r.Header.Set("Authorization", "Bearer sk-test")
 	return r
 }
@@ -115,3 +120,42 @@ func TestHMACBodyAtLimitAccepted(t *testing.T) {
 		t.Fatalf("status = %d, body = %s, want 200", w.Code, w.Body.String())
 	}
 }
+
+// A slot without dims must not prevent a later slot's dims from being
+// enforced: a request for the wrong size is refused.
+func TestCheckDimsHonoursLaterSlot(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := &config.Config{
+		ProxyKeys: []string{"sk-test"},
+		ModelList: []config.ModelEntry{
+			{ModelName: "m", Kind: config.KindEmbeddings, Provider: "alpha",
+				ModelParams: config.ModelParams{Model: "e", APIKey: "k", APIBase: upstream.URL}},
+			{ModelName: "m", Kind: config.KindEmbeddings, Provider: "alpha", Dims: intPtr(1536),
+				ModelParams: config.ModelParams{Model: "e", APIKey: "k", APIBase: upstream.URL}},
+		},
+	}
+	svc := proxy.NewService(cfg, providers.NewRegistry(nil), slog.New(slog.DiscardHandler))
+	srv := New(serverOptions(t, svc))
+
+	requestDims := func(n int) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, requestTo("POST", "/v1/embeddings", []byte(`{"model":"m","input":"x","dimensions":`+itos(n)+`}`)))
+		return w
+	}
+
+	if got := requestDims(512); got.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s, want 400 for mismatched dimensions", got.Code, got.Body.String())
+	}
+	if got := requestDims(1536); got.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200 for matching dimensions", got.Code, got.Body.String())
+	}
+}
+
+func intPtr(n int) *int { return &n }
+
+func itos(n int) string { return strconv.Itoa(n) }
