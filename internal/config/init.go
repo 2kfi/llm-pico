@@ -17,6 +17,9 @@ var defaultFS embed.FS
 // generated rather than embedded so every install gets a fresh PROXY_KEYS.
 var defaultFiles = []string{"provider.yaml", "models.yaml", "aliases.yaml"}
 
+// configFiles names every starter file, the union an init sweep looks for.
+var configFiles = append([]string{"keys.env"}, defaultFiles...)
+
 // GenerateProxyKey returns a fresh bearer key clients can present to the proxy.
 func GenerateProxyKey() (string, error) {
 	b := make([]byte, 32)
@@ -29,7 +32,7 @@ func GenerateProxyKey() (string, error) {
 // keysEnvTemplate is the starter keys.env. The upstream key is a placeholder
 // on purpose: it passes the non-empty parse rule but fails at every upstream
 // call until it is replaced, so a forgotten key is loud instead of silent.
-const keysEnvTemplate = `# llm-pico starter keys. Created by 'llm-pico -init'.
+const keysEnvTemplate = `# llm-pico starter keys. Created by 'llm-pico --init'.
 # PROXY_KEYS is the client credential: whoever presents a key from this list
 # can spend your upstream API keys. Copy it to every caller you authorize.
 PROXY_KEYS=%s
@@ -55,7 +58,7 @@ func Init(dir string) (string, error) {
 	}
 
 	var existing []string
-	for _, name := range append([]string{"keys.env"}, defaultFiles...) {
+	for _, name := range configFiles {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			existing = append(existing, name)
 		}
@@ -83,10 +86,23 @@ func Init(dir string) (string, error) {
 	return proxyKey, nil
 }
 
+// IsEmptyConfigDir reports whether dir holds none of the files llm-pico's
+// configuration needs. Auto-initialisation fires only then, so a directory
+// with a partially written configuration is never silently completed with
+// generated defaults.
+func IsEmptyConfigDir(dir string) bool {
+	for _, name := range configFiles {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // NeedsInit reports whether Load failed because the configuration directory
 // is being used for the first time: keys.env, the one file Load must have,
 // does not exist. In that case the user is on a freshly downloaded binary
-// with no examples/ to copy, and the error should point at -init.
+// with no examples/ to copy, and the error should point at --init.
 func NeedsInit(dir string) bool {
 	_, err := os.Stat(filepath.Join(dir, "keys.env"))
 	return err != nil

@@ -1,4 +1,4 @@
-# llm-pico starter aliases. Created by 'llm-pico -init'.
+# llm-pico starter aliases. Created by 'llm-pico --init'.
 # Optional file. An alias maps a friendly name onto a canonical model name
 # from models.yaml; chains are rejected. Example:
 # gpt-mini: gpt-4o-mini

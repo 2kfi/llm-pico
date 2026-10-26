@@ -54,6 +54,22 @@ func TestInitWritesLoadableConfig(t *testing.T) {
 	}
 }
 
+// Auto-initialisation must fire only for a directory holding none of the
+// config files: any file present means the user is mid-edit, and generated
+// defaults must not fill the gaps.
+func TestIsEmptyConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	if !IsEmptyConfigDir(dir) {
+		t.Fatal("empty dir reported as non-empty")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "provider.yaml"), []byte("providers:\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if IsEmptyConfigDir(dir) {
+		t.Fatal("dir with provider.yaml reported as empty")
+	}
+}
+
 // Nested directories are created on demand, and the flag also works when
 // pointed at an existing empty directory.
 func TestInitCreatesMissingDirectory(t *testing.T) {

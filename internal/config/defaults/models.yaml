@@ -1,4 +1,4 @@
-# llm-pico starter models. Created by 'llm-pico -init'.
+# llm-pico starter models. Created by 'llm-pico --init'.
 gpt-4o-mini:
   kind: chat
   providers: openai-1      # order = priority, implicit fallback

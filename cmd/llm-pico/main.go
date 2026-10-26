@@ -32,6 +32,16 @@ func main() {
 		verbose   = flag.Bool("verbose", false, "enable debug logging")
 		showVer   = flag.Bool("version", false, "print the version and exit")
 	)
+	// Go's flag package accepts both "-flag" and "--flag"; the help text
+	// spells them with the long form so word-flags read as such.
+	flag.Usage = func() {
+		fset := flag.CommandLine
+		fmt.Fprintln(fset.Output(), "usage: llm-pico [flags]")
+		fmt.Fprintln(fset.Output())
+		fset.VisitAll(func(f *flag.Flag) {
+			fmt.Fprintf(fset.Output(), "  --%s %s\n", f.Name, f.Usage)
+		})
+	}
 	flag.Parse()
 
 	if *initDir != "" {
@@ -66,7 +76,7 @@ func main() {
 		// missing first file means the user needs the starter config, not a
 		// reread of the docs.
 		if config.NeedsInit(*configDir) {
-			log.Error("no configuration found in " + *configDir + "; run 'llm-pico -init " + *configDir + "' to create one")
+			log.Error("no configuration found in " + *configDir + "; run 'llm-pico --init " + *configDir + "' to create one")
 		}
 		log.Error("fatal", "error", err)
 		os.Exit(1)
@@ -81,6 +91,21 @@ type runOptions struct {
 }
 
 func run(opts runOptions) error {
+	// A freshly downloaded binary pointed at an empty directory gets its
+	// starter configuration in the same breath: generate, announce the
+	// client key, and keep booting rather than demanding a second command.
+	// A directory with some files is never auto-completed, so half a
+	// configuration cannot bind a port silently.
+	if config.IsEmptyConfigDir(opts.configDir) {
+		proxyKey, err := config.Init(opts.configDir)
+		if err != nil {
+			return err
+		}
+		opts.log.Info("no configuration found; wrote a starter configuration", "dir", opts.configDir)
+		opts.log.Warn("callers authenticate with PROXY_KEYS", "key", proxyKey)
+		opts.log.Info("put your upstream OpenAI API key into " + filepath.Join(opts.configDir, "keys.env"))
+	}
+
 	cfg, err := config.Load(opts.configDir)
 	if err != nil {
 		return err

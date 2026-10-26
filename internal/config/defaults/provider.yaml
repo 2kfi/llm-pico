@@ -1,4 +1,4 @@
-# llm-pico starter providers. Created by 'llm-pico -init'.
+# llm-pico starter providers. Created by 'llm-pico --init'.
 providers:
   openai-1:
     adapter: openai

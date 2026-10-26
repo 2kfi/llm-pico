@@ -117,19 +117,24 @@ or build it:
 go build -o llm-pico ./cmd/llm-pico
 ```
 
-First run: the binary writes itself a starter configuration (embedded, so it
-needs no repository checkout). `-init` never overwrites existing files, prints
-the generated client key once, and leaves one placeholder upstream key to
-fill in:
+First run needs no setup step at all: a bare or empty config directory gets
+a starter configuration written automatically (embedded defaults, a freshly
+generated PROXY_KEYS shown on startup, and one placeholder upstream key to
+fill in). An explicit `--init <dir>` does the same thing up front and exits
+instead of booting; it never overwrites existing files.
 
 ```bash
-./llm-pico -init myconfig       # starter config, fresh PROXY_KEYS
-# edit myconfig/keys.env: put your OpenAI API key in OPENAI_MAIN_KEY
-./llm-pico -config-dir ./myconfig -port 4000
+./llm-pico                       # empty config dir: writes starters, boots
+# edit ./keys.env: put your OpenAI API key in OPENAI_MAIN_KEY
+./llm-pico --init myconfig       # or stage the starter config explicitly
 ```
 
-Flags: `-config-dir` (default `.`), `-init <dir>`, `-host`, `-port`
-(default 4000), `-verbose` (debug logs), `-version`.
+A directory holding any config file is never auto-completed: missing files
+then abort startup pointing at `--init`, so half a configuration cannot bind
+a port on generated defaults.
+
+Flags: `--config-dir` (default `.`), `--init <dir>`, `--host`, `--port`
+(default 4000), `--verbose` (debug logs), `--version`.
 
 Startup validates and loads all files first, then probes each configured slot
 in the background: probe failures are logged, never fatal, and retried with
