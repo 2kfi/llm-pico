@@ -31,8 +31,8 @@ type RouteType string
 const (
 	RouteChat       RouteType = "chat"
 	RouteEmbeddings RouteType = "embeddings"
-	RouteSTT         RouteType = "stt"
-	RouteTTS         RouteType = "tts"
+	RouteSTT        RouteType = "stt"
+	RouteTTS        RouteType = "tts"
 )
 
 // DegradationMode controls how the proxy behaves under stress.
@@ -183,7 +183,8 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 
 	tracer := observability.NewTracer(newRequestID())
 
-	if err := s.admit(ctx, in, cfg); err != nil {
+	admittedFallback, err := s.admit(ctx, in, cfg)
+	if err != nil {
 		return nil, err
 	}
 
@@ -199,7 +200,7 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 		return nil, contextTooLongError(allSlots, in)
 	}
 
-	ac := attemptCtx{tracer: tracer, cfg: cfg, router: r}
+	ac := attemptCtx{tracer: tracer, cfg: cfg, router: r, semOwned: admittedFallback}
 
 	var (
 		lastErr error
@@ -226,7 +227,7 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 			break
 		}
 		if i == len(slots)-1 {
-			r.RecordModelFailure(slot.Provider)
+			r.RecordModelFailure(model)
 		}
 	}
 
@@ -315,36 +316,43 @@ type attemptCtx struct {
 	tracer *observability.Tracer
 	cfg    *config.Config
 	router *router.Router
+	// semOwned records that this request holds a fallback_only semaphore
+	// slot, which release must hand back.
+	semOwned bool
 }
 
-// admit applies the current degradation mode before any work is done.
-func (s *Service) admit(ctx context.Context, in DispatchInput, cfg *config.Config) error {
+// admit applies the current degradation mode before any work is done. It
+// reports whether the request took a fallback_only semaphore slot, so release
+// can hand back exactly what this request took even if the mode changes
+// mid-flight.
+func (s *Service) admit(ctx context.Context, in DispatchInput, cfg *config.Config) (semOwned bool, err error) {
 	switch s.Mode() {
 	case DegradationReject:
-		return httpx.Degraded("service degraded: requests temporarily rejected")
+		return false, httpx.Degraded("service degraded: requests temporarily rejected")
 	case DegradationFallbackOnly:
 		// Only admit a bounded number of concurrent requests, so a provider
 		// that is failing can be given room to recover.
 		select {
 		case s.sem <- struct{}{}:
-			return nil
+			return true, nil
 		case <-ctx.Done():
-			return httpx.UpstreamTimeout("request cancelled while queued")
+			return true, httpx.UpstreamTimeout("request cancelled while queued")
 		default:
-			return httpx.Degraded("service degraded: concurrency limit reached")
+			return false, httpx.Degraded("service degraded: concurrency limit reached")
 		}
 	default:
-		return nil
+		return false, nil
 	}
 }
 
-// release frees a slot taken by admit.
-func (s *Service) release() {
-	if s.Mode() == DegradationFallbackOnly {
-		select {
-		case <-s.sem:
-		default:
-		}
+// release frees a semaphore slot taken by admit.
+func (s *Service) release(semOwned bool) {
+	if !semOwned {
+		return
+	}
+	select {
+	case <-s.sem:
+	default:
 	}
 }
 
@@ -384,10 +392,13 @@ func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInp
 		if err != nil {
 			var cooldown *router.CooldownError
 			if errors.As(err, &cooldown) {
-				return nil, httpx.RateLimited(
+				// A router cooldown is the slot's own quota latitude, not a
+				// caller fault: wrap it as a quota error so Dispatch keeps
+				// walking the remaining fallback slots.
+				return nil, &quotaError{err: httpx.RateLimited(
 					fmt.Sprintf("all keys for provider '%s' are rate-limited", slot.Provider),
 					int(cooldown.RetryAfter.Seconds())+1,
-				)
+				)}
 			}
 			if lastErr != nil {
 				return nil, lastErr
@@ -417,7 +428,7 @@ func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInp
 		}
 
 		adapter := s.Registry().AdapterFor(target.ProviderSlug, target.APIBase)
-		resp, finalize, err := s.call(ctx, in, target, adapter, res)
+		resp, _, err := s.call(ctx, ac, in, target, adapter, res)
 
 		if err == nil {
 			ac.router.RecordSuccess(target)
@@ -426,9 +437,9 @@ func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInp
 				httpx.ApplyHeader(resp.Header, res.headers)
 				resp.Header.Set("X-Request-Id", ac.tracer.ID())
 			}
-			// For a buffered response the accounting already settled
-			// inline; for a stream nil finalize means nothing more to do.
-			finalize(nil)
+			// Buffer calls have already settled inline; stream calls
+			// settle from their copy goroutine once usage is known, and
+			// their finalize is a no-op by design.
 			return resp, nil
 		}
 
@@ -553,10 +564,11 @@ func finalizeFn(s *Service, res *reservation, u *callUsage, err error) {
 	}
 }
 
-// call performs the upstream request and returns the response plus a
-// finalize function that settles accounting exactly once.
+// call performs the upstream request; accounting settles inline for buffered
+// calls and from the stream goroutine for streamed calls.
 func (s *Service) call(
 	ctx context.Context,
+	ac attemptCtx,
 	in DispatchInput,
 	target *router.Target,
 	adapter providers.Adapter,
@@ -570,7 +582,7 @@ func (s *Service) call(
 	}
 
 	start := time.Now()
-	s.release()
+	s.release(ac.semOwned)
 
 	var (
 		resp *providers.Response
@@ -594,7 +606,7 @@ func (s *Service) call(
 	default:
 		req.Stream = wantsStream(in.Body)
 		if req.Stream {
-			return s.callStreaming(ctx, in, target, adapter, req, res, start)
+			return s.callStreaming(ctx, ac, in, target, adapter, req, res, start)
 		}
 		resp, err = adapter.Complete(ctx, req)
 		u = &callUsage{}
@@ -624,6 +636,7 @@ func (s *Service) call(
 // when the body is drained.
 func (s *Service) callStreaming(
 	ctx context.Context,
+	ac attemptCtx,
 	in DispatchInput,
 	target *router.Target,
 	adapter providers.Adapter,
@@ -641,7 +654,10 @@ func (s *Service) callStreaming(
 	info := &callUsage{Latency: time.Since(start)}
 	settle := sync.Once{}
 
-	finalize := func(err error) {
+	// The caller gets a no-op: for a stream, accounting can only settle
+	// from the copy goroutine, once the provider has reported usage.
+	// Settling at dispatch time would lock in the pre-reserved estimate.
+	streamFinalize := func(err error) {
 		settle.Do(func() {
 			finalizeFn(s, res, info, err)
 		})
@@ -659,7 +675,7 @@ func (s *Service) callStreaming(
 			if err != nil {
 				if err != io.EOF {
 					_ = pw.CloseWithError(err)
-					finalize(err)
+					streamFinalize(err)
 					return
 				}
 				break
@@ -696,7 +712,7 @@ func (s *Service) callStreaming(
 		}
 		info.Latency = time.Since(start)
 		s.Latency.Record(target.Model.ModelName, target.ProviderSlug, int(info.Latency.Milliseconds()))
-		finalize(nil)
+		streamFinalize(nil)
 	}()
 
 	return &http.Response{
@@ -708,7 +724,7 @@ func (s *Service) callStreaming(
 			"X-Accel-Buffering": {"no"},
 		},
 		Body: pr,
-	}, finalize, nil
+	}, func(error) {}, nil
 }
 
 // bufferedUsage extracts token counts from a non-streaming response body.

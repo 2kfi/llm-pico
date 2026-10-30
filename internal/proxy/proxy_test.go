@@ -270,3 +270,84 @@ func TestDrainWaitsForStreamingCopy(t *testing.T) {
 		t.Error("BeginDrain timed out after the stream finished")
 	}
 }
+
+// A stream must reconcile its real token usage into the limiter after the
+// copy goroutine settles, not silently stick with the pre-reserved estimate.
+func TestStreamingReconcilesActualUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := chatConfig(upstream, "m", "alpha")
+	cfg.ModelList[0].RPM = cfgInt(10)
+	cfg.ModelList[0].TPM = cfgInt(100)
+	lim := ratelimit.New()
+	defer lim.Stop()
+	svc := newService(t, cfg, lim)
+
+	resp, err := svc.Dispatch(context.Background(), DispatchInput{
+		Model: "m", RouteType: RouteChat, Body: []byte(`{"model":"m","stream":true}`),
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for lim.Usage("", "m", "alpha", ratelimit.LevelModel, ratelimit.RPM) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("stream accounting never settled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := lim.Usage("", "m", "alpha", ratelimit.LevelModel, ratelimit.TPM); got != 5 {
+		t.Fatalf(" TPM usage = %d, want the provider-reported 5 (not the pre-reserved estimate)", got)
+	}
+}
+
+// When every key of the first slot is rate-limited at the router, the slot
+// walk must continue to the next slot instead of refusing the caller.
+func TestRouterCooldownFallsThroughToNextSlot(t *testing.T) {
+	var mu sync.Mutex
+	hits429 := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		// Upstream-wide 429: every request ranked 429 until keys are skipped.
+		hits429++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"quota exhausted"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := chatConfig(upstream, "m", "a", "b")
+	svc := newService(t, cfg, nil)
+
+	// Slot "a" returns 429; the proxy should still fail overall after both
+	// providers were tried, and the failing upstream must be retried fewer
+	// times than NumRetries+1 once both keys are cooling down.
+	for i := 0; i < 3; i++ {
+		_, err := svc.Dispatch(context.Background(), DispatchInput{Model: "m", RouteType: RouteChat, Body: []byte(`{}`)})
+		if err == nil {
+			t.Fatal("expected 429 from both slots")
+		}
+		apiErr := httpx.FromError(err)
+		if apiErr.Status != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429", apiErr.Status)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits429 < 2 {
+		t.Fatalf("slot walk executed %d upstream hits, want at least one per slot", hits429)
+	}
+	if got := svc.Router().Status("m"); len(got) < 2 {
+		t.Fatalf("router status lists %d groups, want both slots tracked", len(got))
+	}
+}

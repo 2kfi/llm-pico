@@ -167,7 +167,10 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 				return
 			}
 			input.Model = peekString(body, "model")
-			input.MaxTokens = peekInt(body, "max_tokens", 4096)
+			// A request that does not set max_tokens gets the provider's own
+			// default; reserving 4096 tokens against the rate limiter would
+			// over-charge callers for budget they did not ask for.
+			input.MaxTokens = peekInt(body, "max_tokens", 0)
 		}
 
 		if input.Model == "" {
@@ -305,7 +308,11 @@ func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	listing := httpx.ModelListResponse([]string{canonical})
-	httpx.WriteJSON(w, http.StatusOK, listing["data"].([]map[string]any)[0])
+	if data, ok := listing["data"].([]map[string]any); ok && len(data) > 0 {
+		httpx.WriteJSON(w, http.StatusOK, data[0])
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, listing)
 }
 
 // Shutdown drains in-flight requests and waits for them to finish.

@@ -827,3 +827,110 @@ func TestOpenAIStreamRequiresStreamFlag(t *testing.T) {
 		t.Error("expected an error when stream is not enabled in the body")
 	}
 }
+
+// Gemini streams must use alt=sse so Google answers with server-sent events
+// rather than its default chunked JSON array, which the SSE reader cannot
+// parse.
+func TestGeminiStreamRequestsSSE(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("alt") != "sse" {
+			t.Errorf("alt query param = %q, want sse", r.URL.Query().Get("alt"))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"STOP"}]}`)
+		fmt.Fprintln(w, "data: [DONE]")
+	}))
+	defer srv.Close()
+
+	a := NewGeminiAdapter(srv.URL, nil, newTestClient())
+	stream, err := a.Stream(context.Background(), Request{
+		Body: []byte(`{"messages":[{"role":"user","content":"hi"}]}`), Model: "gemini/g", APIKey: "k",
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+	for {
+		_, err := stream.Next()
+		if err != nil {
+			break
+		}
+	}
+}
+
+// A cursor-split key must survive URL escaping so the request still resolves.
+func TestGeminiEscapesKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("key"); got != "k&x=1" {
+			t.Errorf("key query param = %q, want 'k&x=1'", got)
+		}
+		fmt.Fprint(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}`)
+	}))
+	defer srv.Close()
+
+	a := NewGeminiAdapter(srv.URL, nil, newTestClient())
+	if _, err := a.Complete(context.Background(), Request{
+		Body: []byte(`{"messages":[]}`), Model: "gemini/g", APIKey: "k&x=1",
+	}); err != nil {
+		t.Fatalf("Complete with a cursor-bearing key: %v", err)
+	}
+}
+
+// The terminal streamed chunk must carry finish_reason even for a plain STOP,
+// and stop-reason chunks must not be merged over text deltas.
+func TestGeminiStreamSurfacesStopFinishReason(t *testing.T) {
+	events := `data: {"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}` + "\n\n" +
+		`data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}}` + "\n\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, events)
+	}))
+	defer srv.Close()
+
+	a := NewGeminiAdapter(srv.URL, nil, newTestClient())
+	stream, err := a.Stream(context.Background(), Request{
+		Body: []byte(`{"messages":[{"role":"user","content":"hi"}]}`), Model: "gemini/g", APIKey: "k",
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	var sawStop bool
+	var sawText bool
+	for {
+		chunk, err := stream.Next()
+		if err != nil {
+			break
+		}
+		if len(chunk.Data) == 0 {
+			continue
+		}
+		var out struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason any `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(chunk.Data, &out); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range out.Choices {
+			if c.Delta.Content != "" {
+				sawText = true
+			}
+			if s, ok := c.FinishReason.(string); ok && s == "stop" {
+				sawStop = true
+			}
+		}
+	}
+	if !sawText {
+		t.Error("text delta was not surfaced")
+	}
+	if !sawStop {
+		t.Error("finish_reason \"stop\" was not surfaced before [DONE]")
+	}
+}

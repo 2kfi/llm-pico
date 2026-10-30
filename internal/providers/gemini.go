@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -56,17 +57,17 @@ func (a *GeminiAdapter) endpoint(req Request) string {
 	return base
 }
 
-// withKey appends the API key as a query parameter.
-func (a *GeminiAdapter) withKey(url, apiKey string) string {
+// withKey appends the API key as an escaped query parameter.
+func (a *GeminiAdapter) withKey(rawURL, apiKey string) string {
 	sep := "?"
-	if strings.Contains(url, "?") {
+	if strings.Contains(rawURL, "?") {
 		sep = "&"
 	}
 	param := a.QueryParam
 	if param == "" {
 		param = "key"
 	}
-	return url + sep + param + "=" + apiKey
+	return rawURL + sep + param + "=" + url.QueryEscape(apiKey)
 }
 
 func (a *GeminiAdapter) headers() map[string]string {
@@ -201,14 +202,13 @@ type geminiResponse struct {
 }
 
 // toOpenAI renders a generateContent reply as an OpenAI chat completion.
+// Only the first candidate is surfaced: OpenAI's default shape is one choice.
 func (g *geminiResponse) toOpenAI(model string) map[string]any {
 	var content strings.Builder
 	var finish string
-	for i, c := range g.Candidates {
-		if i == 0 {
-			finish = c.FinishReason
-		}
-		for _, p := range c.Content.Parts {
+	if len(g.Candidates) > 0 {
+		finish = g.Candidates[0].FinishReason
+		for _, p := range g.Candidates[0].Content.Parts {
 			content.WriteString(p.Text)
 		}
 	}
@@ -299,7 +299,11 @@ func (a *GeminiAdapter) Stream(ctx context.Context, req Request) (Stream, error)
 	}
 
 	model := stripProviderPrefix(req.Model)
-	url := a.withKey(joinURL(a.endpoint(req), "models/"+model+":streamGenerateContent"), req.APIKey)
+	// alt=sse switches Google's stream endpoint from its default chunked
+	// JSON array to the server-sent-event framing the SSE reader expects.
+	streamURL := joinURL(a.endpoint(req), "models/"+model+":streamGenerateContent")
+	streamURL += "?alt=sse"
+	url := a.withKey(streamURL, req.APIKey)
 
 	headers := a.headers()
 	headers["Accept"] = "text/event-stream"
@@ -325,6 +329,51 @@ type geminiStream struct {
 	model string
 }
 
+// geminiChunkText extracts candidate 0's text and finish reason from one
+// streamed generateContent payload.
+func geminiChunkText(decoded geminiResponse) (string, string) {
+	var text strings.Builder
+	var finish string
+	if len(decoded.Candidates) > 0 {
+		finish = decoded.Candidates[0].FinishReason
+		for _, p := range decoded.Candidates[0].Content.Parts {
+			text.WriteString(p.Text)
+		}
+	}
+	return text.String(), finish
+}
+
+// openAIChunkPayload builds an OpenAI chat.completion.chunk body out of a
+// text delta and/or a finish reason, mapping Gemini's finish vocabulary.
+func streamChunkPayload(model string, text string, finish string) ([]byte, bool) {
+	if text == "" && finish == "" {
+		return nil, false
+	}
+	choice := map[string]any{
+		"index":         0,
+		"delta":         map[string]any{},
+		"finish_reason": nil,
+	}
+	if text != "" {
+		choice["delta"] = map[string]any{"content": text}
+	}
+	if finish != "" {
+		choice["finish_reason"] = mapGeminiFinish(finish)
+	}
+	payload := map[string]any{
+		"id":      newID(),
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{choice},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false
+	}
+	return encoded, true
+}
+
 func (s *geminiStream) Next() (*Chunk, error) {
 	for {
 		chunk, err := s.inner.Next()
@@ -341,32 +390,8 @@ func (s *geminiStream) Next() (*Chunk, error) {
 		}
 
 		out := &Chunk{}
-		var text strings.Builder
-		var finish string
-		for i, c := range decoded.Candidates {
-			if i == 0 {
-				finish = c.FinishReason
-			}
-			for _, p := range c.Content.Parts {
-				text.WriteString(p.Text)
-			}
-		}
-		if text.Len() > 0 {
-			payload := map[string]any{
-				"id":      newID(),
-				"object":  "chat.completion.chunk",
-				"created": time.Now().Unix(),
-				"model":   s.model,
-				"choices": []map[string]any{{
-					"index":         0,
-					"delta":         map[string]any{"content": text.String()},
-					"finish_reason": nil,
-				}},
-			}
-			if encoded, err := json.Marshal(payload); err == nil {
-				out.Data = encoded
-			}
-		}
+		text, finish := geminiChunkText(decoded)
+		out.Usage = nil
 		if decoded.UsageMetadata.TotalTokenCount > 0 {
 			total := decoded.UsageMetadata.TotalTokenCount
 			if total == 0 {
@@ -378,23 +403,10 @@ func (s *geminiStream) Next() (*Chunk, error) {
 				TotalTokens:      total,
 			}
 		}
-		// The terminal candidate carries only a finishReason; forward it so
-		// clients see a normal completion signal.
-		if finish != "" && finish != "STOP" {
-			payload := map[string]any{
-				"id":      newID(),
-				"object":  "chat.completion.chunk",
-				"created": time.Now().Unix(),
-				"model":   s.model,
-				"choices": []map[string]any{{
-					"index":         0,
-					"delta":         map[string]any{},
-					"finish_reason": mapGeminiFinish(finish),
-				}},
-			}
-			if encoded, err := json.Marshal(payload); err == nil {
-				out.Data = encoded
-			}
+		// Forward every finish reason, including STOP, so clients see a
+		// complete OpenAI-style termination signal before [DONE].
+		if data, ok := streamChunkPayload(s.model, text, finish); ok {
+			out.Data = data
 		}
 		if out.Data != nil || out.Usage != nil {
 			return out, nil
@@ -458,11 +470,12 @@ func (a *GeminiAdapter) Embeddings(ctx context.Context, req Request) (*Response,
 	}
 
 	data := make([]map[string]any, 0, len(decoded.Embeddings))
-	tokens := 0
 	for i, e := range decoded.Embeddings {
 		data = append(data, map[string]any{"object": "embedding", "index": i, "embedding": e.Values})
-		tokens += estimateTokens(parts)
 	}
+	// The estimate covers the whole input once: multiplying it per returned
+	// embedding double-counted the request.
+	tokens := estimateTokens(parts)
 	body, _ := json.Marshal(map[string]any{
 		"object": "list",
 		"data":   data,

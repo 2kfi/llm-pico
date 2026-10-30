@@ -66,6 +66,7 @@ type breaker struct {
 	mu               sync.Mutex
 	state            BreakerState
 	errorCount       int
+	probes           int
 	openedAt         time.Time
 	failureThreshold int
 	recoveryTimeout  time.Duration
@@ -74,8 +75,13 @@ type breaker struct {
 func (b *breaker) recordFailure() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// A half-open probe has been answered; give its seat back first.
+	if b.probes > 0 {
+		b.probes--
+	}
 	b.errorCount++
-	if b.errorCount >= b.failureThreshold {
+	// A failed half-open probe re-opens the breaker immediately.
+	if b.state == StateHalfOpen || b.errorCount >= b.failureThreshold {
 		b.state = StateOpen
 		b.openedAt = time.Now()
 	}
@@ -87,10 +93,12 @@ func (b *breaker) recordSuccess() {
 	b.state = StateClosed
 	b.errorCount = 0
 	b.openedAt = time.Time{}
+	b.probes = 0
 }
 
 // allows reports whether a request may be sent. A breaker past its recovery
-// timeout transitions to half-open and admits a single probe.
+// timeout transitions to half-open and admits a single probe; further callers
+// are refused until the probe outcome is recorded.
 func (b *breaker) allows() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -100,9 +108,16 @@ func (b *breaker) allows() bool {
 	case StateOpen:
 		if time.Since(b.openedAt) >= b.recoveryTimeout {
 			b.state = StateHalfOpen
+			b.probes = 1
 			return true
 		}
 		return false
+	case StateHalfOpen:
+		if b.probes > 0 {
+			return false
+		}
+		b.probes = 1
+		return true
 	default:
 		return true
 	}
@@ -167,7 +182,7 @@ type group struct {
 	latency latencyWindow
 
 	mu       sync.Mutex
-	nextKey  int
+	lastKey  string // last credential handed out, for even round-robin
 	requests int
 	errors   int
 	health   float64
@@ -181,8 +196,9 @@ func (g *group) healthScore() float64 {
 	return g.health
 }
 
-// pickKey advances the round-robin cursor and returns the next eligible key,
-// skipping any currently cooling down. ok is false when all are cooling.
+// pickKey returns the next eligible key after the previously handed-out one,
+// so every credential gets an even share even as keys enter and leave the
+// cooldown set. ok is false when all are cooling down.
 func (g *group) pickKey(now time.Time) (*keyState, time.Time, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -205,8 +221,15 @@ func (g *group) pickKey(now time.Time) (*keyState, time.Time, bool) {
 		return nil, earliest, false
 	}
 
-	k := eligible[g.nextKey%len(eligible)]
-	g.nextKey = (g.nextKey + 1) % len(eligible)
+	start := 0
+	for i, k := range eligible {
+		if k.apiKey == g.lastKey {
+			start = (i + 1) % len(eligible)
+			break
+		}
+	}
+	k := eligible[start]
+	g.lastKey = k.apiKey
 	return k, earliest, true
 }
 
@@ -234,7 +257,7 @@ func (g *group) recordFailure(key *keyState, statusCode int) {
 	g.mu.Unlock()
 
 	switch {
-	case statusCode == 429:
+	case statusCode == 429 && key != nil:
 		key.mu.Lock()
 		// Progressive backoff: stay short for the first few, then back off hard.
 		cooldown := 10 * time.Second
@@ -245,7 +268,10 @@ func (g *group) recordFailure(key *keyState, statusCode int) {
 		key.fails++
 		key.mu.Unlock()
 
-	case statusCode == 401 || statusCode == 402 || statusCode == 403:
+	case statusCode == 429 && key == nil:
+		// Unknown credential: leave individual keys untouched.
+
+	case (statusCode == 401 || statusCode == 402 || statusCode == 403) && key != nil:
 		// Invalid key, exhausted balance, or revoked: quarantine for a year.
 		key.mu.Lock()
 		key.cooldownUntil = time.Now().Add(365 * 24 * time.Hour)
@@ -462,7 +488,9 @@ func (r *Router) RecordFailure(t *Target, statusCode int) {
 			return
 		}
 	}
-	g.recordFailure(g.keys[0], statusCode)
+	// The exact key is unknown; only penalise the group, never a wrong
+	// credential (and never dereference an empty key list).
+	g.recordFailure(nil, statusCode)
 }
 
 // RecordLatency feeds the rolling latency window used by health metrics.
