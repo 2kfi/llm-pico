@@ -188,7 +188,7 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 		return nil, err
 	}
 
-	model := cfg.Canonical(in.Model)
+	model := in.Model
 	allSlots := kindSlots(cfg, model, in.RouteType)
 	if len(allSlots) == 0 {
 		return nil, httpx.BadRequest(

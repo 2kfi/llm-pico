@@ -16,10 +16,10 @@ Routes:
 
 ## Config files
 
-Four YAML/dotenv files in the config directory (default `.`):
-`keys.env`, `provider.yaml`, `models.yaml`, `aliases.yaml`. `aliases.yaml` is
-optional; the other three are required. Anything invalid aborts startup with an
-error naming file and line.
+Three YAML/dotenv files in the config directory (default `.`):
+`keys.env`, `provider.yaml`, `models.yaml`. All are required. Anything invalid
+aborts startup with an error naming file and line. A leftover legacy
+`aliases.yaml` is rejected with a migration hint.
 
 ### `keys.env`
 
@@ -74,13 +74,17 @@ apply:
 | `daily-audio-sec`  | tts, stt          | audio seconds per day (tts: `len(input)/15` estimate generated; stt: `~32 kB/s` estimate of the upload) |
 | `audio-min`        | stt               | audio minutes per day, same estimate as above rounded up |
 
-### `aliases.yaml`
+### Caller-facing vs upstream names
 
 ```yaml
-gpt-mini: gpt-4o-mini   # alias -> canonical model name; chains are rejected
+gpt-mini:               # the name callers present (/v1/models, "model" field)
+  kind: chat
+  model: gpt-4o-mini    # what is sent upstream; omit to send the key itself
+  providers: openai-1
 ```
 
-Aliases resolve at load. `/v1/models` lists canonical names only.
+`/v1/models` lists the caller-facing keys. Every caller-facing name is its own
+models.yaml entry — there are no alias chains.
 
 ## Semantics
 

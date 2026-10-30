@@ -45,6 +45,7 @@ func modelsYAML() string {
 	return `
 gemini-flash:
   kind: chat
+  model: google/gemini-flash
   providers: google-1, relay-1
   ctx: 1000000
   rpm: 60
@@ -55,7 +56,7 @@ gemini-flash:
 gpt-mini:
   kind: chat
   providers: openai-1
-  upstream: gpt-4o-mini
+  model: gpt-4o-mini
   ctx: 128000
   rpm: 300
 
@@ -80,10 +81,6 @@ whisper-1:
 `
 }
 
-func aliasesYAML() string {
-	return "cheap: gpt-mini\nsmol: gemini-flash\n"
-}
-
 func writeDir(t *testing.T, keys, providers, models, aliases string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -105,7 +102,7 @@ func fullDir(t *testing.T) string {
 	t.Helper()
 	return writeDir(t,
 		keysEnv("openai", "anthropic", "google", "relay", "gpu"),
-		providerYAML(), modelsYAML(), aliasesYAML())
+		providerYAML(), modelsYAML(), "")
 }
 
 func TestLoadEndToEnd(t *testing.T) {
@@ -152,11 +149,13 @@ func TestLoadEndToEnd(t *testing.T) {
 		t.Errorf("upstream override lookup failed: %v %v", upstreamEntry, ok)
 	}
 
-	if cfg.Aliases["cheap"] != "gpt-mini" || cfg.Canonical("cheap") != "gpt-mini" {
-		t.Errorf("aliases = %v", cfg.Aliases)
+	if got := cfg.ModelList[0].ModelParams.Model; got != "google/gemini-flash" {
+		t.Errorf("gemini-flash upstream model = %q", got)
 	}
-	if cfg.Canonical("gpt-mini") != "gpt-mini" {
-		t.Error("canonical name must resolve to itself")
+
+	key, ok := cfg.Model("tts-1")
+	if !ok || key.ModelParams.Model != "tts-1" {
+		t.Errorf("model field must default to the entry key: %v %v", key, ok)
 	}
 
 	tts := cfg.Slots("tts-1")[0]
@@ -225,10 +224,18 @@ func TestLoadValidationErrors(t *testing.T) {
 			"providers:\n  openai-1:\n    adapter: openai\n    keys: OPENAI_1_KEY\n",
 			"a:\n  kind: chat\n  providers: openai-1\n  typo: 1\n", "",
 			"unknown field"},
-		{"alias chain", keysEnv("openai"),
+		{"renamed upstream field", keysEnv("openai"),
 			"providers:\n  openai-1:\n    adapter: openai\n    keys: OPENAI_1_KEY\n",
-			"a:\n  kind: chat\n  providers: openai-1\n", "b: a\nc: b\n",
-			"alias chains"},
+			"a:\n  kind: chat\n  providers: openai-1\n  upstream: b\n", "",
+			"renamed to 'model'"},
+		{"empty model field", keysEnv("openai"),
+			"providers:\n  openai-1:\n    adapter: openai\n    keys: OPENAI_1_KEY\n",
+			"a:\n  kind: chat\n  providers: openai-1\n  model: \"\"\n", "",
+			"must not be empty"},
+		{"legacy aliases file", keysEnv("openai"),
+			"providers:\n  openai-1:\n    adapter: openai\n    keys: OPENAI_1_KEY\n",
+			"a:\n  kind: chat\n  providers: openai-1\n", "cheap: a\n",
+			"aliases.yaml is no longer supported"},
 		{"missing keys", keysEnv(),
 			"providers:\n  openai-1:\n    adapter: openai\n    keys: OPENAI_1_KEY\n",
 			"a:\n  kind: chat\n  providers: openai-1\n", "",
@@ -266,7 +273,7 @@ func TestLoadWithoutAliasesFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Aliases) != 0 {
-		t.Errorf("aliases = %v", cfg.Aliases)
+	if got := cfg.ModelList[0].ModelParams.Model; got != "a" {
+		t.Errorf("upstream model = %q, want the entry key", got)
 	}
 }

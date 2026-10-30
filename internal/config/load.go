@@ -1,7 +1,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,22 +11,25 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Load reads keys.env, provider.yaml, models.yaml and aliases.yaml from dir,
-// validating cross-references. A missing file is fatal except aliases.yaml.
+// Load reads keys.env, provider.yaml and models.yaml from dir, validating
+// cross-references. Every file is mandatory: a models.yaml key is the name
+// callers present, and its 'model' field names the string sent upstream.
+// The legacy aliases.yaml layout is rejected with a migration hint.
 func Load(dir string) (*Config, error) {
 	env, err := keysenv.Load(filepath.Join(dir, "keys.env"))
 	if err != nil {
 		return nil, err
+	}
+	if legacy := filepath.Join(dir, "aliases.yaml"); fileExists(legacy) {
+		return nil, fmt.Errorf(
+			"aliases.yaml is no longer supported: give the caller-facing name its own models.yaml entry " +
+				"and point the 'model' field at the upstream model it serves")
 	}
 	slots, err := loadProviders(filepath.Join(dir, "provider.yaml"), env)
 	if err != nil {
 		return nil, err
 	}
 	models, err := loadModels(filepath.Join(dir, "models.yaml"), slots)
-	if err != nil {
-		return nil, err
-	}
-	aliases, err := loadAliases(filepath.Join(dir, "aliases.yaml"), models)
 	if err != nil {
 		return nil, err
 	}
@@ -44,13 +46,17 @@ func Load(dir string) (*Config, error) {
 		},
 		DegradationMode: "normal",
 		ProxyKeys:       env.ProxyKeys,
-		Aliases:         aliases,
 		providers:       slots,
 	}
 	for _, m := range models {
 		cfg.ModelList = append(cfg.ModelList, m.slots...)
 	}
 	return cfg, nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // adapterCaps maps an adapter type to what it can serve.
@@ -303,11 +309,15 @@ func parseModel(entry mapEntry, byName map[string]ProviderSlot) (modelDef, error
 				return md, err
 			}
 			md.dims = v
-		case "upstream":
-			if node.Value == "" {
-				return md, fmt.Errorf("models.yaml:%d: %s: upstream must not be empty", f.keyLine, md.name)
+		case "model":
+			// The caller-facing key is a name of the operator's choosing;
+			// 'model' is what actually travels upstream.
+			if strings.TrimSpace(node.Value) == "" {
+				return md, fmt.Errorf("models.yaml:%d: %s: model must not be empty", f.keyLine, md.name)
 			}
-			md.upstream = node.Value
+			md.upstream = strings.TrimSpace(node.Value)
+		case "upstream":
+			return md, fmt.Errorf("models.yaml:%d: %s: field 'upstream' was renamed to 'model'", f.keyLine, md.name)
 		default:
 			n, err := maybeLimit(md, f)
 			if err != nil {
@@ -380,39 +390,6 @@ func expandSlots(md modelDef, byName map[string]ProviderSlot) (modelDef, error) 
 		md.slots = append(md.slots, sl)
 	}
 	return md, nil
-}
-
-func loadAliases(path string, models []modelDef) (map[string]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return map[string]string{}, nil
-		}
-		return nil, fmt.Errorf("aliases.yaml: %w", err)
-	}
-	var root yaml.Node
-	if err := yaml.Unmarshal(data, &root); err != nil {
-		return nil, fmt.Errorf("aliases.yaml: %w", err)
-	}
-
-	canonical := map[string]bool{}
-	for _, m := range models {
-		canonical[m.name] = true
-	}
-
-	out := map[string]string{}
-	body := &root
-	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
-		body = root.Content[0]
-	}
-	for _, row := range aliasRows(body) {
-		if !canonical[row.target] {
-			return nil, fmt.Errorf("aliases.yaml:%d: %q points at %q, which is not a canonical model in models.yaml; alias chains are not allowed",
-				row.line, row.alias, row.target)
-		}
-		out[row.alias] = row.target
-	}
-	return out, nil
 }
 
 type mapEntry struct {
@@ -490,21 +467,6 @@ func lineOf(n *yaml.Node) int {
 		return n.Content[0].Line
 	}
 	return n.Line
-}
-
-// aliasRow is one aliases.yaml row plus its source line for errors.
-type aliasRow struct {
-	alias  string
-	target string
-	line   int
-}
-
-func aliasRows(n *yaml.Node) []aliasRow {
-	var out []aliasRow
-	for _, e := range entries(n) {
-		out = append(out, aliasRow{alias: e.key, target: strings.TrimSpace(e.value.Value), line: e.keyLine})
-	}
-	return out
 }
 
 func positiveInt(node *yaml.Node, model, field string) (*int, error) {

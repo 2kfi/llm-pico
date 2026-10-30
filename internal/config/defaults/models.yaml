@@ -1,6 +1,9 @@
 # llm-pico starter models. Created by 'llm-pico --init'.
+# The top-level key is the model name callers present; the 'model' field is
+# the name sent upstream. Omit 'model' to send the key itself.
 gpt-4o-mini:
   kind: chat
+  model: openai/gpt-4o-mini
   providers: openai-1      # order = priority, implicit fallback
   ctx: 128000
   rpm: 300
@@ -10,6 +13,7 @@ gpt-4o-mini:
 
 text-embedding-3-small:
   kind: embeddings
+  model: openai/text-embedding-3-small
   providers: openai-1
   dims: 1536
   rpm: 2000

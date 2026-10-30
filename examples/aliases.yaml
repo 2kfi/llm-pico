@@ -1,3 +1,0 @@
-# alias: canonical-model-name-in-models.yaml
-# Aliases must point at canonical models; chaining aliases is an error.
-gpt-mini: gpt-4o-mini

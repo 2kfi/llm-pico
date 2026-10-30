@@ -1,4 +1,5 @@
 # kind: chat | embeddings | tts | stt
+# model: the name sent upstream. Omit it to send the top-level key itself.
 # providers: order = priority, implicit fallback
 # limits per kind:
 #   chat, embeddings:  rpm, rpd, tpm, tpd
@@ -6,6 +7,7 @@
 #   stt:               rpm, rpd, daily-audio-sec, audio-min
 gemini-3.5-flash:
   kind: chat
+  model: google/gemini-3.5-flash
   providers: google-ai-studio-1, proxy-1-google-ai-studio
   ctx: 1000000
   rpm: 60

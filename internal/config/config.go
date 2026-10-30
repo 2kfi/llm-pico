@@ -93,9 +93,7 @@ type Config struct {
 	RouterSettings  RouterSettings
 	ModelList       []ModelEntry
 	// ProxyKeys are the raw client bearer keys from PROXY_KEYS.
-	ProxyKeys []string
-	// Aliases maps alias -> canonical model name, resolved at load.
-	Aliases         map[string]string
+	ProxyKeys       []string
 	DegradationMode string
 	// providers are the provider.yaml slots, in file order.
 	providers []ProviderSlot
@@ -158,21 +156,6 @@ func (c *Config) Slots(modelName string) []ModelEntry {
 		}
 	}
 	return out
-}
-
-// Canonical resolves an alias to its canonical model name. Unknown names are
-// returned unchanged so lookups behave uniformly.
-func (c *Config) Canonical(name string) string {
-	if v, ok := c.Aliases[name]; ok {
-		return v
-	}
-	return name
-}
-
-// IsAlias reports whether name is an alias.
-func (c *Config) IsAlias(name string) bool {
-	_, ok := c.Aliases[name]
-	return ok
 }
 
 // Keys returns the rotation pool for a slot, normalising the single-key case.

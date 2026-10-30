@@ -10,12 +10,12 @@ import (
 	"path/filepath"
 )
 
-//go:embed defaults/provider.yaml defaults/models.yaml defaults/aliases.yaml
+//go:embed defaults/provider.yaml defaults/models.yaml
 var defaultFS embed.FS
 
 // defaultFiles are written by Init, in the names Load requires. keys.env is
 // generated rather than embedded so every install gets a fresh PROXY_KEYS.
-var defaultFiles = []string{"provider.yaml", "models.yaml", "aliases.yaml"}
+var defaultFiles = []string{"provider.yaml", "models.yaml"}
 
 // configFiles names every starter file, the union an init sweep looks for.
 var configFiles = append([]string{"keys.env"}, defaultFiles...)

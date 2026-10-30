@@ -14,3 +14,4 @@ build/
 docker-compose.yml
 ui-ux.md
 keys.env
+*-design

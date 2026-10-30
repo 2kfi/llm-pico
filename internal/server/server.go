@@ -179,14 +179,13 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 		}
 
 		cfg := s.proxy.Config()
-		canonical := cfg.Canonical(input.Model)
-		if len(cfg.Slots(canonical)) == 0 {
+		if len(cfg.Slots(input.Model)) == 0 {
 			httpx.NotFound(fmt.Sprintf("model '%s' not available", input.Model)).Write(w)
 			return
 		}
 
 		if route == proxy.RouteEmbeddings {
-			if apiErr := s.checkDims(body, canonical); apiErr != nil {
+			if apiErr := s.checkDims(body, input.Model); apiErr != nil {
 				apiErr.Write(w)
 				return
 			}
@@ -302,12 +301,11 @@ func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	cfg := s.proxy.Config()
-	canonical := cfg.Canonical(id)
-	if len(cfg.Slots(canonical)) == 0 {
+	if len(cfg.Slots(id)) == 0 {
 		httpx.NotFound(fmt.Sprintf("model '%s' not found", id)).Write(w)
 		return
 	}
-	listing := httpx.ModelListResponse([]string{canonical})
+	listing := httpx.ModelListResponse([]string{id})
 	if data, ok := listing["data"].([]map[string]any); ok && len(data) > 0 {
 		httpx.WriteJSON(w, http.StatusOK, data[0])
 		return
