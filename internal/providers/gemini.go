@@ -424,9 +424,8 @@ func (a *GeminiAdapter) Embeddings(ctx context.Context, req Request) (*Response,
 		return nil, err
 	}
 	model := stripProviderPrefix(req.Model)
-	if m, ok := StringField(fields, "model"); ok && m != "" {
-		model = stripProviderPrefix(m)
-	}
+	// The body's model field is the caller-facing name; routing already
+	// resolved the upstream model, and the body name must never override it.
 
 	input := fields["input"]
 	parts := convertEmbedInput(input)

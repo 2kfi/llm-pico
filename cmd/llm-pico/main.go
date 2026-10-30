@@ -10,9 +10,9 @@ import (
 	"github.com/arkan/llm-pico/internal/config"
 	"github.com/arkan/llm-pico/internal/providers"
 	"github.com/arkan/llm-pico/internal/proxy"
-	"github.com/arkan/llm-pico/internal/version"
 	"github.com/arkan/llm-pico/internal/ratelimit"
 	"github.com/arkan/llm-pico/internal/server"
+	"github.com/arkan/llm-pico/internal/version"
 	"log/slog"
 	"net/http"
 	"os"
@@ -25,7 +25,7 @@ import (
 
 func main() {
 	var (
-		configDir = flag.String("config-dir", ".", "directory holding keys.env, provider.yaml, models.yaml, aliases.yaml")
+		configDir = flag.String("config-dir", ".", "directory holding keys.env, provider.yaml and models.yaml")
 		initDir   = flag.String("init", "", "write a starter configuration into this directory and exit")
 		host      = flag.String("host", "0.0.0.0", "listen host")
 		port      = flag.Int("port", 4000, "listen port")

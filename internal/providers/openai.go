@@ -202,11 +202,15 @@ func (a *OpenAIAdapter) Transcribe(ctx context.Context, req Request, audio Audio
 	mw := multipart.NewWriter(&buf)
 
 	fields, _ := peekFields(req.Body)
-	model, ok := StringField(fields, "model")
-	if !ok {
-		model = stripProviderPrefix(req.Model)
+	// The body's model field is the caller-facing name; the routed
+	// req.Model is the upstream credential's model and always wins.
+	model := stripProviderPrefix(req.Model)
+	if model == "" {
+		if m, ok := StringField(fields, "model"); ok {
+			model = stripProviderPrefix(m)
+		}
 	}
-	_ = mw.WriteField("model", stripProviderPrefix(model))
+	_ = mw.WriteField("model", model)
 
 	// Forward the optional tuning fields OpenAI accepts on the endpoint.
 	for _, name := range []string{"response_format", "language", "temperature", "timestamp_granularities", "prompt"} {
