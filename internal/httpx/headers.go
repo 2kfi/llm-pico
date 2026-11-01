@@ -63,16 +63,32 @@ func Apply(w http.ResponseWriter, headers http.Header) {
 	}
 }
 
-// ModelListResponse renders the OpenAI-shaped model listing.
-func ModelListResponse(names []string) map[string]any {
+// ModelInfo is one caller-facing model together with the input capabilities
+// the proxy enforces for it.
+type ModelInfo struct {
+	ID       string
+	Images   bool
+	Audio    bool
+	Video    bool
+	Thinking bool
+}
+
+// ModelListResponse renders the OpenAI-shaped model listing. The capability
+// fields are additive: OpenAI clients ignore unknown keys, and /v1/models/{id}
+// returns the same object.
+func ModelListResponse(models []ModelInfo) map[string]any {
 	created := time.Now().Unix()
-	data := make([]map[string]any, 0, len(names))
-	for _, n := range names {
+	data := make([]map[string]any, 0, len(models))
+	for _, m := range models {
 		data = append(data, map[string]any{
-			"id":       n,
-			"object":   "model",
-			"created":  created,
-			"owned_by": "llm-pico",
+			"id":                m.ID,
+			"object":            "model",
+			"created":           created,
+			"owned_by":          "llm-pico",
+			"supports_images":   m.Images,
+			"supports_audio":    m.Audio,
+			"supports_video":    m.Video,
+			"supports_thinking": m.Thinking,
 		})
 	}
 	return map[string]any{"object": "list", "data": data}

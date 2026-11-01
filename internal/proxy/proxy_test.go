@@ -310,6 +310,87 @@ func TestStreamingReconcilesActualUsage(t *testing.T) {
 	}
 }
 
+// Media parts are gated on the per-model flags before any upstream spend, and
+// each kind is checked on its own: a model may allow video without images.
+func TestMediaGateRejectsUnsupportedKind(t *testing.T) {
+	const (
+		imageBody = `{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,x"}}]}]}`
+		audioBody = `{"model":"m","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"a","format":"wav"}}]}]}`
+		videoBody = `{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:video/mp4;base64,x"}}]}]}`
+	)
+	cases := []struct {
+		name   string
+		body   string
+		image  bool
+		audio  bool
+		video  bool
+		wantOK bool
+	}{
+		{"image denied", imageBody, false, false, false, false},
+		{"audio denied", audioBody, false, false, false, false},
+		{"video denied", videoBody, false, false, false, false},
+		// Video is not image input: images off, video on must serve.
+		{"video-only model", videoBody, false, false, true, true},
+		{"audio allowed", audioBody, true, true, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream, hits := newUpstream(t)
+			defer upstream.Close()
+			cfg := chatConfig(upstream, "m", "a")
+			entry := &cfg.ModelList[0]
+			entry.Images, entry.Audio, entry.Video = tc.image, tc.audio, tc.video
+			svc := newService(t, cfg, nil)
+
+			_, err := svc.Dispatch(context.Background(), DispatchInput{
+				Model: "m", RouteType: RouteChat, Body: []byte(tc.body),
+			})
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("dispatch: %v", err)
+				}
+				if len(hits()) != 1 {
+					t.Fatalf("upstream hits = %d, want 1", len(hits()))
+				}
+				return
+			}
+			apiErr := httpx.FromError(err)
+			if apiErr.Status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (%s)", apiErr.Status, apiErr.Message)
+			}
+			if len(hits()) != 0 {
+				t.Error("upstream must not be reached for an unsupported media kind")
+			}
+		})
+	}
+}
+
+// Media capability is a property of the slot, not of the model: a text-only
+// slot ahead of a vision-capable one must be skipped rather than fail the
+// request the caller could have served.
+func TestMediaGateSkipsIncapableSlot(t *testing.T) {
+	const imageBody = `{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,x"}}]}]}`
+
+	upstream, hits := newUpstream(t)
+	defer upstream.Close()
+	cfg := chatConfig(upstream, "m", "textonly", "vision")
+	cfg.ModelList[1].Images = true
+	svc := newService(t, cfg, nil)
+
+	resp, err := svc.Dispatch(context.Background(), DispatchInput{
+		Model: "m", RouteType: RouteChat, Body: []byte(imageBody),
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if got := hits(); len(got) != 1 || !strings.Contains(got[0], "key-vision") {
+		t.Fatalf("hits = %v, want only the vision slot", got)
+	}
+}
+
 // When every key of the first slot is rate-limited at the router, the slot
 // walk must continue to the next slot instead of refusing the caller.
 func TestRouterCooldownFallsThroughToNextSlot(t *testing.T) {

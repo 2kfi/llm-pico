@@ -60,6 +60,8 @@ gpt-4o-mini:
   rpd: 10000
   tpm: 500000
   tpd: 10000000
+  media: image, audio   # optional (chat only): allowed input kinds
+  thinking: true        # optional (chat only): accepts reasoning_effort
 ```
 
 A model's `kind` determines which endpoints serve it and which limit fields
@@ -73,6 +75,24 @@ apply:
 | `cpm` / `cpd`      | tts               | characters of the request `input` (per minute/day) |
 | `daily-audio-sec`  | tts, stt          | audio seconds per day (tts: `len(input)/15` estimate generated; stt: `~32 kB/s` estimate of the upload) |
 | `audio-min`        | stt               | audio minutes per day, same estimate as above rounded up |
+
+### Media and reasoning capabilities
+
+Chat models accept every media kind their adapter can translate (`image`,
+`audio`, `video`). A `media:` allow-list narrows that per model:
+`media: image, audio, video` allows all three, `media: ""` allows none, and
+`media: video` allows video without still images. A request carrying a kind the
+model does not allow is served by another provider slot that does allow it, or
+rejected with 400 before any upstream call when no slot allows it.
+
+`thinking: true` declares that the model accepts the proxy's reasoning
+controls (`reasoning_effort` or `thinking_budget`, mapped to Gemini's thinking
+budget). It defaults to false because the proxy cannot know a model's
+capability.
+
+`GET /v1/models` and `/v1/models/{id}` report the result per model as
+`supports_images`, `supports_audio`, `supports_video` and `supports_thinking`,
+unioned across that model's provider slots.
 
 ### Caller-facing vs upstream names
 

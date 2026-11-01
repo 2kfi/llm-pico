@@ -195,6 +195,11 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 			fmt.Sprintf("model '%s' does not support this endpoint", in.Model))
 	}
 
+	allSlots, err = mediaSlots(allSlots, in)
+	if err != nil {
+		return nil, err
+	}
+
 	slots := slotsWithinContext(allSlots, in)
 	if len(slots) == 0 {
 		return nil, contextTooLongError(allSlots, in)
@@ -235,6 +240,55 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 		lastErr = httpx.Upstream(http.StatusBadGateway, "all upstream providers failed")
 	}
 	return nil, httpx.FromError(lastErr)
+}
+
+// mediaSlots keeps the slots that accept the media a chat request carries:
+// images via image_url parts, audio via input_audio parts, and video riding on
+// an image_url part as a video data URI. Capability is per slot, so a model
+// fronted by both a vision-capable and a text-only provider serves an image
+// request through the slot that can take it rather than rejecting it on
+// whichever slot was tried first.
+func mediaSlots(slots []config.ModelEntry, in DispatchInput) ([]config.ModelEntry, error) {
+	if in.RouteType != RouteChat {
+		return slots, nil
+	}
+	image, audio, video := providers.HasMediaInput(in.Body)
+	if !image && !audio && !video {
+		return slots, nil
+	}
+
+	out := make([]config.ModelEntry, 0, len(slots))
+	var imageOK, audioOK, videoOK bool
+	for _, slot := range slots {
+		imageOK = imageOK || slot.Images
+		audioOK = audioOK || slot.Audio
+		videoOK = videoOK || slot.Video
+		if (!image || slot.Images) && (!audio || slot.Audio) && (!video || slot.Video) {
+			out = append(out, slot)
+		}
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+
+	// Report the kinds no slot can serve; a kind that some slot serves but
+	// no slot combines with the rest gets its own message.
+	var missing []string
+	if image && !imageOK {
+		missing = append(missing, "image")
+	}
+	if audio && !audioOK {
+		missing = append(missing, "audio")
+	}
+	if video && !videoOK {
+		missing = append(missing, "video")
+	}
+	if len(missing) == 0 {
+		return nil, httpx.BadRequest(fmt.Sprintf(
+			"model '%s' has no provider that accepts every media input in this request", in.Model))
+	}
+	return nil, httpx.BadRequest(fmt.Sprintf(
+		"model '%s' does not support %s inputs", in.Model, strings.Join(missing, " or ")))
 }
 
 // kindSlots returns the model's slots that serve the route's operation kind,
@@ -409,12 +463,6 @@ func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInp
 		if !tracedOne {
 			ac.tracer.Add("resolve:"+modelName, modelName, target.ProviderSlug, "ok", "", time.Time{})
 			tracedOne = true
-		}
-
-		// Chat requests carrying image parts need a vision-capable entry;
-		// kind filtering has already handled every other route mismatch.
-		if in.RouteType == RouteChat && providers.HasImageInput(in.Body) && !target.Model.Images {
-			return nil, httpx.BadRequest(fmt.Sprintf("model '%s' does not support image inputs", in.Model))
 		}
 
 		// Limits are charged per slot, plus once at model level; a retry loop

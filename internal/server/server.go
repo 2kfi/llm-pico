@@ -198,13 +198,38 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 		}
 		defer resp.Body.Close()
 
-		for k, vs := range resp.Header {
-			for _, v := range vs {
-				w.Header().Add(k, v)
-			}
-		}
+		copyResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		copyBody(w, resp)
+	}
+}
+
+// hopHeaders are response headers the proxy must not forward. Adapters rewrite
+// the upstream body, so the upstream's framing headers describe bytes the
+// caller never receives; forwarding Content-Length in particular makes clients
+// abort after the converted body comes up short.
+var hopHeaders = map[string]bool{
+	"Connection":          true,
+	"Content-Length":      true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
+// copyResponseHeaders copies upstream headers onto the caller's response,
+// dropping hop-by-hop and body-framing fields.
+func copyResponseHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		if hopHeaders[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
 	}
 }
 
@@ -290,7 +315,27 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 		err.Write(w)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, httpx.ModelListResponse(s.proxy.Router().ModelNames()))
+	models := s.modelInfos(s.proxy.Router().ModelNames())
+	httpx.WriteJSON(w, http.StatusOK, httpx.ModelListResponse(models))
+}
+
+// modelInfos aggregates the per-slot capability flags for each listed model.
+// Capabilities are unioned across slots: a model that accepts images on any
+// slot advertises it, while dispatch still gates every slot on its own flags.
+func (s *Server) modelInfos(names []string) []httpx.ModelInfo {
+	cfg := s.proxy.Config()
+	infos := make([]httpx.ModelInfo, 0, len(names))
+	for _, name := range names {
+		info := httpx.ModelInfo{ID: name}
+		for _, entry := range cfg.Slots(name) {
+			info.Images = info.Images || entry.Images
+			info.Audio = info.Audio || entry.Audio
+			info.Video = info.Video || entry.Video
+			info.Thinking = info.Thinking || entry.Thinking
+		}
+		infos = append(infos, info)
+	}
+	return infos
 }
 
 // getModel serves GET /v1/models/{id}.
@@ -305,7 +350,7 @@ func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
 		httpx.NotFound(fmt.Sprintf("model '%s' not found", id)).Write(w)
 		return
 	}
-	listing := httpx.ModelListResponse([]string{id})
+	listing := httpx.ModelListResponse(s.modelInfos([]string{id}))
 	if data, ok := listing["data"].([]map[string]any); ok && len(data) > 0 {
 		httpx.WriteJSON(w, http.StatusOK, data[0])
 		return

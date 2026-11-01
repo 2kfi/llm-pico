@@ -23,6 +23,8 @@ import (
 // unsupported request before spending a round trip.
 type Capability struct {
 	Images     bool
+	Audio      bool // accepts input_audio parts
+	Video      bool // accepts video data URIs on image_url parts
 	Embeddings bool
 	STT        bool
 	TTS        bool
@@ -264,20 +266,23 @@ func rewriteModel(body []byte, model string) ([]byte, error) {
 	return json.Marshal(fields)
 }
 
-// HasImageInput reports whether a chat request carries an image part, which
-// determines whether the target model must declare vision support.
-func HasImageInput(body []byte) bool {
+// HasMediaInput reports which media kinds a chat request carries. Images use
+// the OpenAI image_url part; audio uses input_audio; video has no OpenAI part
+// type, so clients send it as a base64 data URI on an image_url part. A video
+// data URI is reported as video only, so an allow-list can state video support
+// without also implying image support.
+func HasMediaInput(body []byte) (image, audio, video bool) {
 	fields, err := peekFields(body)
 	if err != nil {
-		return false
+		return false, false, false
 	}
 	raw, ok := fields["messages"]
 	if !ok {
-		return false
+		return false, false, false
 	}
 	var messages []json.RawMessage
 	if err := json.Unmarshal(raw, &messages); err != nil {
-		return false
+		return false, false, false
 	}
 	for _, m := range messages {
 		var msg struct {
@@ -286,20 +291,58 @@ func HasImageInput(body []byte) bool {
 		if err := json.Unmarshal(m, &msg); err != nil {
 			continue
 		}
-		// Multi-part content is the only shape that can carry an image.
+		// Multi-part content is the only shape that can carry media. image_url
+		// is read as raw JSON because the chat API wraps it in an object while
+		// the responses-style input_image part carries a bare URL string.
 		var parts []struct {
-			Type string `json:"type"`
+			Type       string `json:"type"`
+			InputAudio *struct {
+				Data string `json:"data"`
+			} `json:"input_audio"`
+			ImageURL json.RawMessage `json:"image_url"`
 		}
 		if err := json.Unmarshal(msg.Content, &parts); err != nil {
 			continue
 		}
 		for _, p := range parts {
-			if p.Type == "image_url" || p.Type == "input_image" {
-				return true
+			switch p.Type {
+			case "image_url", "input_image":
+				// A video data URI rides on this part type; it is video
+				// input, not image input.
+				if mt, _, ok := splitDataURI(mediaURL(p.ImageURL)); ok && strings.HasPrefix(strings.ToLower(mt), "video/") {
+					video = true
+					continue
+				}
+				image = true
+			case "input_audio":
+				// An empty payload is dropped by the adapters, so it must
+				// not be gated as if media were present.
+				if p.InputAudio != nil && p.InputAudio.Data != "" {
+					audio = true
+				}
 			}
 		}
 	}
-	return false
+	return image, audio, video
+}
+
+// mediaURL extracts a URL from the two shapes an image_url field takes: the
+// chat API's {"url": ...} object and the responses API's bare string.
+func mediaURL(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var obj struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj.URL
+	}
+	return ""
 }
 
 // sseStream reads an OpenAI-shaped server-sent event stream.

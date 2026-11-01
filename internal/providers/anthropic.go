@@ -91,9 +91,30 @@ type contentPart struct {
 	Source *mediaSource `json:"source,omitempty"`
 }
 
-// imageURL wraps the URL of an OpenAI image part.
+// imageURL wraps the URL of an OpenAI image part. The chat API wraps it in an
+// object while the responses shape sends a bare string; both decode here,
+// because a field that fails to decode takes the whole message's content down
+// with it and silently drops the request's text too.
 type imageURL struct {
 	URL string `json:"url"`
+}
+
+func (u *imageURL) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		u.URL = s
+		return nil
+	}
+	var obj struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(data, &obj); err != nil {
+		// An unreadable URL leaves the part empty; the converters skip it
+		// instead of failing every sibling part.
+		return nil
+	}
+	u.URL = obj.URL
+	return nil
 }
 
 // inputAudio wraps base64 audio in the OpenAI shape.
@@ -136,11 +157,12 @@ func toAnthropic(body []byte, model string) (*anthropicRequest, error) {
 			Role    string          `json:"role"`
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
-		MaxTokens   int      `json:"max_tokens"`
-		Temperature *float64 `json:"temperature"`
-		TopP        *float64 `json:"top_p"`
-		Stop        any      `json:"stop"`
-		Stream      bool     `json:"stream"`
+		MaxTokens           int      `json:"max_tokens"`
+		MaxCompletionTokens int      `json:"max_completion_tokens"`
+		Temperature         *float64 `json:"temperature"`
+		TopP                *float64 `json:"top_p"`
+		Stop                any      `json:"stop"`
+		Stream              bool     `json:"stream"`
 	}
 	if err := json.Unmarshal(body, &src); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
@@ -153,7 +175,11 @@ func toAnthropic(body []byte, model string) (*anthropicRequest, error) {
 		TopP:        src.TopP,
 		Stream:      src.Stream,
 	}
-	if src.MaxTokens > 0 {
+	// The newer OpenAI field wins when both are sent, mirroring the OpenAI
+	// adapter's precedence; ignoring it silently fell back to the default.
+	if src.MaxCompletionTokens > 0 {
+		out.MaxTokens = src.MaxCompletionTokens
+	} else if src.MaxTokens > 0 {
 		out.MaxTokens = src.MaxTokens
 	}
 	switch stop := src.Stop.(type) {
@@ -217,9 +243,10 @@ func convertContent(raw json.RawMessage) any {
 		switch p.Type {
 		case "text":
 			out = append(out, contentPart{Type: "text", Text: p.Text})
-		case "image_url":
+		case "image_url", "input_image":
 			// OpenAI carries images as a URL that is usually a data URI;
-			// Anthropic requires the base64 payload split out.
+			// Anthropic requires the base64 payload split out. Both part
+			// names carry the same field.
 			if p.ImageURL == nil {
 				continue
 			}

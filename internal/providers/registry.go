@@ -68,11 +68,11 @@ type Definition struct {
 // small: everything else is configured at runtime through Definition.
 var builtin = []Spec{
 	{Slug: "openai", DisplayName: "OpenAI", BaseURL: DefaultBaseURL, Protocol: ProtocolOpenAI,
-		Auth: AuthBearer, Capabilities: Capability{Images: true, Embeddings: true, STT: true, TTS: true}, Probeable: true},
+		Auth: AuthBearer, Capabilities: Capability{Images: true, Audio: true, Embeddings: true, STT: true, TTS: true}, Probeable: true},
 	{Slug: "anthropic", DisplayName: "Anthropic", BaseURL: AnthropicBaseURL, Protocol: ProtocolAnthropic,
 		Auth: AuthHeaderKey, AuthHeader: "x-api-key", Capabilities: Capability{Images: true}, Probeable: true},
 	{Slug: "gemini", DisplayName: "Google AI Studio", BaseURL: GeminiBaseURL, Protocol: ProtocolGemini,
-		Auth: AuthQueryKey, QueryParam: "key", Capabilities: Capability{Images: true, Embeddings: true}, Probeable: true},
+		Auth: AuthQueryKey, QueryParam: "key", Capabilities: Capability{Images: true, Audio: true, Video: true, Embeddings: true}, Probeable: true},
 }
 
 // catalog is the built-in provider list returned by Catalog.

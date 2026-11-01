@@ -14,15 +14,6 @@ import (
 // newTestClient points adapters at a local test server.
 func newTestClient() *Client { return NewClient() }
 
-func mustJSON(t *testing.T, v any) []byte {
-	t.Helper()
-	b, err := json.Marshal(v)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
-}
-
 // --- body rewriting ---
 
 func TestRewriteModelPreservesUnknownFields(t *testing.T) {
@@ -57,23 +48,34 @@ func TestRewriteModelRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestHasImageInput(t *testing.T) {
+func TestHasMediaInput(t *testing.T) {
 	cases := []struct {
-		name string
-		body string
-		want bool
+		name              string
+		body              string
+		image, audio, vid bool
 	}{
-		{"plain text", `{"messages":[{"role":"user","content":"hello"}]}`, false},
-		{"image part", `{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}]}`, true},
-		{"image later in conversation", `{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":""},{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`, true},
-		{"input_image part", `{"messages":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}]}`, true},
-		{"no messages", `{"model":"gpt-4"}`, false},
-		{"malformed", `{oops`, false},
+		{"image data URI", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,x"}}]}]}`, true, false, false},
+		// Video rides on an image_url part but is not an image input: a
+		// media allow-list must be able to permit one without the other.
+		{"video data URI", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:video/mp4;base64,x"}}]}]}`, false, false, true},
+		{"remote image URL", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x/y.png"}}]}]}`, true, false, false},
+		{"responses-style image string", `{"messages":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,x"}]}]}`, true, false, false},
+		// A malformed part must not panic the gate; it still counts as an
+		// image part, so the model gate can reject it.
+		{"image part without a URL", `{"messages":[{"role":"user","content":[{"type":"image_url"}]}]}`, true, false, false},
+		{"audio part", `{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"a","format":"wav"}}]}]}`, false, true, false},
+		{"empty audio part", `{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"format":"wav"}}]}]}`, false, false, false},
+		{"plain text", `{"messages":[{"role":"user","content":"plain text"}]}`, false, false, false},
+		{"text part", `{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`, false, false, false},
+		{"no messages", `{"model":"gpt-4"}`, false, false, false},
+		{"malformed", `{oops`, false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := HasImageInput([]byte(tc.body)); got != tc.want {
-				t.Errorf("HasImageInput = %v, want %v", got, tc.want)
+			image, audio, vid := HasMediaInput([]byte(tc.body))
+			if image != tc.image || audio != tc.audio || vid != tc.vid {
+				t.Errorf("HasMediaInput(%s) = %v/%v/%v, want %v/%v/%v",
+					tc.body, image, audio, vid, tc.image, tc.audio, tc.vid)
 			}
 		})
 	}
@@ -231,6 +233,53 @@ func TestToAnthropicConvertsImageDataURI(t *testing.T) {
 	}
 	if parts[1].Source.Data != "QUJD" {
 		t.Errorf("data = %q, want QUJD", parts[1].Source.Data)
+	}
+}
+
+// The responses shape names the part input_image and sends the URL as a bare
+// string. Both must reach Anthropic as media: a part that fails to decode
+// takes the message's text down with it and the caller is told nothing.
+func TestToAnthropicConvertsResponsesStyleImage(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"describe"},
+		{"type":"input_image","image_url":"data:image/png;base64,QUJD"}
+	]}],"max_tokens":10}`)
+	out, err := toAnthropic(body, "anthropic/claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts, ok := out.Messages[0].Content.([]contentPart)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content = %#v, want the text and image parts", out.Messages[0].Content)
+	}
+	if parts[0].Text != "describe" {
+		t.Errorf("text part = %q", parts[0].Text)
+	}
+	if parts[1].Source == nil || parts[1].Source.Data != "QUJD" {
+		t.Fatalf("image part = %#v, want the base64 payload", parts[1])
+	}
+}
+
+// max_completion_tokens is what the newer OpenAI clients send; ignoring it
+// silently fell back to the default.
+func TestToAnthropicHonorsMaxCompletionTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"new field wins", `{"messages":[{"role":"user","content":"hi"}],"max_tokens":10,"max_completion_tokens":77}`, 77},
+		{"new field alone", `{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":33}`, 33},
+		{"legacy field", `{"messages":[{"role":"user","content":"hi"}],"max_tokens":12}`, 12},
+	}
+	for _, tc := range cases {
+		out, err := toAnthropic([]byte(tc.body), "anthropic/claude")
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if out.MaxTokens != tc.want {
+			t.Errorf("%s: maxTokens = %d, want %d", tc.name, out.MaxTokens, tc.want)
+		}
 	}
 }
 
@@ -473,6 +522,52 @@ func TestToGeminiMapsRoles(t *testing.T) {
 	// Gemini calls the assistant role "model".
 	if out.Contents[1].Role != "model" {
 		t.Errorf("second role = %q, want model", out.Contents[1].Role)
+	}
+}
+
+// A responses-style input_image part must survive the Gemini translation; the
+// media gate reports it as an image, so dropping it would send the model a
+// request with no content at all.
+func TestToGeminiConvertsResponsesStyleImage(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"what is this"},
+		{"type":"input_image","image_url":"data:image/png;base64,QUJD"}
+	]}]}`)
+	out, err := toGemini(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Contents) != 1 || len(out.Contents[0].Parts) != 2 {
+		t.Fatalf("contents = %+v, want the text and image parts", out.Contents)
+	}
+	if got := out.Contents[0].Parts[0].Text; got != "what is this" {
+		t.Errorf("text part = %q", got)
+	}
+	part := out.Contents[0].Parts[1]
+	if part.InlineData == nil || part.InlineData.MimeType != "image/png" || part.InlineData.Data != "QUJD" {
+		t.Fatalf("image part = %+v, want the inline PNG payload", part)
+	}
+}
+
+func TestToGeminiHonorsMaxCompletionTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"new field wins", `{"messages":[{"role":"user","content":"hi"}],"max_tokens":10,"max_completion_tokens":77}`, 77},
+		{"new field alone", `{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":33}`, 33},
+		{"legacy field", `{"messages":[{"role":"user","content":"hi"}],"max_tokens":12}`, 12},
+		{"neither", `{"messages":[{"role":"user","content":"hi"}]}`, 4096},
+	}
+	for _, tc := range cases {
+		out, err := toGemini([]byte(tc.body))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := out.GenerationConfig.MaxOutputTokens; got != tc.want {
+			t.Errorf("%s: maxOutputTokens = %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }
 

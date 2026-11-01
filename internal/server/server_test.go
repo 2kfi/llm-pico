@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -136,6 +137,95 @@ func TestHMACBodyAtLimitAccepted(t *testing.T) {
 
 // A slot without dims must not prevent a later slot's dims from being
 // enforced: a request for the wrong size is refused.
+// The proxy rewrites adapter bodies, so upstream framing headers must not
+// describe the bytes sent to the caller.
+func TestCopyResponseHeadersDropsFraming(t *testing.T) {
+	src := http.Header{
+		"Content-Length":        {"245"},
+		"Transfer-Encoding":     {"chunked"},
+		"Connection":            {"keep-alive"},
+		"Content-Type":          {"application/json"},
+		"X-RateLimit-Remaining": {"7"},
+	}
+	dst := http.Header{}
+	copyResponseHeaders(dst, src)
+	for _, key := range []string{"Content-Length", "Transfer-Encoding", "Connection"} {
+		if got := dst.Get(key); got != "" {
+			t.Errorf("%s = %q, want it dropped", key, got)
+		}
+	}
+	if dst.Get("Content-Type") != "application/json" || dst.Get("X-RateLimit-Remaining") != "7" {
+		t.Errorf("end-to-end headers lost: %v", dst)
+	}
+}
+
+// /v1/models advertises the capabilities the media gate and reasoning controls
+// honour, unioned across a model's slots.
+func TestModelListingExposesCapabilities(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := testConfig(upstream, false)
+	cfg.ModelList[0].Audio = true
+	cfg.ModelList[0].Thinking = true
+	// A second slot contributes image support, so the union advertises it.
+	cfg.ModelList = append(cfg.ModelList, config.ModelEntry{
+		ModelName:   "m",
+		Kind:        config.KindChat,
+		Provider:    "beta",
+		ModelParams: config.ModelParams{Model: "beta/m", APIKey: "key-beta", APIBase: upstream.URL},
+		Images:      true,
+	})
+
+	svc := proxy.NewService(cfg, providers.NewRegistry(nil), slog.New(slog.DiscardHandler))
+	srv := New(serverOptions(t, svc))
+
+	list := httptest.NewRecorder()
+	srv.ServeHTTP(list, requestTo("GET", "/v1/models", nil))
+	if list.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", list.Code, list.Body.String())
+	}
+	var listing struct {
+		Data []struct {
+			ID               string `json:"id"`
+			SupportsImages   bool   `json:"supports_images"`
+			SupportsAudio    bool   `json:"supports_audio"`
+			SupportsVideo    bool   `json:"supports_video"`
+			SupportsThinking bool   `json:"supports_thinking"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &listing); err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Data) != 1 || listing.Data[0].ID != "m" {
+		t.Fatalf("listing = %+v, want one model named m", listing.Data)
+	}
+	got := listing.Data[0]
+	if !got.SupportsImages || !got.SupportsAudio || got.SupportsVideo || !got.SupportsThinking {
+		t.Errorf("capabilities = images:%v audio:%v video:%v thinking:%v, want true/true/false/true",
+			got.SupportsImages, got.SupportsAudio, got.SupportsVideo, got.SupportsThinking)
+	}
+
+	single := httptest.NewRecorder()
+	srv.ServeHTTP(single, requestTo("GET", "/v1/models/m", nil))
+	if single.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", single.Code, single.Body.String())
+	}
+	var one struct {
+		ID               string `json:"id"`
+		SupportsThinking bool   `json:"supports_thinking"`
+	}
+	if err := json.Unmarshal(single.Body.Bytes(), &one); err != nil {
+		t.Fatal(err)
+	}
+	if one.ID != "m" || !one.SupportsThinking {
+		t.Errorf("single model = %+v, want m with thinking support", one)
+	}
+}
+
 func TestCheckDimsHonoursLaterSlot(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

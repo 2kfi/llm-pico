@@ -75,6 +75,9 @@ type ModelEntry struct {
 	Embeddings bool
 	STT        bool
 	TTS        bool
+	Audio      bool // accepts input_audio parts
+	Video      bool // accepts video data URIs on image_url parts
+	Thinking   bool // accepts reasoning_effort / thinking_budget
 }
 
 // EffectiveCtx returns the context budget that applies to this slot: the

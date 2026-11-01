@@ -95,6 +95,10 @@ Commits: `107af4e` (hotfix batch), `393f856` (aliases retirement), `3ad6808`
     `recordFailure` handles the nil key case safely.
 
 ### Lower (fixed)
+- Adapter-rewritten bodies forwarded the upstream's `Content-Length` (and other
+  framing headers), so an HTTP/1.1 upstream that sets one made clients abort
+  mid-response when the translated body came up short. Framing headers are now
+  dropped in `server.copyResponseHeaders`.
 - Gemini API key is `url.QueryEscape`d in the query string.
 - `estimateTokens` was multiplied per returned embedding — computed once now.
 - `/v1/chat/completions` no longer charges 4096 default tokens of TPM budget for
@@ -147,17 +151,41 @@ Gemini paths now all work live against Google AI Studio (Nov 01):
 | Images (data URI on `image_url`) | ✅ live-tested, real answer about color |
 | **Video** (data URI with `video/mp4` on `image_url`) | ✅ live-tested with a real 1s ffmpeg mp4 — Gemini watched it (“Red”) |
 
+### Tools, JSON mode (NEW)
+
+- **Tools.** OpenAI `tools[].function` → Gemini `functionDeclarations`, with the
+  caller's JSON Schema forwarded **verbatim** through `parametersJsonSchema`
+  (full JSON Schema; the legacy `parameters` field only takes the OpenAPI 3.0
+  subset). Non-function tools are skipped. `tool_choice` maps
+  `auto`→default, `none`→`NONE`, `required`→`ANY`, and a specific function→
+  `ANY` + `allowedFunctionNames`.
+- **Tool turns.** assistant `tool_calls` → `functionCall` parts (the argument
+  string is parsed into an object; a non-object is wrapped as `{"value": …}`).
+  `role:"tool"` → a user-role `functionResponse` keyed by the function name,
+  resolved from the earlier `tool_call_id`; a JSON-object result passes through,
+  anything else becomes `{"result": …}`. Adjacent same-role turns are merged
+  (parallel tool results become one user turn) and empty content is dropped.
+- **Responses.** `functionCall` parts → OpenAI `tool_calls`
+  (`id: call_<hex>`, `arguments` as a JSON **string**), `finish_reason:
+  tool_calls` when the reply only called tools and content is `null`; streamed
+  calls arrive as `delta.tool_calls` with an `index`, and the terminal chunk
+  carries `finish_reason: tool_calls`. `thought: true` parts are skipped so
+  reasoning summaries never leak into content.
+- **JSON mode.** `response_format: {"type":"json_object"}` →
+  `responseMimeType: application/json`; `{"type":"json_schema", …}` also
+  forwards the schema through `responseJsonSchema` (same verbatim policy as
+  tools).
+
 Not supported / not attempted (still true):
 - Gemini `batchEmbedContents` sends **one** `requests[]` element (i.e., one
   embedding per proxy call) — the OpenAI `input` array semantics aren't batched.
-- No tool/function-call passthrough (`tools`, `tool_calls`, `role:"tool"`
-  messages are dropped on the ground).
-- Non-thinking content types: `system` role merging, empty-content edge cases,
-  JSON-mode response schema (`response_mime_type` etc.) are not mapped.
+- Gemini thought signatures are not echoed back, so multi-turn tool use on
+  models that require them may need a follow-up.
+- `parallel_tool_calls` and non-function tool types are ignored.
 
 ---
 
-## 5. Thinking controls (NEW, in the tree — uncommitted)
+## 5. Thinking controls (NEW)
 
 OpenAI clients can now control Gemini thinking from `/v1/chat/completions`
 **without a models.yaml change**:
@@ -187,7 +215,7 @@ payload carries exactly the mapped `thinkingBudget` int.
 
 ---
 
-## 6. Audio / video support in chat (NEW, in the tree — uncommitted)
+## 6. Audio / video support in chat (NEW)
 
 Gemini adapter now maps the OpenAI `input_audio` content part:
 
@@ -219,21 +247,26 @@ flash-local-gemma4:31b:
   media: ""                    # ← accepts no media at all
 ```
 
-- **Default:** chat models accept `image, audio, video` (existing behavior
-  preserved: runtime images AND audio AND video now allowed); embeddings/tts/stt
-  never expect media parts. If a `media:` list is present it NARROWS the defaults
-  (it can't widen an `openai-compat` slot that has no image, e.g., Anthropic-adapter
-  slots can't take images at all because the adapter never qualifies).
-- The gate is enforced in `internal/proxy/proxy.go` `attemptSlot` via the new
-  `providers.HasMediaInput` (was `HasImageInput`): image without `Images`,
-  audio without `Audio`, video without `Video` → `400 BadRequest` mentioning the
-  unsupported kind, **before** any upstream spend (consistent with the old image
-  gate, and with the `x-llm-pico`-docs elsewhere; it does not continue the failover
-  walk on this kind of `4xx`, which is deliberate: caller is pinned).
+- **Default:** chat models accept every media kind **their adapter can translate**
+  (`Capability.Images/Audio/Video`): Gemini takes image+audio+video, OpenAI takes
+  image+audio, Anthropic takes images only, openai-compat advertises all three
+  because it forwards the body verbatim. Embeddings/tts/stt never expect media
+  parts. A `media:` list NARROWS the adapter default; it cannot widen it
+  (Anthropic slots still refuse audio/video).
+- The gate is enforced in `internal/proxy/proxy.go` `mediaSlots`, before the
+  slot walk, via `providers.HasMediaInput` (was `HasImageInput`): image without
+  `Images`, audio without `Audio`, video without `Video`. Each kind is checked
+  independently (video data URI ≠ image input), so `media: video` works without
+  granting images. A `media:` field on a non-chat kind is a config error.
+- Incapable slots are **skipped, not fatal**: a model fronted by a text-only
+  slot and a vision slot serves image requests through the vision slot no
+  matter which one round-robin would have picked. Only when no slot accepts
+  every kind the request carries is it a `400 BadRequest` naming the
+  unsupported kind(s), still **before** any upstream spend. (This replaced the
+  per-attempt 400, which aborted the failover walk and randomly rejected
+  requests the model could serve.)
 
-Work still open in this feature (see §7 TODO):
-- `httpx.ModelListResponse` (`/v1/models`) does NOT yet expose capabilities —
-  worth adding `owned_by`-adjacent fields or a new `informational` endpoint.
+Work still open in this feature:
 - No Anthropic-side audio (dropped deliberately, code says so at
   `anthropic.go ~line 237-243`), and no Anthropic `source:` → OpenAI re-encode
   for minimality.
@@ -289,7 +322,11 @@ the timeout left each attempt — the retry loop *does* apply within the same sl
 - New tests: `routed_model_test.go` (embeddings/transcribe routed-model precedence),
   `gemini_thinking_test.go` (effort mapping, budget priority, audio part mapping,
   video data URI mapping, non-thinking 400 pass-through),
-  `HasMediaInput` cases in `providers_test.go`
+  `gemini_tools_test.go` (tool/turn mapping, tool_choice modes, JSON mode, tool
+  calls in buffered and streamed replies, thought-part filtering),
+  `HasMediaInput` cases in `providers_test.go`, media/thinking flags in
+  `config/load_test.go`, capability listing and framing-header tests in
+  `server/server_test.go`
 - GitHub Actions: `.github/workflows/release.yml` builds releases; version stamping
   via `internal/version` reading build info — the binary is built as
   `go build -trimpath -ldflags "-s -w"` (version string v0.3.2-dirty-<hash> when
@@ -299,14 +336,16 @@ the timeout left each attempt — the retry loop *does* apply within the same sl
 
 ## 9. Known gaps / ideas (NOT urgent, opinionated)
 
-- `/v1/models` does not report capabilities (`supports_vision`, `supports_audio`,
-  `supports_video`, `supports_thinking`, etc.) — natural follow-up to the
-  `media:` flags: could be surfaced by extending the capability probe
-  shape in `providers.ModelCapability` (it already has `SupportsTools`,
-  `SupportsVision`, `SupportsStream`, `SupportsJSON`) and rendering them in
-  the listing.
-- Gemini: no tool/function calling, no JSON-mode scoping, no response length cap
-  beyond `max_tokens`.
+- `/v1/models` now reports `supports_images` / `supports_audio` /
+  `supports_video` / `supports_thinking`, unioned across a model's slots. The
+  union is optimistic: dispatch gates each slot individually, so a model with a
+  video slot and a text-only slot answers video only through the former. A
+  request whose kind no slot accepts is a 400, so the listing never promises
+  something the model cannot serve at all.
+- Gemini: no response length cap beyond `max_tokens`; thought signatures from
+  Gemini 3 tool calls are not preserved across turns.
+- The deployment's `models.yaml` must add `thinking: true` to a model before
+  `/v1/models` advertises thinking for it; the flag is opt-in by design.
 - OpenAI 4xx vs proxy 4xx distinction is fuzzy — `upstreamError` currently
   canonicalizes upstream errors into `httpx.Error`, losing provider metadata
   headers (a cached “provider” field is in `EndpointError`, but it never
@@ -348,13 +387,21 @@ the timeout left each attempt — the retry loop *does* apply within the same sl
    (the `setsid` is deliberate — a bare `&` in some shells dies with the console).
 4. Quick health: `curl -s :4400/health` (version stamp), `/v1/models` with a PROXY_KEY from `keys.env`.
 5. Real completion smoke: `gemini-flash` + a 1-token budget question — see §7 table.
-6. Before publishing: commit the §5/§6 tree contents (message suggestion:
-   `feat: gemini thinking controls (reasoning_effort/thinking_budget), audio parts, video data URIs, per-model media:` flags in models.yaml with per-kind proxy gating`),
-   then tag a release if a new user-facing knob lands.
+6. Before publishing: tag a release if a new user-facing knob lands — builds
+   for linux/darwin/windows are produced by `.github/workflows/release.yml` on
+   a `v*.*.*` tag (the version string is stamped from `git describe`).
 7. Sneaky bits worth knowing about the code:
    - round-robin anchor lives in `group.lastKey` (string, the api key), not an int — don't “refactor” it back.
-   - `HasMediaInput` returns 3 bools and image==true is implied for video-in-image_url; the proxy checks all three.
-   - The `key == "" ` fallback in the OpenAI transcribe model override keeps a
-     `<missing req.Model>`-free path — don't remove without re-reading that test.
+   - `HasMediaInput` returns 3 bools. A video data URI rides on an `image_url`
+    part but reports only `video=true`, never `image=true`; `image_url` is read
+    as raw JSON because responses-style `input_image` carries a bare string URL.
+    The proxy checks all three independently.
+  - The `key == "" ` fallback in the OpenAI transcribe model override keeps a
+    `<missing req.Model>`-free path — don't remove without re-reading that test.
+  - Gemini schemas use `parametersJsonSchema` / `responseJsonSchema` on purpose:
+    the legacy `parameters` / `responseSchema` fields only accept the OpenAPI
+    3.0 subset, while the JSON-Schema fields take what OpenAI clients send.
+  - `geminiStream.toolIndex`/`sawToolCalls` exist so a finish-only terminal
+    chunk can still report `finish_reason: tool_calls`.
    - `aliases.yaml.bak` / `models.yaml.bak` in the deployment dir are the
      user's rollback, keep them.

@@ -79,7 +79,9 @@ type AuthHeaderNames struct {
 func (a *OpenAIAdapter) Name() string { return "openai" }
 
 func (a *OpenAIAdapter) Capabilities() Capability {
-	return Capability{Images: true, Embeddings: true, STT: true, TTS: true}
+	// Audio input is served by OpenAI's audio chat models; the chat API has
+	// no video part type, so a video data URI would be rejected upstream.
+	return Capability{Images: true, Audio: true, Embeddings: true, STT: true, TTS: true}
 }
 
 // authHeaders applies the configured credential style to a header map.

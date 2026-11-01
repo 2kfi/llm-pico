@@ -60,11 +60,14 @@ func fileExists(path string) bool {
 }
 
 // adapterCaps maps an adapter type to what it can serve.
+// The media flags mirror what each adapter can translate: Anthropic has no
+// audio or video blocks, while openai-compat forwards the body verbatim and
+// leaves the decision to its upstream.
 var adapterCaps = map[string]providers.Capability{
-	"openai":        {Images: true, Embeddings: true, STT: true, TTS: true},
+	"openai":        {Images: true, Audio: true, Embeddings: true, STT: true, TTS: true},
 	"anthropic":     {Images: true},
-	"gemini":        {Images: true, Embeddings: true},
-	"openai-compat": {Images: true, Embeddings: true, STT: true, TTS: true},
+	"gemini":        {Images: true, Audio: true, Video: true, Embeddings: true},
+	"openai-compat": {Images: true, Audio: true, Video: true, Embeddings: true, STT: true, TTS: true},
 }
 
 // providerProtocol maps a file adapter name onto the providers.Registry
@@ -88,19 +91,6 @@ func providerDefinition(p ProviderSlot) (providers.Definition, bool) {
 		Protocol:     proto,
 		Capabilities: adapterCaps[p.Adapter],
 	}, true
-}
-
-func kindCaps(k Kind) providers.Capability {
-	switch k {
-	case KindTTS:
-		return providers.Capability{TTS: true}
-	case KindSTT:
-		return providers.Capability{STT: true}
-	case KindEmbeddings:
-		return providers.Capability{Embeddings: true}
-	default:
-		return providers.Capability{Images: true}
-	}
 }
 
 // kindSupports reports whether an adapter's capability set covers a kind.
@@ -221,6 +211,11 @@ type modelDef struct {
 	ctx      *int
 	dims     *int
 	upstream string
+	images   *bool
+	audio    *bool
+	video    *bool
+	thinking *bool
+	mediaSet bool
 	slots    []ModelEntry
 }
 
@@ -316,6 +311,39 @@ func parseModel(entry mapEntry, byName map[string]ProviderSlot) (modelDef, error
 				return md, fmt.Errorf("models.yaml:%d: %s: model must not be empty", f.keyLine, md.name)
 			}
 			md.upstream = strings.TrimSpace(node.Value)
+		case "media":
+			md.mediaSet = true
+			names, err := nameList(node)
+			if err != nil {
+				return md, fmt.Errorf("models.yaml:%d: %s: media: %v", f.keyLine, md.name, err)
+			}
+			if len(names) == 0 {
+				// An explicit empty list: the chat-level defaults were
+				// permissive; this entry accepts no media at all.
+				var off bool
+				md.images, md.audio, md.video = &off, &off, &off
+				break
+			}
+			var images, audio, video bool
+			for _, n := range names {
+				switch strings.ToLower(strings.TrimSpace(n)) {
+				case "image", "images":
+					images = true
+				case "audio":
+					audio = true
+				case "video":
+					video = true
+				default:
+					return md, fmt.Errorf("models.yaml:%d: %s: media: unknown kind %q (want image, audio or video)", f.keyLine, md.name, n)
+				}
+			}
+			md.images, md.audio, md.video = &images, &audio, &video
+		case "thinking":
+			v, err := boolValue(node, md.name, "thinking")
+			if err != nil {
+				return md, err
+			}
+			md.thinking = &v
 		case "upstream":
 			return md, fmt.Errorf("models.yaml:%d: %s: field 'upstream' was renamed to 'model'", f.keyLine, md.name)
 		default:
@@ -329,6 +357,14 @@ func parseModel(entry mapEntry, byName map[string]ProviderSlot) (modelDef, error
 
 	if md.kind == "" {
 		return md, fmt.Errorf("models.yaml:%d: %s: 'kind' is required", md.line, md.name)
+	}
+	// media: describes chat content parts; accepting it elsewhere would let
+	// an operator believe they had restricted a model that never sees media.
+	if md.mediaSet && md.kind != KindChat {
+		return md, fmt.Errorf("models.yaml:%d: %s: media does not apply to kind %q", md.line, md.name, md.kind)
+	}
+	if md.thinking != nil && md.kind != KindChat {
+		return md, fmt.Errorf("models.yaml:%d: %s: thinking does not apply to kind %q", md.line, md.name, md.kind)
 	}
 	return expandSlots(md, byName)
 }
@@ -359,6 +395,20 @@ func maybeLimit(md modelDef, f mapEntry) (*int, error) {
 }
 
 func expandSlots(md modelDef, byName map[string]ProviderSlot) (modelDef, error) {
+	// Chat models accept every media kind their adapter can translate by
+	// default; an explicit 'media:' list narrows it further.
+	media := md.kind == KindChat
+	audio, video, images := media, media, media
+	if md.audio != nil {
+		audio = *md.audio
+	}
+	if md.video != nil {
+		video = *md.video
+	}
+	if md.images != nil {
+		images = *md.images
+	}
+
 	for _, name := range md.provider {
 		slot := byName[name]
 		caps := adapterCaps[slot.Adapter]
@@ -374,7 +424,10 @@ func expandSlots(md modelDef, byName map[string]ProviderSlot) (modelDef, error) 
 			CtxOverride:    slot.Ctx,
 			Dims:           md.dims,
 			ModelParams:    ModelParams{Model: md.upstream, APIKeys: slot.Keys, APIBase: slot.BaseURL},
-			Images:         md.kind == KindChat && caps.Images,
+			Images:         md.kind == KindChat && caps.Images && images,
+			Audio:          md.kind == KindChat && caps.Audio && audio,
+			Video:          md.kind == KindChat && caps.Video && video,
+			Thinking:       md.kind == KindChat && md.thinking != nil && *md.thinking,
 			Embeddings:     md.kind == KindEmbeddings,
 			STT:            md.kind == KindSTT,
 			TTS:            md.kind == KindTTS,
@@ -478,6 +531,15 @@ func positiveInt(node *yaml.Node, model, field string) (*int, error) {
 		return nil, fmt.Errorf("models.yaml:%d: %s: %s must be positive", node.Line, model, field)
 	}
 	return &v, nil
+}
+
+// boolValue reads a YAML boolean field, naming the file and field on error.
+func boolValue(node *yaml.Node, model, field string) (bool, error) {
+	var v bool
+	if err := node.Decode(&v); err != nil {
+		return false, fmt.Errorf("models.yaml:%d: %s: %s must be true or false", node.Line, model, field)
+	}
+	return v, nil
 }
 
 // nameList accepts both a flow/block list and a comma-joined scalar.

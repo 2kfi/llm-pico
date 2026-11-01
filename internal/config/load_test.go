@@ -164,6 +164,118 @@ func TestLoadEndToEnd(t *testing.T) {
 	}
 }
 
+// Chat models default to every media kind their adapter can translate; an
+// explicit 'media:' list narrows that, and one kind never implies another.
+func TestMediaCapabilitiesPerAdapterAndAllowList(t *testing.T) {
+	models := `
+gemini-default:
+  kind: chat
+  providers: google-1
+
+anthropic-default:
+  kind: chat
+  providers: anthropic-1
+
+video-only:
+  kind: chat
+  providers: google-1
+  media: video
+
+vision-only:
+  kind: chat
+  providers: google-1
+  media: image
+
+muted:
+  kind: chat
+  providers: google-1
+  media: ""
+`
+	cfg, err := Load(writeDir(t, keysEnv("openai", "anthropic", "google", "relay", "gpu"),
+		providerYAML(), models, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		model               string
+		image, audio, video bool
+	}{
+		{"gemini-default", true, true, true},
+		// Anthropic has no audio or video blocks, so the default must not
+		// promise them even though the model did not narrow anything.
+		{"anthropic-default", true, false, false},
+		{"video-only", false, false, true},
+		{"vision-only", true, false, false},
+		{"muted", false, false, false},
+	}
+	for _, tc := range cases {
+		slots := cfg.Slots(tc.model)
+		if len(slots) != 1 {
+			t.Fatalf("%s slots = %d, want 1", tc.model, len(slots))
+		}
+		got := slots[0]
+		if got.Images != tc.image || got.Audio != tc.audio || got.Video != tc.video {
+			t.Errorf("%s media flags = %v/%v/%v, want %v/%v/%v", tc.model,
+				got.Images, got.Audio, got.Video, tc.image, tc.audio, tc.video)
+		}
+	}
+}
+
+// thinking: is an opt-in declaration that a chat model accepts the proxy's
+// reasoning controls; it is what /v1/models reports.
+func TestThinkingFlagPerModel(t *testing.T) {
+	models := `
+thinking-model:
+  kind: chat
+  providers: google-1
+  thinking: true
+
+plain-model:
+  kind: chat
+  providers: google-1
+`
+	cfg, err := Load(writeDir(t, keysEnv("openai", "anthropic", "google", "relay", "gpu"),
+		providerYAML(), models, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Slots("thinking-model")[0].Thinking {
+		t.Error("thinking: true was not carried into the model entry")
+	}
+	if cfg.Slots("plain-model")[0].Thinking {
+		t.Error("thinking must default to false, not be inferred")
+	}
+
+	bad := `
+embed:
+  kind: embeddings
+  providers: openai-1
+  thinking: true
+`
+	_, err = Load(writeDir(t, keysEnv("openai", "anthropic", "google", "relay", "gpu"),
+		providerYAML(), bad, ""))
+	if err == nil || !strings.Contains(err.Error(), "thinking does not apply") {
+		t.Fatalf("err = %v, want a thinking/kind mismatch", err)
+	}
+}
+
+// media: describes chat content parts; on any other kind it must be rejected
+// rather than silently ignored.
+func TestMediaOnNonChatKindIsRejected(t *testing.T) {
+	models := `
+embed:
+  kind: embeddings
+  providers: openai-1
+  media: image
+`
+	_, err := Load(writeDir(t, keysEnv("openai", "anthropic", "google", "relay", "gpu"),
+		providerYAML(), models, ""))
+	if err == nil || !strings.Contains(err.Error(), "media does not apply") {
+		t.Fatalf("err = %v, want a media/kind mismatch", err)
+	}
+}
+
 func TestRegistryBuiltFromProviders(t *testing.T) {
 	cfg, err := Load(fullDir(t))
 	if err != nil {
