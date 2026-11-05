@@ -552,18 +552,27 @@ func (r *Router) find(t *Target) groupRef {
 	return nil
 }
 
+// KeyStatus is a point-in-time health snapshot of one credential.
+type KeyStatus struct {
+	Prefix        string    `json:"prefix"`
+	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
+	Fails         int       `json:"fails"`
+	Status        string    `json:"status"` // "READY", "COOLING_DOWN", "QUARANTINED"
+}
+
 // GroupStatus is a point-in-time health snapshot of one routing group.
 type GroupStatus struct {
-	ProviderSlug string  `json:"provider"`
-	APIBase      string  `json:"api_base,omitempty"`
-	Health       float64 `json:"health"`
-	Breaker      string  `json:"breaker"`
-	Errors       int     `json:"errors"`
-	Requests     int     `json:"requests"`
-	LatencyP50MS int64   `json:"latency_p50_ms"`
-	LatencyP95MS int64   `json:"latency_p95_ms"`
-	KeyCount     int     `json:"key_count"`
-	KeysCooling  int     `json:"keys_cooling"`
+	ProviderSlug string      `json:"provider"`
+	APIBase      string      `json:"api_base,omitempty"`
+	Health       float64     `json:"health"`
+	Breaker      string      `json:"breaker"`
+	Errors       int         `json:"errors"`
+	Requests     int         `json:"requests"`
+	LatencyP50MS int64       `json:"latency_p50_ms"`
+	LatencyP95MS int64       `json:"latency_p95_ms"`
+	KeyCount     int         `json:"key_count"`
+	KeysCooling  int         `json:"keys_cooling"`
+	Keys         []KeyStatus `json:"keys,omitempty"`
 }
 
 // Status reports health for every group serving modelName.
@@ -577,14 +586,31 @@ func (r *Router) Status(modelName string) []GroupStatus {
 		state, _ := g.breaker.snapshot()
 		p50, p95 := g.latency.percentiles()
 
+		var keys []KeyStatus
 		cooling := 0
 		now := time.Now()
 		for _, k := range g.keys {
 			k.mu.Lock()
+			prefix := k.apiKey
+			if len(prefix) > 12 {
+				prefix = prefix[:8] + "..." + prefix[len(prefix)-4:]
+			}
+			ks := KeyStatus{
+				Prefix:        prefix,
+				CooldownUntil: k.cooldownUntil,
+				Fails:         k.fails,
+				Status:        "READY",
+			}
 			if k.cooldownUntil.After(now) {
 				cooling++
+				ks.Status = "COOLING_DOWN"
+				// A year-long cooldown marks a quarantined key (401/403).
+				if k.cooldownUntil.Sub(now) > 30*24*time.Hour {
+					ks.Status = "QUARANTINED"
+				}
 			}
 			k.mu.Unlock()
+			keys = append(keys, ks)
 		}
 
 		out = append(out, GroupStatus{
@@ -598,7 +624,17 @@ func (r *Router) Status(modelName string) []GroupStatus {
 			LatencyP95MS: p95.Milliseconds(),
 			KeyCount:     len(g.keys),
 			KeysCooling:  cooling,
+			Keys:         keys,
 		})
+	}
+	return out
+}
+
+// AllStatus returns the health status of every configured model.
+func (r *Router) AllStatus() map[string][]GroupStatus {
+	out := make(map[string][]GroupStatus)
+	for _, name := range r.ModelNames() {
+		out[name] = r.Status(name)
 	}
 	return out
 }

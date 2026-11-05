@@ -363,6 +363,31 @@ func TestConcurrentResolveIsRaceFree(t *testing.T) {
 	}
 }
 
+func TestKeyQuarantineAndStatus(t *testing.T) {
+	r := New(multiKeyConfig())
+
+	target1, err := r.Resolve("test-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Record 403 Forbidden on target1
+	r.RecordFailure(target1, 403)
+
+	statuses := r.Status("test-model")
+	if len(statuses) == 0 {
+		t.Fatal("expected status groups")
+	}
+	foundQuarantined := false
+	for _, k := range statuses[0].Keys {
+		if k.Status == "QUARANTINED" {
+			foundQuarantined = true
+		}
+	}
+	if !foundQuarantined {
+		t.Errorf("expected at least one key to be QUARANTINED after 403 error, keys status: %+v", statuses[0].Keys)
+	}
+}
+
 // --- helpers ---
 
 func (r *Router) groupBySlug(model, slug string) *group {

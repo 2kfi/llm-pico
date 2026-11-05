@@ -226,6 +226,66 @@ func TestModelListingExposesCapabilities(t *testing.T) {
 	}
 }
 
+func TestStatusEndpoint(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := testConfig(upstream, false)
+	svc := proxy.NewService(cfg, providers.NewRegistry(nil), slog.New(slog.DiscardHandler))
+	srv := New(serverOptions(t, svc))
+
+	// Record a failure so the status shows something interesting.
+	target, _ := svc.Router().Resolve("m")
+	svc.Router().RecordFailure(target, 429)
+
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, requestTo("GET", "/v1/status", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var status map[string][]struct {
+		Provider string `json:"provider"`
+		Health   float64 `json:"health"`
+		Keys     []struct {
+			Prefix string `json:"prefix"`
+			Status string `json:"status"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status["m"]) == 0 {
+		t.Fatal("status for model 'm' missing")
+	}
+	group := status["m"][0]
+	if group.Health >= 1.0 {
+		t.Errorf("health = %f, want < 1.0 after failure", group.Health)
+	}
+	if len(group.Keys) == 0 || group.Keys[0].Status != "COOLING_DOWN" {
+		t.Errorf("key status = %v, want COOLING_DOWN", group.Keys)
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	srv := newTestServer(t, false)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["status"] != "ok" {
+		t.Errorf("status = %q, want ok", resp["status"])
+	}
+}
+
 func TestCheckDimsHonoursLaterSlot(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

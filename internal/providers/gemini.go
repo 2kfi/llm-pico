@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -612,7 +613,7 @@ func (a *GeminiAdapter) Complete(ctx context.Context, req Request) (*Response, e
 	model := stripProviderPrefix(req.Model)
 	url := a.withKey(joinURL(a.endpoint(req), "models/"+model+":generateContent"), req.APIKey)
 
-	httpReq, err := a.client.BuildRequest(ctx, "POST", url, strings.NewReader(string(encoded)), a.headers())
+	httpReq, err := a.client.BuildRequest(ctx, "POST", url, bytes.NewReader(encoded), a.headers())
 	if err != nil {
 		return nil, err
 	}
@@ -662,7 +663,7 @@ func (a *GeminiAdapter) Stream(ctx context.Context, req Request) (Stream, error)
 	headers := a.headers()
 	headers["Accept"] = "text/event-stream"
 
-	httpReq, err := a.client.BuildRequest(ctx, "POST", url, strings.NewReader(string(encoded)), headers)
+	httpReq, err := a.client.BuildRequest(ctx, "POST", url, bytes.NewReader(encoded), headers)
 	if err != nil {
 		return nil, err
 	}
@@ -829,7 +830,7 @@ func (a *GeminiAdapter) Embeddings(ctx context.Context, req Request) (*Response,
 	encoded, _ := json.Marshal(payload)
 	url := a.withKey(joinURL(a.endpoint(req), "models/"+model+":batchEmbedContents"), req.APIKey)
 
-	httpReq, err := a.client.BuildRequest(ctx, "POST", url, strings.NewReader(string(encoded)), a.headers())
+	httpReq, err := a.client.BuildRequest(ctx, "POST", url, bytes.NewReader(encoded), a.headers())
 	if err != nil {
 		return nil, err
 	}

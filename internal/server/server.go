@@ -81,6 +81,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /v1/audio/speech", s.handle(proxy.RouteTTS))
 	mux.HandleFunc("GET /v1/models", s.listModels)
 	mux.HandleFunc("GET /v1/models/{id}", s.getModel)
+	mux.HandleFunc("GET /v1/status", s.handleStatus)
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.String()})
@@ -356,6 +357,15 @@ func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, listing)
+}
+
+// handleStatus serves GET /v1/status.
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.resolveIdentity(r); err != nil {
+		err.Write(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, s.proxy.Router().AllStatus())
 }
 
 // Shutdown drains in-flight requests and waits for them to finish.
