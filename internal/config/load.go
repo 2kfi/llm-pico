@@ -38,6 +38,9 @@ func Load(dir string) (*Config, error) {
 		RouterSettings: RouterSettings{
 			NumRetries:   2,
 			CooldownTime: 45,
+			// A stream that stops sending frames for five minutes is stalled,
+			// not slow: agents need to be told rather than hang forever.
+			StreamIdleTimeout: 300,
 			CircuitBreaker: CircuitBreakerSettings{
 				Enabled:          true,
 				FailureThreshold: 3,
@@ -64,10 +67,10 @@ func fileExists(path string) bool {
 // audio or video blocks, while openai-compat forwards the body verbatim and
 // leaves the decision to its upstream.
 var adapterCaps = map[string]providers.Capability{
-	"openai":        {Images: true, Audio: true, Embeddings: true, STT: true, TTS: true},
-	"anthropic":     {Images: true},
-	"gemini":        {Images: true, Audio: true, Video: true, Embeddings: true},
-	"openai-compat": {Images: true, Audio: true, Video: true, Embeddings: true, STT: true, TTS: true},
+	"openai":        {Images: true, Audio: true, Embeddings: true, STT: true, TTS: true, Tools: true, Reasoning: true, Cache: true},
+	"anthropic":     {Images: true, Tools: true, Reasoning: true, Cache: true},
+	"gemini":        {Images: true, Audio: true, Video: true, Embeddings: true, Tools: true, Reasoning: true, Cache: true},
+	"openai-compat": {Images: true, Audio: true, Video: true, Embeddings: true, STT: true, TTS: true, Tools: true, Reasoning: true, Cache: true},
 }
 
 // providerProtocol maps a file adapter name onto the providers.Registry
@@ -216,6 +219,10 @@ type modelDef struct {
 	video    *bool
 	thinking *bool
 	mediaSet bool
+	retries  *int
+	budget   *int
+	maxOut   *int
+	cache    *bool
 	slots    []ModelEntry
 }
 
@@ -344,6 +351,30 @@ func parseModel(entry mapEntry, byName map[string]ProviderSlot) (modelDef, error
 				return md, err
 			}
 			md.thinking = &v
+		case "retries":
+			v, err := nonNegativeInt(node, md.name, "retries")
+			if err != nil {
+				return md, err
+			}
+			md.retries = v
+		case "attempt-budget", "attempt_budget":
+			v, err := positiveInt(node, md.name, "attempt-budget")
+			if err != nil {
+				return md, err
+			}
+			md.budget = v
+		case "max-output", "max_output":
+			v, err := positiveInt(node, md.name, "max-output")
+			if err != nil {
+				return md, err
+			}
+			md.maxOut = v
+		case "cache":
+			v, err := boolValue(node, md.name, "cache")
+			if err != nil {
+				return md, err
+			}
+			md.cache = &v
 		case "upstream":
 			return md, fmt.Errorf("models.yaml:%d: %s: field 'upstream' was renamed to 'model'", f.keyLine, md.name)
 		default:
@@ -423,11 +454,17 @@ func expandSlots(md modelDef, byName map[string]ProviderSlot) (modelDef, error) 
 			Ctx:            md.ctx,
 			CtxOverride:    slot.Ctx,
 			Dims:           md.dims,
+			Retries:        md.retries,
+			AttemptBudget:  md.budget,
+			MaxOutput:      md.maxOut,
 			ModelParams:    ModelParams{Model: md.upstream, APIKeys: slot.Keys, APIBase: slot.BaseURL},
 			Images:         md.kind == KindChat && caps.Images && images,
 			Audio:          md.kind == KindChat && caps.Audio && audio,
 			Video:          md.kind == KindChat && caps.Video && video,
 			Thinking:       md.kind == KindChat && md.thinking != nil && *md.thinking,
+			Tools:          md.kind == KindChat && caps.Tools,
+			Reasoning:      md.kind == KindChat && caps.Reasoning,
+			NoCache:        md.cache != nil && !*md.cache,
 			Embeddings:     md.kind == KindEmbeddings,
 			STT:            md.kind == KindSTT,
 			TTS:            md.kind == KindTTS,
@@ -529,6 +566,19 @@ func positiveInt(node *yaml.Node, model, field string) (*int, error) {
 	}
 	if v <= 0 {
 		return nil, fmt.Errorf("models.yaml:%d: %s: %s must be positive", node.Line, model, field)
+	}
+	return &v, nil
+}
+
+// nonNegativeInt reads a field where zero is meaningful, e.g. retries: 0 for a
+// single attempt per slot.
+func nonNegativeInt(node *yaml.Node, model, field string) (*int, error) {
+	var v int
+	if err := node.Decode(&v); err != nil {
+		return nil, fmt.Errorf("models.yaml:%d: %s: %s must be an integer", node.Line, model, field)
+	}
+	if v < 0 {
+		return nil, fmt.Errorf("models.yaml:%d: %s: %s must not be negative", node.Line, model, field)
 	}
 	return &v, nil
 }

@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/arkan/llm-pico/internal/config"
-	"github.com/arkan/llm-pico/internal/httpx"
 	"github.com/arkan/llm-pico/internal/providers"
 	"github.com/arkan/llm-pico/internal/proxy"
 )
@@ -79,12 +78,35 @@ func requestTo(method, path string, body []byte) *http.Request {
 	return r
 }
 
-// A body over the JSON route limit must be rejected before dispatch.
+// A body over the JSON route limit must be rejected before dispatch with 413,
+// so an agent reads it as "retry with less context" rather than a schema error.
+func TestRequestedMaxTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"max_tokens only", `{"max_tokens":64}`, 64},
+		{"max_completion_tokens only", `{"max_completion_tokens":32}`, 32},
+		{"both, newer wins", `{"max_tokens":64,"max_completion_tokens":32}`, 32},
+		{"neither", `{}`, 0},
+	}
+	for _, tc := range cases {
+		fields, ok := decodeMap([]byte(tc.body))
+		if !ok {
+			t.Fatalf("%s: body did not decode", tc.name)
+		}
+		if got := requestedMaxTokens(fields); got != tc.want {
+			t.Errorf("%s: requestedMaxTokens = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestOversizedBodyRejected(t *testing.T) {
 	w := httptest.NewRecorder()
 	newTestServer(t, false).ServeHTTP(w, plainRequest(bytes.Repeat([]byte("x"), 8<<20)))
-	if w.Code != http.StatusBadRequest || !bytes.Contains(w.Body.Bytes(), []byte(httpx.TypeBadRequest)) {
-		t.Fatalf("status = %d, body = %s, want a 400 rejection", w.Code, w.Body.String())
+	if w.Code != http.StatusRequestEntityTooLarge || !bytes.Contains(w.Body.Bytes(), []byte("request body too large")) {
+		t.Fatalf("status = %d, body = %s, want a 413 size rejection", w.Code, w.Body.String())
 	}
 }
 
@@ -93,8 +115,8 @@ func TestOversizedBodyRejected(t *testing.T) {
 func TestOversizedBodyRejectedWithHMAC(t *testing.T) {
 	w := httptest.NewRecorder()
 	newTestServer(t, true).ServeHTTP(w, signedRequest(bytes.Repeat([]byte("x"), 8<<20)))
-	if w.Code != http.StatusBadRequest || !bytes.Contains(w.Body.Bytes(), []byte(httpx.TypeBadRequest)) {
-		t.Fatalf("status = %d, body = %s, want a 400 rejection", w.Code, w.Body.String())
+	if w.Code != http.StatusRequestEntityTooLarge || !bytes.Contains(w.Body.Bytes(), []byte("request body too large")) {
+		t.Fatalf("status = %d, body = %s, want a 413 size rejection", w.Code, w.Body.String())
 	}
 }
 
@@ -248,7 +270,7 @@ func TestStatusEndpoint(t *testing.T) {
 	}
 
 	var status map[string][]struct {
-		Provider string `json:"provider"`
+		Provider string  `json:"provider"`
 		Health   float64 `json:"health"`
 		Keys     []struct {
 			Prefix string `json:"prefix"`

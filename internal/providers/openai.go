@@ -1,10 +1,10 @@
 package providers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"regexp"
@@ -163,7 +163,7 @@ func (a *OpenAIAdapter) Stream(ctx context.Context, req Request) (Stream, error)
 	headers := map[string]string{"Content-Type": "application/json", "Accept": "text/event-stream"}
 	a.authHeaders(req.APIKey, headers)
 
-	httpReq, err := a.client.BuildRequest(ctx, "POST", a.queryAuth(url, req.APIKey), strings.NewReader(string(body)), headers)
+	httpReq, err := a.client.BuildRequest(ctx, "POST", a.queryAuth(url, req.APIKey), bytes.NewReader(body), headers)
 	if err != nil {
 		return nil, err
 	}
@@ -173,8 +173,8 @@ func (a *OpenAIAdapter) Stream(ctx context.Context, req Request) (Stream, error)
 	}
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
-		payload, _ := io.ReadAll(resp.Body)
-		return nil, &EndpointError{StatusCode: resp.StatusCode, Body: payload, Provider: "openai"}
+		payload, _ := readAllLimited(resp.Body)
+		return nil, endpointError(resp, payload, "openai")
 	}
 	return newSSEStream(resp.Body), nil
 }
@@ -289,7 +289,7 @@ func requiresMaxCompletionTokens(model string) bool {
 func (a *OpenAIAdapter) doJSON(ctx context.Context, req Request, method, url string, body []byte) (*Response, error) {
 	headers := map[string]string{"Content-Type": "application/json"}
 	a.authHeaders(req.APIKey, headers)
-	httpReq, err := a.client.BuildRequest(ctx, method, a.queryAuth(url, req.APIKey), strings.NewReader(string(body)), headers)
+	httpReq, err := a.client.BuildRequest(ctx, method, a.queryAuth(url, req.APIKey), bytes.NewReader(body), headers)
 	if err != nil {
 		return nil, err
 	}
@@ -303,12 +303,12 @@ func (a *OpenAIAdapter) finish(ctx context.Context, httpReq *http.Request, req R
 	}
 	defer resp.Body.Close()
 
-	payload, err := io.ReadAll(resp.Body)
+	payload, err := readAllLimited(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, &EndpointError{StatusCode: resp.StatusCode, Body: payload, Provider: provider}
+		return nil, endpointError(resp, payload, provider)
 	}
 	out := &Response{
 		StatusCode:  resp.StatusCode,
@@ -372,7 +372,9 @@ func stripReasoningBlocks(body []byte) []byte {
 // Probe sends a minimal request with the optional features enabled and infers
 // support from the error text when the provider rejects one.
 func (a *OpenAIAdapter) Probe(ctx context.Context, req Request) (ModelCapability, error) {
-	caps := ModelCapability{SupportsStream: true}
+	// Tools are assumed until a provider rejects them explicitly: a probe
+	// that fails for an unrelated reason must not hide agent support.
+	caps := ModelCapability{SupportsStream: true, SupportsTools: true}
 	body, err := json.Marshal(map[string]any{
 		"model": stripProviderPrefix(req.Model),
 		"messages": []map[string]string{
@@ -397,7 +399,7 @@ func (a *OpenAIAdapter) Probe(ctx context.Context, req Request) (ModelCapability
 		return caps, nil // network errors are not capability signals
 	}
 	defer resp.Body.Close()
-	payload, _ := io.ReadAll(resp.Body)
+	payload, _ := readAllLimited(resp.Body)
 
 	switch resp.StatusCode {
 	case http.StatusOK:

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -430,5 +431,229 @@ func TestRouterCooldownFallsThroughToNextSlot(t *testing.T) {
 	}
 	if got := svc.Router().Status("m"); len(got) < 2 {
 		t.Fatalf("router status lists %d groups, want both slots tracked", len(got))
+	}
+}
+
+// An upstream 429 is the provider's wall, not the caller's: the walk must move
+// to the next slot instead of refusing a request another provider can serve.
+func TestUpstream429FallsOverToNextSlot(t *testing.T) {
+	var mu sync.Mutex
+	var hits []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		hits = append(hits, auth)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(auth, "key-a") {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"quota exhausted"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := chatConfig(upstream, "m", "a", "b")
+	cfg.ModelList[0].Retries = cfgInt(0)
+	svc := newService(t, cfg, nil)
+
+	resp, err := svc.Dispatch(context.Background(), DispatchInput{
+		Model: "m", RouteType: RouteChat, Body: []byte(`{"model":"m"}`),
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if got := resp.Header.Get("X-Pico-Provider"); got != "b" {
+		t.Errorf("X-Pico-Provider = %q, want the slot that served", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hits) != 2 || !strings.Contains(hits[0], "key-a") || !strings.Contains(hits[1], "key-b") {
+		t.Fatalf("hits = %v, want a then b", hits)
+	}
+}
+
+// Upstream pacing metadata must reach the caller, attributed to the provider
+// that produced it.
+func TestUpstreamRateLimitMetadata(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "3")
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"slow down"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := chatConfig(upstream, "m", "a")
+	cfg.ModelList[0].Retries = cfgInt(0)
+	svc := newService(t, cfg, nil)
+
+	_, err := svc.Dispatch(context.Background(), DispatchInput{
+		Model: "m", RouteType: RouteChat, Body: []byte(`{}`),
+	})
+	apiErr := httpx.FromError(err)
+	if apiErr.Status != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", apiErr.Status)
+	}
+	if apiErr.Source != httpx.SourceUpstream {
+		t.Errorf("source = %q, want upstream", apiErr.Source)
+	}
+	if apiErr.RetryAfter != 3 {
+		t.Errorf("RetryAfter = %d, want the upstream's 3", apiErr.RetryAfter)
+	}
+	if got := apiErr.Headers.Get("X-Pico-Provider"); got != "a" {
+		t.Errorf("X-Pico-Provider = %q, want a", got)
+	}
+	if got := apiErr.Headers.Get("X-RateLimit-Remaining"); got != "0" {
+		t.Errorf("X-RateLimit-Remaining = %q, want the upstream value", got)
+	}
+	if got := apiErr.Headers.Get("X-Pico-Attempts"); got != "1" {
+		t.Errorf("X-Pico-Attempts = %q, want 1", got)
+	}
+}
+
+// A per-model retries knob overrides the global one.
+func TestModelRetriesOverrideGlobal(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := chatConfig(upstream, "m", "a")
+	cfg.RouterSettings.NumRetries = 5
+	cfg.RouterSettings.CircuitBreaker.FailureThreshold = 100
+	cfg.ModelList[0].Retries = cfgInt(1) // two tries, not six
+	svc := newService(t, cfg, nil)
+
+	_, err := svc.Dispatch(context.Background(), DispatchInput{
+		Model: "m", RouteType: RouteChat, Body: []byte(`{}`),
+	})
+	if err == nil {
+		t.Fatal("expected the upstream failure to surface")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits != 2 {
+		t.Fatalf("upstream hits = %d, want 2 from retries: 1", hits)
+	}
+}
+
+// Prompt-cache hits bill at a fraction of the input rate, so the token window
+// must charge only the uncached remainder.
+func TestCachedTokensReconciled(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{` +
+			`"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,` +
+			`"prompt_tokens_details":{"cached_tokens":90}}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := chatConfig(upstream, "m", "a")
+	cfg.ModelList[0].TPM = cfgInt(1000)
+	lim := ratelimit.New()
+	defer lim.Stop()
+	svc := newService(t, cfg, lim)
+
+	resp, err := svc.Dispatch(context.Background(), DispatchInput{
+		Model: "m", RouteType: RouteChat, Body: []byte(`{"model":"m"}`),
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	if got := lim.Usage("", "m", "a", ratelimit.LevelModel, ratelimit.TPM); got != 20 {
+		t.Fatalf("TPM usage = %d, want 20 (110 total minus 90 cached)", got)
+	}
+}
+
+// A stalled upstream must fail the stream after the idle deadline instead of
+// hanging the agent forever.
+func TestStreamIdleWatchdogTearsDownStalledStream(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer upstream.Close()
+
+	cfg := chatConfig(upstream, "m", "alpha")
+	cfg.RouterSettings.StreamIdleTimeout = 1 // one second
+	svc := newService(t, cfg, nil)
+
+	resp, err := svc.Dispatch(context.Background(), DispatchInput{
+		Model: "m", RouteType: RouteChat, Body: []byte(`{"model":"m","stream":true}`),
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, resp.Body)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a stalled stream must surface an error")
+		}
+		if !strings.Contains(err.Error(), "stalled") {
+			t.Errorf("error = %v, want it to name the stall", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("stream did not time out; the watchdog never fired")
+	}
+	close(release)
+}
+
+// The estimator must land within a fifth of the real token count on a large
+// tool-loop body, rather than charging the raw JSON byte count.
+func TestEstimateTokensOnToolLoopBody(t *testing.T) {
+	const textLen = 25 * 1024
+	messages := make([]string, 0, 45)
+	for i := 0; i < 45; i++ {
+		content := strings.Repeat("abcde ", textLen/6)
+		messages = append(messages, fmt.Sprintf(
+			`{"role":"tool","tool_call_id":"call_%d","content":%q}`, i, content))
+	}
+	body := []byte(`{"model":"m","messages":[` + strings.Join(messages, ",") + `]}`)
+	if len(body) < 1<<20 {
+		t.Fatalf("fixture is %d bytes, want about 1 MB", len(body))
+	}
+
+	got := EstimateBodyTokens(body)
+	want := int64(45 * textLen / 4)
+	if got < want*8/10 || got > want*12/10 {
+		t.Fatalf("estimate = %d, want within 20%% of %d", got, want)
+	}
+}
+
+// Base64 media is not text: an inline image must not be charged a quarter of
+// a million tokens for its bytes.
+func TestEstimateTokensIgnoresMediaBulk(t *testing.T) {
+	data := strings.Repeat("A", 1<<20)
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":[` +
+		`{"type":"text","text":"describe this"},` +
+		`{"type":"image_url","image_url":{"url":"data:image/png;base64,` + data + `"}}]}]}`)
+
+	got := EstimateBodyTokens(body)
+	if got > 5000 {
+		t.Fatalf("estimate = %d for a 1 MB inline image, want a flat media band", got)
 	}
 }

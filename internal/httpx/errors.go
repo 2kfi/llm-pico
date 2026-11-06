@@ -24,6 +24,15 @@ const (
 	TypeDraining        = "draining"
 )
 
+// Error sources distinguish a limit the caller exhausted from a provider that
+// refused this request. They drive the slot walk: an upstream 429 is the
+// provider's wall and another slot may still have room, while a rejection by
+// this proxy's own limiter is the caller's to wait out.
+const (
+	SourceProxy    = "proxy"
+	SourceUpstream = "upstream"
+)
+
 // Error is the proxy's API error. Every failure the client sees is rendered
 // from this shape, so error bodies are consistent across every endpoint.
 //
@@ -33,6 +42,7 @@ type Error struct {
 	Status     int
 	Type       string
 	Message    string
+	Source     string         // SourceProxy or SourceUpstream; empty is a caller fault
 	RetryAfter int            // seconds, emitted as a Retry-After header when set
 	Extra      map[string]any // additional fields merged into the envelope
 	// Headers are emitted alongside the error, e.g. quota 429s carry the

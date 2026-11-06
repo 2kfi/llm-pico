@@ -403,7 +403,7 @@ func (r *Registry) getJSON(ctx context.Context, url string, headers map[string]s
 	case resp.StatusCode == 402:
 		return nil, fmt.Errorf("providers: %s reports the quota exhausted", provider)
 	case resp.StatusCode >= 400:
-		return nil, &EndpointError{StatusCode: resp.StatusCode, Body: body, Provider: provider}
+		return nil, endpointError(resp, body, provider)
 	}
 	return body, nil
 }

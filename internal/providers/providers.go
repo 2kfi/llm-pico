@@ -16,7 +16,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // Capability describes what a provider supports, so the proxy can reject an
@@ -28,6 +31,9 @@ type Capability struct {
 	Embeddings bool
 	STT        bool
 	TTS        bool
+	Tools      bool // tool calls round-trip in both directions
+	Reasoning  bool // reasoning effort / thinking budgets are translated
+	Cache      bool // prompt caching is available
 }
 
 // Request carries everything an adapter needs to make one upstream call.
@@ -42,6 +48,11 @@ type Request struct {
 	BaseURL string
 	// Stream requests a streamed response.
 	Stream bool
+	// MaxOutput is the per-model completion cap an adapter applies when the
+	// caller sets none.
+	MaxOutput int
+	// NoCache disables an adapter's default prompt-cache injection.
+	NoCache bool
 }
 
 // Response is a non-streaming upstream reply.
@@ -77,6 +88,11 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// CachedTokens is the part of PromptTokens the provider served from its
+	// prompt cache (OpenAI cached_tokens, Anthropic cache_read_input_tokens,
+	// Gemini cachedContentTokenCount). Those tokens bill at a fraction of the
+	// input rate, so accounting charges them separately.
+	CachedTokens int `json:"cached_tokens,omitempty"`
 }
 
 // Adapter is one upstream protocol implementation.
@@ -137,6 +153,50 @@ type EndpointError struct {
 	StatusCode int
 	Body       []byte
 	Provider   string
+	// Header is the upstream response header, kept so the proxy can forward
+	// rate-limit pacing information to the caller.
+	Header http.Header
+	// RetryAfter is the upstream's requested delay, parsed from Retry-After.
+	RetryAfter time.Duration
+}
+
+// endpointError builds an EndpointError carrying the response metadata the
+// dispatch loop needs to pace retries and attribute the failure.
+func endpointError(resp *http.Response, body []byte, provider string) *EndpointError {
+	return &EndpointError{
+		StatusCode: resp.StatusCode,
+		Body:       body,
+		Provider:   provider,
+		Header:     resp.Header.Clone(),
+		RetryAfter: retryAfterFrom(resp.Header),
+	}
+}
+
+// retryAfterFrom parses the forms providers use for pacing hints.
+func retryAfterFrom(h http.Header) time.Duration {
+	if h == nil {
+		return 0
+	}
+	value := strings.TrimSpace(h.Get("Retry-After"))
+	if value == "" {
+		value = strings.TrimSpace(h.Get("retry-after-ms"))
+		if value != "" {
+			if ms, err := strconv.Atoi(value); err == nil && ms > 0 {
+				return time.Duration(ms) * time.Millisecond
+			}
+			return 0
+		}
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if d := time.Until(when); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func (e *EndpointError) Error() string {
@@ -356,11 +416,31 @@ type sseStream struct {
 	done    bool
 }
 
+// DefaultMaxSSELineBytes bounds one SSE line. Tool calls and long completion
+// deltas routinely exceed bufio's 64 KiB default; a single oversized tool
+// result used to kill the stream at 4 MiB.
+const DefaultMaxSSELineBytes = 16 << 20
+
+var maxSSELineBytes = func() *atomic.Int64 {
+	v := &atomic.Int64{}
+	v.Store(DefaultMaxSSELineBytes)
+	return v
+}()
+
+// SetMaxSSELineBytes overrides the per-line cap for every stream created
+// afterwards. It exists so an operator or an embedder can widen the bound for
+// unusually large tool payloads.
+func SetMaxSSELineBytes(n int) {
+	if n > 0 {
+		maxSSELineBytes.Store(int64(n))
+	}
+}
+
 func newSSEStream(body io.ReadCloser) *sseStream {
 	sc := bufio.NewScanner(body)
 	// SSE frames can exceed bufio's default 64KiB cap when a tool call or a
 	// long completion delta arrives.
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	sc.Buffer(make([]byte, 0, 64*1024), int(maxSSELineBytes.Load()))
 	return &sseStream{scanner: sc, body: body}
 }
 
@@ -425,13 +505,31 @@ func extractUsage(payload []byte) *Usage {
 	if !containsSubstring(payload, "usage") {
 		return nil
 	}
+	// OpenAI reports cache hits both at the top level of usage and inside
+	// prompt_tokens_details, depending on the model family, so both are read.
 	var envelope struct {
-		Usage *Usage `json:"usage"`
+		Usage *struct {
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			TotalTokens         int `json:"total_tokens"`
+			CachedTokens        int `json:"cached_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(payload, &envelope); err != nil || envelope.Usage == nil {
 		return nil
 	}
-	u := *envelope.Usage
+	u := Usage{
+		PromptTokens:     envelope.Usage.PromptTokens,
+		CompletionTokens: envelope.Usage.CompletionTokens,
+		TotalTokens:      envelope.Usage.TotalTokens,
+		CachedTokens:     envelope.Usage.CachedTokens,
+	}
+	if envelope.Usage.PromptTokensDetails != nil && envelope.Usage.PromptTokensDetails.CachedTokens > u.CachedTokens {
+		u.CachedTokens = envelope.Usage.PromptTokensDetails.CachedTokens
+	}
 	if u.TotalTokens == 0 {
 		u.TotalTokens = u.PromptTokens + u.CompletionTokens
 	}

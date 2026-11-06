@@ -23,12 +23,36 @@ const (
 // Either rate may be unset, in which case only the other contributes; if both
 // are unset the model has no configured pricing and cost is unknown.
 func Cost(promptTokens, completionTokens int, costPer1MIn, costPer1MOut *float64) *float64 {
-	if costPer1MIn == nil && costPer1MOut == nil {
+	return CostCached(promptTokens, 0, completionTokens, costPer1MIn, costPer1MOut, nil)
+}
+
+// CostCached computes cost when part of the prompt was served from the
+// provider's prompt cache, which bills at a fraction of the input rate. A nil
+// cached rate falls back to the ordinary input rate for cached tokens, so a
+// model with no cache pricing is not under-billed.
+func CostCached(promptTokens, cachedTokens, completionTokens int, costPer1MIn, costPer1MOut, costPer1MCached *float64) *float64 {
+	if costPer1MIn == nil && costPer1MOut == nil && costPer1MCached == nil {
 		return nil
 	}
+	if cachedTokens < 0 {
+		cachedTokens = 0
+	}
+	if cachedTokens > promptTokens {
+		cachedTokens = promptTokens
+	}
+	uncached := promptTokens - cachedTokens
 	var total float64
 	if costPer1MIn != nil {
-		total += float64(promptTokens) / 1_000_000 * *costPer1MIn
+		total += float64(uncached) / 1_000_000 * *costPer1MIn
+	}
+	if cachedTokens > 0 {
+		rate := costPer1MIn
+		if costPer1MCached != nil {
+			rate = costPer1MCached
+		}
+		if rate != nil {
+			total += float64(cachedTokens) / 1_000_000 * *rate
+		}
 	}
 	if costPer1MOut != nil {
 		total += float64(completionTokens) / 1_000_000 * *costPer1MOut

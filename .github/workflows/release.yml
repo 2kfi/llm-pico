@@ -5,68 +5,74 @@ on:
     tags:
       - 'v*.*.*'
 
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: true
       matrix:
-        goos: [linux, darwin, windows]
-        goarch: [amd64, arm64]
-        exclude:
-          - goos: darwin
-            goarch: arm64
-          - goos: windows
-            goarch: arm64
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
-          
+          go-version-file: go.mod
+          cache: true
+
       - name: Build
-        id: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
         run: |
-          VERSION=$(git describe --tags --always --dirty)
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags="-s -w -X github.com/arkan/llm-pico/internal/version.pkgVersion=${VERSION}" -o llm-pico-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/llm-pico
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            mv llm-pico-${{ matrix.goos }}-${{ matrix.goarch }} llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}.exe
-          fi
-          
+          set -eu
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          out="llm-pico-${GOOS}-${GOARCH}${ext}"
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/arkan/llm-pico/internal/version.pkgVersion=${VERSION}" \
+            -o "$out" ./cmd/llm-pico
+          sha256sum "$out" > "$out.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}
-            llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}.exe
-            
+          path: llm-pico-${{ matrix.goos }}-${{ matrix.goarch }}*
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-      
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-      
-      - name: Create release
-        id: create_release
+          merge-multiple: true
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref }}
-          name: Release ${{ github.ref }}
+          # github.ref is refs/tags/vX.Y.Z; the action needs the bare tag.
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           generate_release_notes: true
-      
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref }}
-          files: artifacts/**/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: artifacts/*
+          fail_on_unmatched_files: true

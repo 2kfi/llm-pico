@@ -3,6 +3,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,18 +74,31 @@ type Service struct {
 
 	// queue bounds concurrent requests in fallback_only mode.
 	sem chan struct{}
+
+	// probes caches the capability probes run at boot so the model listing can
+	// advertise agent-readiness honestly instead of guessing.
+	probes capabilityProbes
+}
+
+// capabilityProbes holds the last successful probe per model. It is a named
+// type because the Service's own `providers` field shadows the package name
+// for later field declarations inside the struct.
+type capabilityProbes struct {
+	mu   sync.Mutex
+	caps map[string]providers.ModelCapability
 }
 
 // NewService builds a Service from a configuration snapshot.
-func NewService(cfg *config.Config, providers *providers.Registry, logger *slog.Logger) *Service {
+func NewService(cfg *config.Config, reg *providers.Registry, logger *slog.Logger) *Service {
 	s := &Service{
 		Latency: observability.NewLatencyTracker(1000),
 		Log:     logger,
 		sem:     make(chan struct{}, 512),
+		probes:  capabilityProbes{caps: map[string]providers.ModelCapability{}},
 	}
 	s.config.Store(cfg)
 	s.routes.Store(router.New(cfg))
-	s.providers.Store(providers)
+	s.providers.Store(reg)
 	s.mode.Store(DegradationNormal)
 	return s
 }
@@ -205,7 +220,19 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 		return nil, contextTooLongError(allSlots, in)
 	}
 
-	ac := attemptCtx{tracer: tracer, cfg: cfg, router: r, semOwned: admittedFallback}
+	// An attempt budget is the most specific bound any slot declares: a
+	// bursty agent request must not spend the whole walk's worth of retries.
+	budget := 0
+	for _, slot := range allSlots {
+		if slot.AttemptBudget == nil || *slot.AttemptBudget <= 0 {
+			continue
+		}
+		if budget == 0 || *slot.AttemptBudget < budget {
+			budget = *slot.AttemptBudget
+		}
+	}
+
+	ac := &attemptCtx{tracer: tracer, cfg: cfg, router: r, semOwned: admittedFallback, budget: budget}
 
 	var (
 		lastErr error
@@ -213,10 +240,17 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 	)
 	for i, slot := range slots {
 		tried = append(tried, slot.Provider)
+		if ac.budget > 0 && ac.attempts >= ac.budget {
+			break
+		}
 		resp, err := s.attemptSlot(ctx, ac, in, model, slot)
 		if err == nil {
-			if i > 0 && resp != nil {
-				httpx.ApplyHeader(resp.Header, httpx.ChainHeaders(slot.Provider, tried, i))
+			if resp != nil {
+				if i > 0 {
+					httpx.ApplyHeader(resp.Header, httpx.ChainHeaders(slot.Provider, tried, i))
+				}
+				resp.Header.Set("X-Pico-Provider", slot.Provider)
+				resp.Header.Set("X-Pico-Attempts", strconv.Itoa(ac.attempts))
 			}
 			return resp, nil
 		}
@@ -238,6 +272,14 @@ func (s *Service) Dispatch(ctx context.Context, in DispatchInput) (*http.Respons
 
 	if lastErr == nil {
 		lastErr = httpx.Upstream(http.StatusBadGateway, "all upstream providers failed")
+	}
+	// Attribute the final failure to the walk, not just the last attempt.
+	var apiErr *httpx.Error
+	if errors.As(lastErr, &apiErr) {
+		if apiErr.Headers == nil {
+			apiErr.Headers = http.Header{}
+		}
+		apiErr.Headers.Set("X-Pico-Attempts", strconv.Itoa(ac.attempts))
 	}
 	return nil, httpx.FromError(lastErr)
 }
@@ -355,10 +397,11 @@ func contextTooLongError(slots []config.ModelEntry, in DispatchInput) error {
 	}
 }
 
-// estimateTokens is the preflight body-size approximation used for context and
-// token-window accounting: four bytes per token plus completion budget.
+// estimateTokens is the preflight approximation used for context and
+// token-window accounting: a JSON-aware prompt estimate plus the completion
+// budget.
 func estimateTokens(in DispatchInput) int64 {
-	total := int64(len(in.Body)/4) + int64(in.MaxTokens)
+	total := EstimateBodyTokens(in.Body) + int64(in.MaxTokens)
 	if total <= 0 {
 		return 1
 	}
@@ -373,6 +416,10 @@ type attemptCtx struct {
 	// semOwned records that this request holds a fallback_only semaphore
 	// slot, which release must hand back.
 	semOwned bool
+	// budget bounds the request's total upstream attempts; zero is unbounded.
+	budget int
+	// attempts counts what the walk actually sent upstream.
+	attempts int
 }
 
 // admit applies the current degradation mode before any work is done. It
@@ -433,8 +480,13 @@ func keyHash(in DispatchInput) string {
 
 // attemptSlot makes the configured number of tries against one provider slot
 // of the model.
-func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInput, modelName string, slot config.ModelEntry) (*http.Response, error) {
+func (s *Service) attemptSlot(ctx context.Context, ac *attemptCtx, in DispatchInput, modelName string, slot config.ModelEntry) (*http.Response, error) {
+	// A per-model retries knob beats the global one, so bursty agent traffic
+	// can be tuned per provider without changing every model.
 	maxTries := max(1, ac.cfg.RouterSettings.NumRetries+1)
+	if slot.Retries != nil {
+		maxTries = max(1, *slot.Retries+1)
+	}
 	var (
 		res       *reservation
 		lastErr   error
@@ -442,22 +494,23 @@ func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInp
 	)
 
 	for try := 0; try < maxTries; try++ {
+		if ac.budget > 0 && ac.attempts >= ac.budget {
+			break
+		}
 		target, err := ac.router.ResolveSlot(modelName, slot.Provider)
 		if err != nil {
+			// A slot whose keys are cooling down, or a model in cooldown, is
+			// that slot's own quota latitude, not a caller fault: wrap it as a
+			// quota error so Dispatch keeps walking the remaining slots.
+			retryAfter := 1
 			var cooldown *router.CooldownError
 			if errors.As(err, &cooldown) {
-				// A router cooldown is the slot's own quota latitude, not a
-				// caller fault: wrap it as a quota error so Dispatch keeps
-				// walking the remaining fallback slots.
-				return nil, &quotaError{err: httpx.RateLimited(
-					fmt.Sprintf("all keys for provider '%s' are rate-limited", slot.Provider),
-					int(cooldown.RetryAfter.Seconds())+1,
-				)}
+				retryAfter = int(cooldown.RetryAfter.Seconds()) + 1
 			}
-			if lastErr != nil {
-				return nil, lastErr
-			}
-			return nil, httpx.NotFound(fmt.Sprintf("model '%s' not available", modelName))
+			return nil, &quotaError{err: httpx.RateLimited(
+				fmt.Sprintf("model '%s' has no capacity on provider '%s'", modelName, slot.Provider),
+				retryAfter,
+			)}
 		}
 
 		if !tracedOne {
@@ -476,6 +529,7 @@ func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInp
 		}
 
 		adapter := s.Registry().AdapterFor(target.ProviderSlug, target.APIBase)
+		ac.attempts++
 		resp, _, err := s.call(ctx, ac, in, target, adapter, res)
 
 		if err == nil {
@@ -505,12 +559,52 @@ func (s *Service) attemptSlot(ctx context.Context, ac attemptCtx, in DispatchInp
 		ac.tracer.Add("error:"+modelName, modelName, target.ProviderSlug, "fail",
 			fmt.Sprint(status), time.Time{})
 		lastErr = err
+
+		// Back off between tries on this slot instead of hammering a
+		// provider that just said 429 or 5xx.
+		if try < maxTries-1 && retryableUpstream(err) {
+			if !sleepCtx(ctx, retryBackoff(try)) {
+				break
+			}
+		}
 	}
 
 	// Every attempt failed: release the reservation so the caller is not
 	// charged for work that never happened.
 	s.refund(res)
+	if lastErr == nil {
+		lastErr = &quotaError{err: httpx.RateLimited(
+			fmt.Sprintf("model '%s' exhausted its attempt budget", modelName), 1)}
+	}
 	return nil, lastErr
+}
+
+// retryableUpstream reports whether another try against the same slot could
+// plausibly succeed.
+func retryableUpstream(err error) bool {
+	status := statusOf(err)
+	return status == http.StatusTooManyRequests || status >= 500
+}
+
+// retryBackoff grows from 100ms to a 2s cap.
+func retryBackoff(try int) time.Duration {
+	d := 100 * time.Millisecond << min(try, 5)
+	if d > 2*time.Second {
+		d = 2 * time.Second
+	}
+	return d
+}
+
+// sleepCtx waits, reporting false when the request was cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // reserve consumes capacity from the slot's and the model's limit sets. On
@@ -589,8 +683,12 @@ func (s *Service) refund(res *reservation) {
 
 // callUsage is what a completed upstream call cost.
 type callUsage struct {
-	TotalTokens int
-	Latency     time.Duration
+	TotalTokens  int
+	PromptTokens int
+	// CachedTokens is the prompt-cached part of PromptTokens, which the token
+	// windows charge at a fraction of the input rate.
+	CachedTokens int
+	Latency      time.Duration
 }
 
 // finalizeFn settles accounting for one call exactly once. For a buffered
@@ -603,6 +701,13 @@ func finalizeFn(s *Service, res *reservation, u *callUsage, err error) {
 		// exactly what was reserved, which keeps the limiter from drifting
 		// in either direction.
 		total = int(res.tokens)
+	} else if u.CachedTokens > 0 {
+		// Prompt-cache hits bill at a fraction of the input rate, so only the
+		// uncached remainder is charged to TPM/TPD.
+		total -= u.CachedTokens
+		if total < 0 {
+			total = 0
+		}
 	}
 
 	if err == nil {
@@ -616,17 +721,19 @@ func finalizeFn(s *Service, res *reservation, u *callUsage, err error) {
 // calls and from the stream goroutine for streamed calls.
 func (s *Service) call(
 	ctx context.Context,
-	ac attemptCtx,
+	ac *attemptCtx,
 	in DispatchInput,
 	target *router.Target,
 	adapter providers.Adapter,
 	res *reservation,
 ) (*http.Response, func(error), error) {
 	req := providers.Request{
-		Body:    in.Body,
-		Model:   target.Model.ModelParams.Model,
-		APIKey:  target.APIKey,
-		BaseURL: target.APIBase,
+		Body:      in.Body,
+		Model:     target.Model.ModelParams.Model,
+		APIKey:    target.APIKey,
+		BaseURL:   target.APIBase,
+		MaxOutput: intOrZero(target.Model.MaxOutput),
+		NoCache:   target.Model.NoCache,
 	}
 
 	start := time.Now()
@@ -661,7 +768,7 @@ func (s *Service) call(
 	}
 
 	if err != nil {
-		return nil, nil, upstreamError(err, target.ProviderSlug)
+		return nil, nil, upstreamError(err, target.ProviderSlug, ac.attempts)
 	}
 
 	if in.RouteType == RouteChat {
@@ -673,7 +780,7 @@ func (s *Service) call(
 	out := &http.Response{
 		StatusCode:    resp.StatusCode,
 		Header:        resp.Header.Clone(),
-		Body:          io.NopCloser(strings.NewReader(string(resp.Body))),
+		Body:          io.NopCloser(bytes.NewReader(resp.Body)),
 		ContentLength: int64(len(resp.Body)),
 	}
 	finalizeFn(s, res, u, nil)
@@ -684,7 +791,7 @@ func (s *Service) call(
 // when the body is drained.
 func (s *Service) callStreaming(
 	ctx context.Context,
-	ac attemptCtx,
+	ac *attemptCtx,
 	in DispatchInput,
 	target *router.Target,
 	adapter providers.Adapter,
@@ -695,7 +802,7 @@ func (s *Service) callStreaming(
 	req.Stream = true
 	stream, err := adapter.Stream(ctx, req)
 	if err != nil {
-		return nil, nil, upstreamError(err, target.ProviderSlug)
+		return nil, nil, upstreamError(err, target.ProviderSlug, ac.attempts)
 	}
 
 	pr, pw := io.Pipe()
@@ -714,14 +821,56 @@ func (s *Service) callStreaming(
 	// The stream settles and closes after Dispatch has returned, which
 	// BeginDrain's dispatch counter no longer covers; drain therefore
 	// tracks this goroutine separately.
+	// A stalled upstream used to hang an agent forever: the transport only
+	// bounds the wait for response headers, and the server has no write
+	// timeout by design so long streams survive. The watchdog closes the body
+	// once no frame has arrived for the idle deadline.
+	idle := time.Duration(ac.cfg.RouterSettings.StreamIdleTimeout) * time.Second
+
 	s.streamWG.Add(1)
 	go func() {
 		defer s.streamWG.Done()
+
+		watcherDone := make(chan struct{})
+		var lastChunk atomic.Int64
+		var stalled atomic.Bool
+		lastChunk.Store(time.Now().UnixNano())
+		if idle > 0 {
+			interval := idle / 4
+			if interval > time.Second {
+				interval = time.Second
+			}
+			if interval < 50*time.Millisecond {
+				interval = 50 * time.Millisecond
+			}
+			go func() {
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-watcherDone:
+						return
+					case <-ticker.C:
+						if time.Since(time.Unix(0, lastChunk.Load())) > idle {
+							stalled.Store(true)
+							_ = stream.Close()
+							return
+						}
+					}
+				}
+			}()
+		}
+		defer close(watcherDone)
+
 		var last *providers.Usage
 		for {
+			lastChunk.Store(time.Now().UnixNano())
 			chunk, err := stream.Next()
 			if err != nil {
 				if err != io.EOF {
+					if stalled.Load() {
+						err = fmt.Errorf("upstream %s stream stalled for %s: %w", target.ProviderSlug, idle, err)
+					}
 					_ = pw.CloseWithError(err)
 					streamFinalize(err)
 					return
@@ -757,6 +906,8 @@ func (s *Service) callStreaming(
 
 		if last != nil {
 			info.TotalTokens = last.TotalTokens
+			info.PromptTokens = last.PromptTokens
+			info.CachedTokens = last.CachedTokens
 		}
 		info.Latency = time.Since(start)
 		s.Latency.Record(target.Model.ModelName, target.ProviderSlug, int(info.Latency.Milliseconds()))
@@ -779,9 +930,13 @@ func (s *Service) callStreaming(
 func bufferedUsage(body []byte) *callUsage {
 	var payload struct {
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			TotalTokens         int `json:"total_tokens"`
+			CachedTokens        int `json:"cached_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -791,12 +946,21 @@ func bufferedUsage(body []byte) *callUsage {
 	if total == 0 {
 		total = payload.Usage.PromptTokens + payload.Usage.CompletionTokens
 	}
-	return &callUsage{TotalTokens: total}
+	cached := payload.Usage.CachedTokens
+	if details := payload.Usage.PromptTokensDetails; details != nil && details.CachedTokens > cached {
+		cached = details.CachedTokens
+	}
+	return &callUsage{
+		TotalTokens:  total,
+		PromptTokens: payload.Usage.PromptTokens,
+		CachedTokens: cached,
+	}
 }
 
 // upstreamError converts a provider failure into an API error, passing the
-// upstream status and body through so clients see what the provider said.
-func upstreamError(err error, slug string) error {
+// upstream status, body and rate-limit pacing headers through so clients see
+// what the provider said and can pace themselves.
+func upstreamError(err error, slug string, attempts int) error {
 	var endpoint *providers.EndpointError
 	if errors.As(err, &endpoint) {
 		msg := string(endpoint.Body)
@@ -807,16 +971,64 @@ func upstreamError(err error, slug string) error {
 		if status < 400 {
 			status = http.StatusBadGateway
 		}
-		return &httpx.Error{
+		// Report the configured provider slot: the adapter's own name is the
+		// protocol family, which is not what an operator or agent route by.
+		provider := slug
+		if provider == "" {
+			provider = endpoint.Provider
+		}
+		apiErr := &httpx.Error{
 			Status:  status,
 			Type:    usage.Classify(status, msg),
 			Message: truncate(msg, 2000),
+			// An upstream limit is the provider's wall, not the caller's:
+			// the slot walk keeps going on it.
+			Source:  httpx.SourceUpstream,
+			Headers: http.Header{},
 		}
+		apiErr.Headers.Set("X-Pico-Provider", provider)
+		if attempts > 0 {
+			apiErr.Headers.Set("X-Pico-Attempts", strconv.Itoa(attempts))
+		}
+		if secs := int(endpoint.RetryAfter / time.Second); secs > 0 {
+			apiErr.RetryAfter = secs
+		}
+		pacingHeaders(apiErr.Headers, endpoint.Header)
+		if apiErr.RetryAfter == 0 {
+			if secs, convErr := strconv.Atoi(apiErr.Headers.Get("Retry-After")); convErr == nil && secs > 0 {
+				apiErr.RetryAfter = secs
+			}
+		}
+		return apiErr
 	}
+
 	if errors.Is(err, context.DeadlineExceeded) {
-		return httpx.UpstreamTimeout(fmt.Sprintf("upstream %s timed out", slug))
+		apiErr := httpx.UpstreamTimeout(fmt.Sprintf("upstream %s timed out", slug))
+		apiErr.Source = httpx.SourceUpstream
+		apiErr.Headers = http.Header{"X-Pico-Provider": {slug}}
+		return apiErr
 	}
-	return httpx.Upstream(http.StatusBadGateway, fmt.Sprintf("upstream %s request failed: %v", slug, err))
+
+	apiErr := httpx.Upstream(http.StatusBadGateway, fmt.Sprintf("upstream %s request failed: %v", slug, err))
+	apiErr.Source = httpx.SourceUpstream
+	apiErr.Headers = http.Header{"X-Pico-Provider": {slug}}
+	if attempts > 0 {
+		apiErr.Headers.Set("X-Pico-Attempts", strconv.Itoa(attempts))
+	}
+	return apiErr
+}
+
+// pacingHeaders copies the upstream's retry and rate-limit headers onto the
+// error response, so an agent can back off on the provider's own schedule.
+func pacingHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		name := strings.ToLower(k)
+		if name != "retry-after" && !strings.HasPrefix(name, "x-ratelimit-") &&
+			!strings.HasPrefix(name, "anthropic-ratelimit-") {
+			continue
+		}
+		dst[http.CanonicalHeaderKey(k)] = append([]string(nil), vs...)
+	}
 }
 
 // isTerminal reports whether an error is the caller's to fix, in which case
@@ -842,7 +1054,12 @@ func isClientRejection(err error) bool {
 	if !errors.As(err, &apiErr) {
 		return false
 	}
-	return apiErr.Type == httpx.TypeRateLimited
+	if apiErr.Type != httpx.TypeRateLimited {
+		return false
+	}
+	// An upstream 429 is the provider's own wall: another slot may still have
+	// capacity, so the walk must continue rather than refuse the caller.
+	return apiErr.Source != httpx.SourceUpstream
 }
 
 func statusOf(err error) int {
@@ -873,6 +1090,36 @@ func intPtr(v *int) *int64 {
 	}
 	n := int64(*v)
 	return &n
+}
+
+// intOrZero dereferences an optional integer knob.
+func intOrZero(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+// RecordCapability stores a model's probed capabilities so the model listing
+// can advertise agent-readiness from a live probe rather than a guess.
+func (s *Service) RecordCapability(model string, caps providers.ModelCapability) {
+	if model == "" {
+		return
+	}
+	s.probes.mu.Lock()
+	defer s.probes.mu.Unlock()
+	if s.probes.caps == nil {
+		s.probes.caps = map[string]providers.ModelCapability{}
+	}
+	s.probes.caps[model] = caps
+}
+
+// Capability returns the last recorded probe for a model, if any.
+func (s *Service) Capability(model string) (providers.ModelCapability, bool) {
+	s.probes.mu.Lock()
+	defer s.probes.mu.Unlock()
+	caps, ok := s.probes.caps[model]
+	return caps, ok
 }
 
 func truncate(s string, n int) string {

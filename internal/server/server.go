@@ -10,9 +10,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/arkan/llm-pico/internal/auth"
+	"github.com/arkan/llm-pico/internal/config"
 	"github.com/arkan/llm-pico/internal/httpx"
 	"github.com/arkan/llm-pico/internal/proxy"
 	"github.com/arkan/llm-pico/internal/ratelimit"
@@ -38,6 +40,18 @@ type Server struct {
 	limiter *ratelimit.Limiter
 	mux     *http.ServeMux
 	opts    Options
+
+	// keySet caches the hashed proxy keys of one configuration snapshot, so
+	// authenticating a request is a map lookup rather than a full scan.
+	keySet atomic.Pointer[proxyKeySet]
+}
+
+// proxyKeySet is the hashed key set of one configuration snapshot. The config
+// pointer is the cache key: a reload stores a new pointer and the set is
+// rebuilt on the next request.
+type proxyKeySet struct {
+	cfg  *config.Config
+	keys map[string]struct{}
 }
 
 // New builds a Server with all routes registered.
@@ -115,7 +129,13 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 		if err != nil {
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
-				httpx.BadRequest("request body too large").Write(w)
+				// 413, not 400: an agent must read a size rejection as
+				// "retry with less context", not as a schema error.
+				(&httpx.Error{
+					Status:  http.StatusRequestEntityTooLarge,
+					Type:    httpx.TypeBadRequest,
+					Message: "request body too large",
+				}).Write(w)
 				return
 			}
 			httpx.BadRequest("could not read request body").Write(w)
@@ -133,45 +153,47 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 			RouteType: route,
 		}
 
+		// One decode serves every peek below. The old path validated the body
+		// and then unmarshalled it again for each field, which is real memory
+		// on a large agent payload.
+		var fields map[string]any
+		if route != proxy.RouteSTT {
+			decoded, ok := decodeMap(body)
+			if !ok {
+				httpx.BadRequest("invalid JSON body").Write(w)
+				return
+			}
+			fields = decoded
+		}
+
 		switch route {
 		case proxy.RouteSTT:
 			// The multipart parser needs a live reader; the body has
 			// already been bounded and read above.
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			audio, fields, apiErr := s.parseAudio(r)
+			audio, formFields, apiErr := s.parseAudio(r)
 			if apiErr != nil {
 				apiErr.Write(w)
 				return
 			}
 			input.Audio = audio
-			input.Model = fields["model"]
+			input.Model = formFields["model"]
 			// ~32 kB of compressed audio per second is the usual bitrate
 			// band; the estimate only feeds the audio-seconds limits.
 			input.AudioSeconds = max(1, len(audio.Data)/32000)
 			input.MaxTokens = 0
 		case proxy.RouteTTS:
-			if !json.Valid(body) {
-				httpx.BadRequest("invalid JSON body").Write(w)
-				return
-			}
-			input.Model = peekString(body, "model")
-			input.Chars = len(peekString(body, "input"))
+			input.Model = stringField(fields, "model")
+			input.Chars = len(stringField(fields, "input"))
 			// Spoken cadence is roughly fifteen characters per second.
 			input.AudioSeconds = (input.Chars + 14) / 15
 			input.MaxTokens = 0
 		default:
-			// A body that is not a JSON object cannot be dispatched, and
-			// reporting that plainly beats reporting a missing model field,
-			// which is what peeking would otherwise produce.
-			if !json.Valid(body) {
-				httpx.BadRequest("invalid JSON body").Write(w)
-				return
-			}
-			input.Model = peekString(body, "model")
+			input.Model = stringField(fields, "model")
 			// A request that does not set max_tokens gets the provider's own
 			// default; reserving 4096 tokens against the rate limiter would
 			// over-charge callers for budget they did not ask for.
-			input.MaxTokens = peekInt(body, "max_tokens", 0)
+			input.MaxTokens = requestedMaxTokens(fields)
 		}
 
 		if input.Model == "" {
@@ -186,7 +208,7 @@ func (s *Server) handle(route proxy.RouteType) http.HandlerFunc {
 		}
 
 		if route == proxy.RouteEmbeddings {
-			if apiErr := s.checkDims(body, input.Model); apiErr != nil {
+			if apiErr := s.checkDims(fields, input.Model); apiErr != nil {
 				apiErr.Write(w)
 				return
 			}
@@ -248,14 +270,7 @@ func (s *Server) resolveIdentity(r *http.Request) (*auth.Identity, *httpx.Error)
 	// Each request builds the hash set; the key list is small and reload
 	// replaces cfg wholesale, so there is nothing to invalidate.
 	hash := auth.HashKey(raw)
-	known := false
-	for _, k := range cfg.ProxyKeys {
-		if auth.HashKey(k) == hash {
-			known = true
-			break
-		}
-	}
-	if !known {
+	if _, known := s.proxyKeySet(cfg)[hash]; !known {
 		return nil, httpx.Unauthorized("invalid API key")
 	}
 
@@ -265,6 +280,20 @@ func (s *Server) resolveIdentity(r *http.Request) (*auth.Identity, *httpx.Error)
 		KeyPrefix: auth.PrefixFromKey(raw),
 	}
 	return identity, nil
+}
+
+// proxyKeySet returns the hashed key set for cfg, rebuilding it when the
+// configuration snapshot has been swapped by a reload.
+func (s *Server) proxyKeySet(cfg *config.Config) map[string]struct{} {
+	if cached := s.keySet.Load(); cached != nil && cached.cfg == cfg {
+		return cached.keys
+	}
+	keys := make(map[string]struct{}, len(cfg.ProxyKeys))
+	for _, k := range cfg.ProxyKeys {
+		keys[auth.HashKey(k)] = struct{}{}
+	}
+	s.keySet.Store(&proxyKeySet{cfg: cfg, keys: keys})
+	return keys
 }
 
 // verifyHMAC enforces optional HMAC request signing over the caller's body,
@@ -286,8 +315,8 @@ func (s *Server) verifyHMAC(r *http.Request, body []byte) *httpx.Error {
 
 // checkDims validates an embeddings request's "dimensions" against the
 // model's configured ceiling. The parameter still passes upstream untouched.
-func (s *Server) checkDims(body []byte, canonical string) *httpx.Error {
-	req := peekInt(body, "dimensions", 0)
+func (s *Server) checkDims(fields map[string]any, canonical string) *httpx.Error {
+	req := intField(fields, "dimensions", 0)
 	if req == 0 {
 		return nil
 	}
@@ -321,18 +350,28 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // modelInfos aggregates the per-slot capability flags for each listed model.
-// Capabilities are unioned across slots: a model that accepts images on any
-// slot advertises it, while dispatch still gates every slot on its own flags.
+//
+// Media capabilities are unioned across slots: a model that accepts images on
+// any slot advertises it, while dispatch still gates every slot on its own
+// flags. Agent-readiness is an intersection instead: advertising tool support
+// for a model whose next slot cannot run a tool call would be a lie.
 func (s *Server) modelInfos(names []string) []httpx.ModelInfo {
 	cfg := s.proxy.Config()
 	infos := make([]httpx.ModelInfo, 0, len(names))
 	for _, name := range names {
-		info := httpx.ModelInfo{ID: name}
-		for _, entry := range cfg.Slots(name) {
+		slots := cfg.Slots(name)
+		info := httpx.ModelInfo{ID: name, Tools: len(slots) > 0, Reasoning: len(slots) > 0}
+		for _, entry := range slots {
 			info.Images = info.Images || entry.Images
 			info.Audio = info.Audio || entry.Audio
 			info.Video = info.Video || entry.Video
 			info.Thinking = info.Thinking || entry.Thinking
+			info.Tools = info.Tools && entry.Tools
+			info.Reasoning = info.Reasoning && entry.Reasoning
+		}
+		// A live probe that reports no tool support is the last word.
+		if caps, ok := s.proxy.Capability(name); ok && !caps.SupportsTools {
+			info.Tools = false
 		}
 		infos = append(infos, info)
 	}
@@ -409,23 +448,25 @@ func copyBody(w http.ResponseWriter, resp *http.Response) {
 	}
 }
 
-func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
-
-func peekString(body []byte, field string) string {
-	m, ok := decodeMap(body)
-	if !ok {
-		return ""
-	}
-	s, _ := m[field].(string)
+// stringField reads a string field from an already-decoded body.
+func stringField(fields map[string]any, name string) string {
+	s, _ := fields[name].(string)
 	return s
 }
 
-func peekInt(body []byte, field string, def int) int {
-	m, ok := decodeMap(body)
-	if !ok {
-		return def
+// requestedMaxTokens reads the completion budget, preferring OpenAI's newer
+// max_completion_tokens so reservation and context checks match what the
+// adapters actually send upstream.
+func requestedMaxTokens(fields map[string]any) int {
+	if n := intField(fields, "max_completion_tokens", 0); n > 0 {
+		return n
 	}
-	switch v := m[field].(type) {
+	return intField(fields, "max_tokens", 0)
+}
+
+// intField reads a positive integer field from an already-decoded body.
+func intField(fields map[string]any, name string, def int) int {
+	switch v := fields[name].(type) {
 	case float64:
 		if v <= 0 {
 			return def
@@ -437,9 +478,11 @@ func peekInt(body []byte, field string, def int) int {
 	return def
 }
 
+// decodeMap decodes a request body once, so every later peek reads the same
+// map instead of re-parsing the payload.
 func decodeMap(body []byte) (map[string]any, bool) {
 	var m map[string]any
-	if err := jsonUnmarshal(body, &m); err != nil {
+	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, false
 	}
 	return m, true

@@ -123,7 +123,14 @@ func run(opts runOptions) error {
 	svc := proxy.NewService(cfg, reg, opts.log)
 	svc.SetLimiter(limiter)
 
-	httpServer := startHTTP(opts, svc)
+	// Drain for as long as a stream may legitimately stay open, rather than
+	// cutting a 30-minute stream off at the fixed 30-second mark.
+	drain := 30 * time.Second
+	if idle := svc.Config().RouterSettings.StreamIdleTimeout; idle > 0 {
+		drain = time.Duration(idle)*time.Second + 30*time.Second
+	}
+
+	httpServer := startHTTP(opts, svc, drain)
 
 	// A misconfigured upstream should not stop serving the healthy ones, so
 	// key and endpoint problems are probed in the background and logged only.
@@ -167,7 +174,7 @@ func run(opts runOptions) error {
 	}
 	signal.Stop(reload)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drain+5*time.Second)
 	defer cancel()
 
 	// Stop accepting new connections, then drain in-flight requests so
@@ -175,7 +182,7 @@ func run(opts runOptions) error {
 	if err := httpServer.Shutdown(ctx); err != nil {
 		opts.log.Warn("graceful shutdown timed out; forcing close", "error", err)
 	}
-	if !svc.BeginDrain(30 * time.Second) {
+	if !svc.BeginDrain(drain) {
 		opts.log.Warn("drain timed out with requests still in flight")
 	}
 	opts.log.Info("shutdown complete")
@@ -183,11 +190,11 @@ func run(opts runOptions) error {
 }
 
 // startHTTP builds the listener and the server without serving yet.
-func startHTTP(opts runOptions, svc *proxy.Service) *http.Server {
+func startHTTP(opts runOptions, svc *proxy.Service, drain time.Duration) *http.Server {
 	srv := server.New(server.Options{
 		Proxy:        svc,
 		Logger:       opts.log,
-		DrainTimeout: 30 * time.Second,
+		DrainTimeout: drain,
 	})
 	return &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", opts.host, opts.port),
@@ -199,6 +206,11 @@ func startHTTP(opts runOptions, svc *proxy.Service) *http.Server {
 		ErrorLog:          nil,
 	}
 }
+
+// minimalProbeBody is the smallest request every adapter can translate, so a
+// capability probe reflects the upstream's answer rather than a body the
+// adapter could not build.
+var minimalProbeBody = []byte(`{"messages":[{"role":"user","content":"hi"}],"max_tokens":1}`)
 
 // probeUpstreams probes each configured slot once at boot and then backs off,
 // logging failures without ever affecting request handling.
@@ -220,7 +232,8 @@ func probeUpstreams(svc *proxy.Service, log *slog.Logger) {
 					key = slot.ModelParams.APIKeys[0]
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_, err := adapter.Probe(ctx, providers.Request{
+				caps, err := adapter.Probe(ctx, providers.Request{
+					Body:    minimalProbeBody,
 					Model:   slot.ModelParams.Model,
 					APIKey:  key,
 					BaseURL: slot.ModelParams.APIBase,
@@ -229,7 +242,10 @@ func probeUpstreams(svc *proxy.Service, log *slog.Logger) {
 				if err != nil {
 					failed++
 					log.Warn("upstream probe failed", "slot", slot.Provider, "model", slot.ModelName, "error", err)
+					continue
 				}
+				// The listing advertises agent-readiness from this live answer.
+				svc.RecordCapability(slot.ModelName, caps)
 			}
 		}
 		if failed == 0 {

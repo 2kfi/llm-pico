@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -84,6 +85,9 @@ type geminiPart struct {
 	InlineData       *inlineMedia          `json:"inlineData,omitempty"`
 	FunctionCall     *geminiFunctionCall   `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResult `json:"functionResponse,omitempty"`
+	// ThoughtSignature is an opaque replay token Gemini 3 requires on
+	// functionCall parts when conversation history contains tool calls.
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 	// Thought marks a reasoning summary; it is not part of the answer and
 	// must not leak into the caller's content.
 	Thought bool `json:"thought,omitempty"`
@@ -98,7 +102,15 @@ type inlineMedia struct {
 type geminiFunctionCall struct {
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args,omitempty"`
+	// Signature is the part-level thoughtSignature, carried alongside the
+	// call for translation. It is never serialised inside functionCall.
+	Signature string `json:"-"`
 }
+
+// skipThoughtSignature is Google's documented sentinel for replaying a
+// functionCall whose original signature is unavailable: Gemini 3 rejects the
+// turn with INVALID_ARGUMENT without one. A captured signature always wins.
+const skipThoughtSignature = "skip_thought_signature_validator"
 
 // geminiFunctionResult is a tool result being handed back to the model; it is
 // keyed by function name rather than by call id.
@@ -199,9 +211,12 @@ type chatMessage struct {
 }
 
 type chatToolCall struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Function struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	// ThoughtSignature lets a signature-aware client echo Gemini's replay
+	// token; clients that drop it get the documented sentinel instead.
+	ThoughtSignature string `json:"thought_signature,omitempty"`
+	Function         struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
@@ -319,10 +334,20 @@ func toGemini(body []byte) (*geminiRequest, error) {
 			role = "model"
 			parts = convertGeminiParts(m.Content)
 			for _, tc := range m.ToolCalls {
-				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{
-					Name: tc.Function.Name,
-					Args: toolArguments(tc.Function.Arguments),
-				}})
+				signature := tc.ThoughtSignature
+				if signature == "" {
+					// Gemini 3 rejects replayed functionCall parts without a
+					// signature; Google documents this sentinel for calls whose
+					// signature was lost in translation.
+					signature = skipThoughtSignature
+				}
+				parts = append(parts, geminiPart{
+					FunctionCall: &geminiFunctionCall{
+						Name: tc.Function.Name,
+						Args: toolArguments(tc.Function.Arguments),
+					},
+					ThoughtSignature: signature,
+				})
 			}
 		case "tool", "function":
 			parts = []geminiPart{{FunctionResponse: &geminiFunctionResult{
@@ -344,6 +369,28 @@ func toGemini(body []byte) (*geminiRequest, error) {
 		out.Contents = append(out.Contents, geminiContent{Role: role, Parts: parts})
 	}
 	return out, nil
+}
+
+// dropUnsupportedZeroThinking removes a thinking config Gemini would reject.
+// Gemini 3 models always think and refuse thinkingBudget 0; only the Gemini 2.5
+// Flash family documents 0 as "disable thinking". Sending 0 elsewhere turns an
+// otherwise valid request into an upstream 400, so the knob is dropped and the
+// model keeps its default budget.
+func dropUnsupportedZeroThinking(payload *geminiRequest, model string) {
+	if payload == nil || payload.GenerationConfig == nil || payload.GenerationConfig.ThinkingConfig == nil {
+		return
+	}
+	budget := payload.GenerationConfig.ThinkingConfig.Budget
+	if budget == nil || *budget != 0 || supportsZeroThinkingBudget(model) {
+		return
+	}
+	payload.GenerationConfig.ThinkingConfig = nil
+}
+
+// supportsZeroThinkingBudget reports the family that accepts a zero budget.
+func supportsZeroThinkingBudget(model string) bool {
+	m := strings.ToLower(stripProviderPrefix(model))
+	return strings.Contains(m, "gemini-2.5") && strings.Contains(m, "flash")
 }
 
 // applyResponseFormat translates OpenAI's response_format into Gemini's JSON
@@ -515,9 +562,11 @@ type geminiResponse struct {
 		FinishReason string        `json:"finishReason"`
 	} `json:"candidates"`
 	UsageMetadata struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
+		PromptTokenCount        int `json:"promptTokenCount"`
+		CandidatesTokenCount    int `json:"candidatesTokenCount"`
+		ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+		TotalTokenCount         int `json:"totalTokenCount"`
+		CachedContentTokenCount int `json:"cachedContentTokenCount"`
 	} `json:"usageMetadata"`
 }
 
@@ -535,6 +584,7 @@ func (g *geminiResponse) toOpenAI(model string) map[string]any {
 			}
 			content.WriteString(p.Text)
 			if p.FunctionCall != nil {
+				p.FunctionCall.Signature = p.ThoughtSignature
 				calls = append(calls, openAIToolCall(p.FunctionCall))
 			}
 		}
@@ -550,9 +600,24 @@ func (g *geminiResponse) toOpenAI(model string) map[string]any {
 	if len(calls) > 0 && reason == "stop" {
 		reason = "tool_calls"
 	}
+	// OpenAI counts reasoning tokens inside completion_tokens, so Gemini's
+	// thinking tokens belong there too; otherwise prompt+completion would not
+	// reconcile with total_tokens.
+	completion := g.UsageMetadata.CandidatesTokenCount + g.UsageMetadata.ThoughtsTokenCount
 	total := g.UsageMetadata.TotalTokenCount
 	if total == 0 {
-		total = g.UsageMetadata.PromptTokenCount + g.UsageMetadata.CandidatesTokenCount
+		total = g.UsageMetadata.PromptTokenCount + completion
+	}
+	usage := map[string]any{
+		"prompt_tokens":     g.UsageMetadata.PromptTokenCount,
+		"completion_tokens": completion,
+		"total_tokens":      total,
+	}
+	if g.UsageMetadata.ThoughtsTokenCount > 0 {
+		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": g.UsageMetadata.ThoughtsTokenCount}
+	}
+	if g.UsageMetadata.CachedContentTokenCount > 0 {
+		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": g.UsageMetadata.CachedContentTokenCount}
 	}
 	return map[string]any{
 		"id":      newID(),
@@ -564,11 +629,7 @@ func (g *geminiResponse) toOpenAI(model string) map[string]any {
 			"message":       message,
 			"finish_reason": reason,
 		}},
-		"usage": map[string]any{
-			"prompt_tokens":     g.UsageMetadata.PromptTokenCount,
-			"completion_tokens": g.UsageMetadata.CandidatesTokenCount,
-			"total_tokens":      total,
-		},
+		"usage": usage,
 	}
 }
 
@@ -579,7 +640,7 @@ func openAIToolCall(call *geminiFunctionCall) map[string]any {
 	if len(call.Args) > 0 {
 		args = string(call.Args)
 	}
-	return map[string]any{
+	out := map[string]any{
 		"id":   "call_" + newID(),
 		"type": "function",
 		"function": map[string]any{
@@ -587,6 +648,10 @@ func openAIToolCall(call *geminiFunctionCall) map[string]any {
 			"arguments": args,
 		},
 	}
+	if call.Signature != "" {
+		out["thought_signature"] = call.Signature
+	}
+	return out
 }
 
 func mapGeminiFinish(reason string) string {
@@ -605,6 +670,7 @@ func (a *GeminiAdapter) Complete(ctx context.Context, req Request) (*Response, e
 	if err != nil {
 		return nil, err
 	}
+	dropUnsupportedZeroThinking(payload, req.Model)
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -623,12 +689,12 @@ func (a *GeminiAdapter) Complete(ctx context.Context, req Request) (*Response, e
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readAllLimited(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, &EndpointError{StatusCode: resp.StatusCode, Body: raw, Provider: "gemini"}
+		return nil, endpointError(resp, raw, "gemini")
 	}
 
 	var decoded geminiResponse
@@ -648,6 +714,7 @@ func (a *GeminiAdapter) Stream(ctx context.Context, req Request) (Stream, error)
 	if err != nil {
 		return nil, err
 	}
+	dropUnsupportedZeroThinking(payload, req.Model)
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -673,8 +740,8 @@ func (a *GeminiAdapter) Stream(ctx context.Context, req Request) (Stream, error)
 	}
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
-		raw, _ := io.ReadAll(resp.Body)
-		return nil, &EndpointError{StatusCode: resp.StatusCode, Body: raw, Provider: "gemini"}
+		raw, _ := readAllLimited(resp.Body)
+		return nil, endpointError(resp, raw, "gemini")
 	}
 	return &geminiStream{inner: newSSEStream(resp.Body), model: model}, nil
 }
@@ -688,6 +755,8 @@ type geminiStream struct {
 	// sawToolCalls upgrades the terminal finish_reason to tool_calls even
 	// when a later chunk carries only the finish reason.
 	sawToolCalls bool
+	// finished reports the synthesized [DONE] so a later Next returns EOF.
+	finished bool
 }
 
 // geminiChunkParts extracts candidate 0's text, finish reason and function
@@ -704,6 +773,7 @@ func geminiChunkParts(decoded geminiResponse) (string, string, []*geminiFunction
 			}
 			text.WriteString(p.Text)
 			if p.FunctionCall != nil {
+				p.FunctionCall.Signature = p.ThoughtSignature
 				calls = append(calls, p.FunctionCall)
 			}
 		}
@@ -760,11 +830,21 @@ func streamChunkPayload(model string, text string, finish string, calls []*gemin
 
 func (s *geminiStream) Next() (*Chunk, error) {
 	for {
+		if s.finished {
+			return nil, io.EOF
+		}
 		chunk, err := s.inner.Next()
 		if err != nil {
+			if err == io.EOF {
+				// Gemini's SSE body simply ends; OpenAI clients (and the
+				// proxy's stream writer) need an explicit [DONE] sentinel.
+				s.finished = true
+				return &Chunk{Done: true}, nil
+			}
 			return nil, err
 		}
 		if chunk.Done {
+			s.finished = true
 			return &Chunk{Done: true}, nil
 		}
 
@@ -776,15 +856,17 @@ func (s *geminiStream) Next() (*Chunk, error) {
 		out := &Chunk{}
 		text, finish, calls := geminiChunkParts(decoded)
 		out.Usage = nil
-		if decoded.UsageMetadata.TotalTokenCount > 0 {
-			total := decoded.UsageMetadata.TotalTokenCount
+		if meta := decoded.UsageMetadata; meta.PromptTokenCount > 0 || meta.CandidatesTokenCount > 0 || meta.ThoughtsTokenCount > 0 || meta.TotalTokenCount > 0 {
+			completion := meta.CandidatesTokenCount + meta.ThoughtsTokenCount
+			total := meta.TotalTokenCount
 			if total == 0 {
-				total = decoded.UsageMetadata.PromptTokenCount + decoded.UsageMetadata.CandidatesTokenCount
+				total = meta.PromptTokenCount + completion
 			}
 			out.Usage = &Usage{
-				PromptTokens:     decoded.UsageMetadata.PromptTokenCount,
-				CompletionTokens: decoded.UsageMetadata.CandidatesTokenCount,
+				PromptTokens:     meta.PromptTokenCount,
+				CompletionTokens: completion,
 				TotalTokens:      total,
+				CachedTokens:     meta.CachedContentTokenCount,
 			}
 		}
 		// Forward every finish reason, including STOP, so clients see a
@@ -816,36 +898,103 @@ func (a *GeminiAdapter) Embeddings(ctx context.Context, req Request) (*Response,
 	// The body's model field is the caller-facing name; routing already
 	// resolved the upstream model, and the body name must never override it.
 
-	input := fields["input"]
-	parts := convertEmbedInput(input)
-	if len(parts) == 0 {
+	inputs := embedInputs(fields["input"])
+	if len(inputs) == 0 {
 		return nil, fmt.Errorf("%w: embeddings require a non-empty input", ErrInvalidRequest)
 	}
 
-	payload := map[string]any{
-		"requests": []map[string]any{
-			{"model": "models/" + model, "content": geminiContent{Parts: parts}},
-		},
+	// Forward outputDimensionality so a requested width is honoured instead of
+	// silently returning the model's default width.
+	dims := 0
+	if raw, ok := fields["dimensions"]; ok {
+		var d int
+		if err := json.Unmarshal(raw, &d); err == nil && d > 0 {
+			dims = d
+		}
 	}
-	encoded, _ := json.Marshal(payload)
+
+	// One requests[] element per input text: indexing a batch of documents is
+	// a single upstream call (chunked to the API's per-call ceiling) rather
+	// than one call per document.
+	var (
+		data      []map[string]any
+		tokens    int
+		nextIndex int
+		header    http.Header
+	)
+	for start := 0; start < len(inputs); start += geminiEmbedBatchLimit {
+		end := min(start+geminiEmbedBatchLimit, len(inputs))
+		batch := inputs[start:end]
+		values, respHeader, err := a.embedBatch(ctx, req, model, batch, dims)
+		if err != nil {
+			return nil, err
+		}
+		header = respHeader
+		for _, v := range values {
+			data = append(data, map[string]any{
+				"object":    "embedding",
+				"index":     nextIndex,
+				"embedding": v,
+			})
+			nextIndex++
+		}
+		// The estimate covers each input once: multiplying it per returned
+		// embedding double-counted the request.
+		for _, parts := range batch {
+			tokens += estimateTokens(parts)
+		}
+	}
+	if header == nil {
+		header = http.Header{}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"object": "list",
+		"data":   data,
+		"model":  model,
+		"usage":  map[string]any{"prompt_tokens": tokens, "total_tokens": tokens},
+	})
+	return &Response{StatusCode: http.StatusOK, Header: header, Body: body, ContentType: "application/json"}, nil
+}
+
+// geminiEmbedBatchLimit is Google's ceiling on requests[] per call.
+const geminiEmbedBatchLimit = 100
+
+// embedBatch performs one batchEmbedContents call for up to the batch limit of
+// inputs and returns the embeddings in request order.
+func (a *GeminiAdapter) embedBatch(ctx context.Context, req Request, model string, inputs [][]geminiPart, dims int) ([][]float64, http.Header, error) {
+	requests := make([]map[string]any, 0, len(inputs))
+	for _, parts := range inputs {
+		entry := map[string]any{
+			"model":   "models/" + model,
+			"content": geminiContent{Parts: parts},
+		}
+		if dims > 0 {
+			entry["outputDimensionality"] = dims
+		}
+		requests = append(requests, entry)
+	}
+	encoded, err := json.Marshal(map[string]any{"requests": requests})
+	if err != nil {
+		return nil, nil, err
+	}
 	url := a.withKey(joinURL(a.endpoint(req), "models/"+model+":batchEmbedContents"), req.APIKey)
 
 	httpReq, err := a.client.BuildRequest(ctx, "POST", url, bytes.NewReader(encoded), a.headers())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readAllLimited(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, &EndpointError{StatusCode: resp.StatusCode, Body: raw, Provider: "gemini"}
+		return nil, nil, endpointError(resp, raw, "gemini")
 	}
 
 	var decoded struct {
@@ -854,42 +1003,32 @@ func (a *GeminiAdapter) Embeddings(ctx context.Context, req Request) (*Response,
 		} `json:"embeddings"`
 	}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return nil, fmt.Errorf("providers: decode gemini embeddings: %w", err)
+		return nil, nil, fmt.Errorf("providers: decode gemini embeddings: %w", err)
 	}
-
-	data := make([]map[string]any, 0, len(decoded.Embeddings))
-	for i, e := range decoded.Embeddings {
-		data = append(data, map[string]any{"object": "embedding", "index": i, "embedding": e.Values})
+	out := make([][]float64, 0, len(decoded.Embeddings))
+	for _, e := range decoded.Embeddings {
+		out = append(out, e.Values)
 	}
-	// The estimate covers the whole input once: multiplying it per returned
-	// embedding double-counted the request.
-	tokens := estimateTokens(parts)
-	body, _ := json.Marshal(map[string]any{
-		"object": "list",
-		"data":   data,
-		"model":  model,
-		"usage":  map[string]any{"prompt_tokens": tokens, "total_tokens": tokens},
-	})
-	return &Response{StatusCode: resp.StatusCode, Header: resp.Header, Body: body, ContentType: "application/json"}, nil
+	return out, resp.Header, nil
 }
 
-// convertEmbedInput normalizes the several shapes the OpenAI input field
-// accepts into Gemini content parts.
-func convertEmbedInput(raw json.RawMessage) []geminiPart {
+// embedInputs normalizes the several shapes the OpenAI input field accepts
+// into one content per input, so a batch keeps its element boundaries.
+func embedInputs(raw json.RawMessage) [][]geminiPart {
 	if len(raw) == 0 {
 		return nil
 	}
 	var single string
 	if err := json.Unmarshal(raw, &single); err == nil {
-		return []geminiPart{{Text: single}}
+		return [][]geminiPart{{{Text: single}}}
 	}
 	var many []string
 	if err := json.Unmarshal(raw, &many); err == nil {
-		parts := make([]geminiPart, 0, len(many))
+		out := make([][]geminiPart, 0, len(many))
 		for _, s := range many {
-			parts = append(parts, geminiPart{Text: s})
+			out = append(out, []geminiPart{{Text: s}})
 		}
-		return parts
+		return out
 	}
 	// Token-array inputs cannot be rendered as text.
 	return nil
@@ -917,9 +1056,9 @@ func (a *GeminiAdapter) Speak(ctx context.Context, req Request) (*Response, erro
 }
 
 func (a *GeminiAdapter) Probe(ctx context.Context, req Request) (ModelCapability, error) {
-	// Gemini models all support vision and JSON-style responses; probing would
-	// cost a real generation for no additional signal.
-	return ModelCapability{SupportsVision: true, SupportsStream: true, SupportsJSON: true}, nil
+	// Gemini models all support vision, tools and JSON-style responses;
+	// probing would cost a real generation for no additional signal.
+	return ModelCapability{SupportsVision: true, SupportsStream: true, SupportsJSON: true, SupportsTools: true}, nil
 }
 
 var _ Adapter = (*GeminiAdapter)(nil)

@@ -31,9 +31,13 @@ type CircuitBreakerSettings struct {
 
 // RouterSettings controls retry and failover behaviour.
 type RouterSettings struct {
-	NumRetries     int
-	CooldownTime   int
-	CircuitBreaker CircuitBreakerSettings
+	NumRetries   int
+	CooldownTime int
+	// StreamIdleTimeout is how long an upstream stream may go without a frame
+	// before it is treated as stalled and torn down, in seconds. Zero
+	// disables the watchdog.
+	StreamIdleTimeout int
+	CircuitBreaker    CircuitBreakerSettings
 }
 
 // GeneralSettings holds instance-wide settings.
@@ -55,13 +59,20 @@ type ModelParams struct {
 // metadata. A model configured against N providers yields N entries whose
 // order is the declared priority.
 type ModelEntry struct {
-	ModelName      string
-	Kind           Kind
-	Provider       string // provider.yaml slot name
-	ModelParams    ModelParams
-	Ctx            *int // declared context budget
-	CtxOverride    *int // per-slot ctx from provider.yaml, beats Ctx
-	Dims           *int // embeddings dimensions
+	ModelName   string
+	Kind        Kind
+	Provider    string // provider.yaml slot name
+	ModelParams ModelParams
+	Ctx         *int // declared context budget
+	CtxOverride *int // per-slot ctx from provider.yaml, beats Ctx
+	Dims        *int // embeddings dimensions
+	// Retries overrides RouterSettings.NumRetries for this model's slots.
+	Retries *int
+	// AttemptBudget caps the total upstream attempts across the whole slot
+	// walk for one request.
+	AttemptBudget *int
+	// MaxOutput is the completion cap used when the caller sets none.
+	MaxOutput      *int
 	RPM            *int
 	RPD            *int
 	TPM            *int
@@ -78,6 +89,11 @@ type ModelEntry struct {
 	Audio      bool // accepts input_audio parts
 	Video      bool // accepts video data URIs on image_url parts
 	Thinking   bool // accepts reasoning_effort / thinking_budget
+	// Tools and Reasoning advertise agent-readiness. NoCache opts this slot
+	// out of the adapter's default prompt-cache injection.
+	Tools     bool
+	Reasoning bool
+	NoCache   bool
 }
 
 // EffectiveCtx returns the context budget that applies to this slot: the

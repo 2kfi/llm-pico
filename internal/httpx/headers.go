@@ -66,11 +66,13 @@ func Apply(w http.ResponseWriter, headers http.Header) {
 // ModelInfo is one caller-facing model together with the input capabilities
 // the proxy enforces for it.
 type ModelInfo struct {
-	ID       string
-	Images   bool
-	Audio    bool
-	Video    bool
-	Thinking bool
+	ID        string
+	Images    bool
+	Audio     bool
+	Video     bool
+	Thinking  bool
+	Tools     bool
+	Reasoning bool
 }
 
 // ModelListResponse renders the OpenAI-shaped model listing. The capability
@@ -81,14 +83,16 @@ func ModelListResponse(models []ModelInfo) map[string]any {
 	data := make([]map[string]any, 0, len(models))
 	for _, m := range models {
 		data = append(data, map[string]any{
-			"id":                m.ID,
-			"object":            "model",
-			"created":           created,
-			"owned_by":          "llm-pico",
-			"supports_images":   m.Images,
-			"supports_audio":    m.Audio,
-			"supports_video":    m.Video,
-			"supports_thinking": m.Thinking,
+			"id":                 m.ID,
+			"object":             "model",
+			"created":            created,
+			"owned_by":           "llm-pico",
+			"supports_images":    m.Images,
+			"supports_audio":     m.Audio,
+			"supports_video":     m.Video,
+			"supports_thinking":  m.Thinking,
+			"supports_tools":     m.Tools,
+			"supports_reasoning": m.Reasoning,
 		})
 	}
 	return map[string]any{"object": "list", "data": data}
